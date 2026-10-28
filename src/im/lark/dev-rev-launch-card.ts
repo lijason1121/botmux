@@ -3,11 +3,15 @@ import { DevRevAuthorizationError, DevRevLaunchError, readDevRevLaunch, submitDe
 import { isV3SupportedCli } from '../../workflows/v3/contract.js';
 import type { BotConfig } from '../../bot-registry.js';
 import type { ChatBotMember } from './client.js';
+import { BOTMUX_CALLBACK_MARKER_KEY } from './callback-button-marker.js';
 
 export const DEV_REV_SUBMIT = 'v3_dev_rev_submit';
 export const DEV_REV_CANCEL = 'v3_dev_rev_cancel';
 const valueSchema = z.object({ action: z.enum([DEV_REV_SUBMIT, DEV_REV_CANCEL]),
-  id: z.string().regex(/^dl_[a-f0-9]{32}$/), nonce: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
+  id: z.string().regex(/^dl_[a-f0-9]{32}$/), nonce: z.string().regex(/^[a-f0-9]{64}$/),
+  // Lark egress stamps this presentation marker; it conveys no authorization.
+  [BOTMUX_CALLBACK_MARKER_KEY]: z.literal(1).optional(),
+}).strict().transform(({ [BOTMUX_CALLBACK_MARKER_KEY]: _marker, ...value }) => value);
 export function isDevRevLaunchAction(action: unknown): boolean { return action === DEV_REV_SUBMIT || action === DEV_REV_CANCEL; }
 const text = (content: string) => ({ tag: 'plain_text', content });
 
