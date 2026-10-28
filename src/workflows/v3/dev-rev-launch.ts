@@ -8,8 +8,9 @@ import type { BotConfig } from '../../bot-registry.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { createDevelopmentReviewPreset } from './presets/development-review.js';
+import { upgradeDevelopmentReviewPreset } from './presets/development-review-upgrade.js';
 import { canonicalJsonStringify } from './library-schema.js';
-import { createSavedWorkflow } from './library-store.js';
+import { appendSavedWorkflowRevision, createSavedWorkflow } from './library-store.js';
 import { instantiatePublishedSavedWorkflow, listVisibleSavedWorkflows, loadVisibleSavedWorkflow,
   requireActorContext, type SavedWorkflowActorContext } from './library-service.js';
 import { loadAuthorizedV3Run } from './run-envelope.js';
@@ -123,6 +124,12 @@ async function ensurePreset(dataDir: string, context: SavedWorkflowActorContext,
       const loaded = await loadVisibleSavedWorkflow({ dataDir, context, ref: own[0]!.workflowId });
       const { workflowId: _id, humanVersion: _v, createdAt: _at, createdBy: _by, ...draft } = loaded.revision.payload;
       const defaults = Object.fromEntries(DEV_REV_ROLES.map(role => [role, draft.roles?.[role]?.defaultBot]));
+      const upgrade = loaded.metadata.status === 'active' ? upgradeDevelopmentReviewPreset(draft) : undefined;
+      if (upgrade) {
+        return appendSavedWorkflowRevision(dataDir, loaded.metadata.workflowId, {
+          actor: context.actor, revision: upgrade, publish: true, expectedLatestRevision: loaded.metadata.latestRevision,
+        });
+      }
       if (loaded.metadata.status !== 'active' || canonicalJsonStringify(draft) !== canonicalJsonStringify(
         createDevelopmentReviewPreset(defaults as unknown as Parameters<typeof createDevelopmentReviewPreset>[0]))) {
         fail('同名 dev-rev 与当前内置预设不同，请更新定义或更名后重试。');

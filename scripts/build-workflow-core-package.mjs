@@ -124,6 +124,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/workflows/v3/external-control.ts',           // node built-ins + allowlisted v3 modules
     'src/workflows/v3/external-executor.ts',          // transport-neutral seam (constants + types)
     'src/workflows/v3/gate-policy.ts',
+    'src/workflows/v3/gate-context.ts',
     'src/workflows/v3/gate-wait-store.ts',
     'src/workflows/v3/host-bindings.ts',
     'src/workflows/v3/host-effect-ledger.ts',

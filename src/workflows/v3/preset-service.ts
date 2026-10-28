@@ -14,8 +14,9 @@ import {
   listVisibleSavedWorkflows, loadVisibleSavedWorkflow, requireActorContext,
   type SavedWorkflowActorContext,
 } from './library-service.js';
-import { createSavedWorkflow, type SavedWorkflowWriteResult } from './library-store.js';
+import { appendSavedWorkflowRevision, createSavedWorkflow, type SavedWorkflowWriteResult } from './library-store.js';
 import { createDevelopmentReviewPreset } from './presets/development-review.js';
+import { upgradeDevelopmentReviewPreset } from './presets/development-review-upgrade.js';
 
 export const DEVELOPMENT_REVIEW_PRESET = 'development-review';
 
@@ -73,6 +74,16 @@ export async function createPresetSavedWorkflow(
       if (matches.length !== 1) throw new Error(`Workflow name is ambiguous: ${displayName}`);
       const loaded = await loadVisibleSavedWorkflow({ dataDir: input.dataDir, ref: matches[0]!.workflowId, context });
       const { workflowId: _id, humanVersion: _version, createdAt: _at, createdBy: _by, ...draft } = loaded.revision.payload;
+      const upgrade = upgradeDevelopmentReviewPreset(draft);
+      if (loaded.metadata.owner.openId === context.actor.openId &&
+          loaded.metadata.owner.larkAppId === context.actor.larkAppId &&
+          loaded.metadata.scope.kind === 'chat' && loaded.metadata.status === 'active' &&
+          upgrade && canonicalJsonStringify(upgrade) === canonicalJsonStringify(revision)) {
+        const upgraded = await appendSavedWorkflowRevision(input.dataDir, loaded.metadata.workflowId, {
+          actor: context.actor, revision, publish: true, expectedLatestRevision: loaded.metadata.latestRevision,
+        });
+        return { ...upgraded, created: false, origin: 'authored_preset' as const };
+      }
       if (loaded.metadata.owner.openId !== context.actor.openId ||
           loaded.metadata.owner.larkAppId !== context.actor.larkAppId ||
           loaded.metadata.scope.kind !== 'chat' || loaded.metadata.status !== 'active' ||

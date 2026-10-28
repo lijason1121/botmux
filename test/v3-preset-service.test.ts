@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { BotConfig } from '../src/bot-registry.js';
 import { createPresetSavedWorkflow } from '../src/workflows/v3/preset-service.js';
 import { instantiatePublishedSavedWorkflow, loadVisibleSavedWorkflow } from '../src/workflows/v3/library-service.js';
-import { workflowLibraryRoot } from '../src/workflows/v3/library-store.js';
+import { appendSavedWorkflowRevision, workflowLibraryRoot } from '../src/workflows/v3/library-store.js';
 import { loadAuthorizedV3Run } from '../src/workflows/v3/run-envelope.js';
 import { validateSavedWorkflowRevisionDraft } from '../src/workflows/v3/library-schema.js';
 import { DEVELOPMENT_REVIEW_ROLE_CONTEXT_JSON } from '../src/workflows/v3/presets/development-review.js';
@@ -55,6 +55,18 @@ describe('reviewed preset creation', () => {
     await expect(create({ roleSelections: { ...roleSelections, developer: 'Alternate' } })).rejects.toThrow(/different definition/);
     const saved = await loadVisibleSavedWorkflow({ dataDir, context, ref: one.metadata.workflowId });
     expect(saved.revision.payload.roles?.developer.defaultBot).toBe('cli_dev');
+  });
+
+  it('does not upgrade or overwrite a customized owned workflow', async () => {
+    const saved = await create();
+    const { workflowId: _id, humanVersion: _version, createdAt: _at, createdBy: _by, ...draft } = saved.revision.payload;
+    draft.dagTemplate.nodes[0]!.goal += '\nCustom requirement policy';
+    const custom = await appendSavedWorkflowRevision(dataDir, saved.metadata.workflowId, {
+      actor: context.actor, revision: draft, publish: true, expectedLatestRevision: saved.metadata.latestRevision,
+    });
+    await expect(create()).rejects.toThrow(/different definition/);
+    const after = await loadVisibleSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId });
+    expect(after.metadata.latestRevision).toBe(custom.metadata.latestRevision);
   });
 
   it.each([
