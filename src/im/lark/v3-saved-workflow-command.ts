@@ -25,6 +25,12 @@ export type V3SavedWorkflowCommand =
   | { kind: 'show'; ref: string }
   | { kind: 'invalid'; error: string };
 
+/** Only the argument-free reserved shortcut opens a form; ordinary runs keep their path. */
+export function isDevRevLaunchCommand(command: V3SavedWorkflowCommand): boolean {
+  return command.kind === 'run' && command.ref === 'dev-rev' &&
+    Object.keys(command.rawParams).length === 0 && !command.roleSelections;
+}
+
 /**
  * Return null for ordinary ad-hoc goals and non-workflow messages. The daemon
  * invokes this before the grill parser, so reserved verbs can never become an
@@ -198,6 +204,7 @@ function tokenizeWorkflowRunTail(value: string): string[] | undefined {
 export function v3SavedWorkflowUsage(): string {
   return [
     'Saved Workflow：',
+    '/workflow run dev-rev（交互选择仓库、角色和需求，自动准备任务分支）',
     '/workflow save [last|runId] [名称] [--role developer=loopId/goalId ...] [--global（当前 Bot 全局）] [--ack-unsafe]',
     '/workflow save [last|runId] <名称> --distill（参数化后保存到本群）',
     '/workflow run <名称或 workflowId> [key=value ...] [--role developer=BotName ...]（多词值可用 key="multi word"）',
