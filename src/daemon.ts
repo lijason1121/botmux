@@ -7268,7 +7268,7 @@ const cardDeps: CardHandlerDeps = {
     dataDir: dirname(v3DefaultBaseDir()), baseDir: v3DefaultBaseDir(),
     resolveMessageChatId: getMessageChatId,
     authorize: (appId, chatId, operator) => isWorkflowFeatureEnabled() && canOperate(appId, chatId, operator),
-    listChatBots: devRevChatBotChoices, loadBots: loadBotConfigs,
+    listChatBots: devRevChatBotChoices, loadBots: () => loadBotConfigs(),
     persistStartIntent: persistV3StartIntent,
     driveDetached: runId => v3GateRunner.driveDetached(runId),
     onError: (id, error) => logger.warn(`[dev-rev-launch:${id}] action failed: ${error instanceof Error ? error.name : 'unknown'}`),
