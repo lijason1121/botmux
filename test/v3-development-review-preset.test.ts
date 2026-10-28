@@ -102,6 +102,34 @@ describe('authored development-review preset', () => {
 });
 
 describe('fixed development-review executable resources', () => {
+  it('discovers required checks from preflight only when the launch plan is empty', async () => {
+    const f = fixture(), input = json(f.params), checked = json(f.preflight);
+    const expected = input.params.validation_commands;
+    input.params.validation_commands = []; checked.validationCommands = expected;
+    write(f.params, input); write(f.preflight, checked);
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(f.prepared, 'context.json')).validationCommands).toEqual(expected);
+
+    const explicit = fixture(), supplied = json(explicit.params).params.validation_commands;
+    write(explicit.preflight, { ...json(explicit.preflight), validationCommands: [{ id: 'different', argv: ['ignored'] }] });
+    expect(await explicit.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(explicit.prepared, 'context.json')).validationCommands).toEqual(supplied);
+  });
+  it('refuses missing automatic checks before creating the task worktree', async () => {
+    const f = fixture(), input = json(f.params); input.params.validation_commands = []; write(f.params, input);
+    expect((await f.prepare()).code).not.toBe(0); expect(existsSync(f.worktree)).toBe(false);
+  });
+  it('requires document content and a matching read source before preparing a URL-only requirement', async () => {
+    const f = fixture(), input = json(f.params), url = 'https://example.invalid/docx/requirement';
+    input.params.requirement = url; write(f.params, input);
+    expect((await f.prepare()).code).not.toBe(0); expect(existsSync(f.worktree)).toBe(false);
+    const checked = { ...json(f.preflight), resolvedRequirement: 'Actual document requirements',
+      requirementSources: [{ url: 'https://example.invalid/docx/other', read: true }] };
+    write(f.preflight, checked); expect((await f.prepare()).code).not.toBe(0);
+    checked.requirementSources = [{ url, read: true }]; write(f.preflight, checked);
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(f.prepared, 'context.json')).requirement).toBe('Actual document requirements');
+  });
   it('prepares a real task worktree, records real argv execution, gates evidence, and publishes a valid manifest', async () => {
     const f = await evidenceFixture();
     expect(sha(f.resources)).toBe(DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256);
