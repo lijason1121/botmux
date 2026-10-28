@@ -102,6 +102,52 @@ describe('authored development-review preset', () => {
 });
 
 describe('fixed development-review executable resources', () => {
+  it('prepares an existing PR at its actual head and keeps the target base separate', async () => {
+    const f = fixture();
+    const baseSha = f.git(f.repo, 'rev-parse', 'HEAD');
+    f.git(f.repo, 'checkout', '-qb', 'feature/review');
+    writeFileSync(join(f.repo, 'value.txt'), 'existing PR\n');
+    f.git(f.repo, 'add', 'value.txt'); f.git(f.repo, 'commit', '-qm', 'existing PR');
+    const headSha = f.git(f.repo, 'rev-parse', 'HEAD');
+    write(f.preflight, { ...json(f.preflight), reviewTarget: { url: 'https://example.invalid/pull/23',
+      sourceBranch: 'feature/review', targetBranch: 'main', baseSha, headSha } });
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(f.git(f.worktree, 'rev-parse', 'HEAD')).toBe(headSha);
+    expect(json(join(f.prepared, 'context.json'))).toMatchObject({ baseSha, startSha: headSha });
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+  });
+
+  it('plans reuse, update of the original source branch, and creation from live Git evidence', async () => {
+    const f = await evidenceFixture();
+    expect(await f.gate()).toMatchObject({ code: 0 });
+    const headSha = json(f.candidate).headSha;
+    f.git(f.repo, 'remote', 'add', 'origin', f.repo);
+    f.git(f.repo, 'branch', 'original-pr', headSha);
+    const output = f.out('prepare-mr'), draft = join(output, 'mr-draft.json');
+    const title = join(output, 'title.txt'), body = join(output, 'body.md');
+    writeFileSync(title, 'Fixture change'); writeFileSync(body, 'Behavior and actual checks');
+    const existingPr = { url: 'https://example.invalid/pull/23', state: 'OPEN', sourceBranch: 'original-pr',
+      targetBranch: 'main', headSha, baseSha: f.ctx.baseSha };
+    const args = ['--context', f.context, '--release', join(f.gated, 'release-candidate.json'), '--draft', draft, '--title', title, '--body', body];
+    const plan = () => f.tool('delivery', args, output);
+    write(draft, { repository: 'example/project', pushRemote: 'origin', summary: 'Checks passed; no new edits', existingPr });
+    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(output, 'result.json'))).toMatchObject({ action: 'reuse', publicationRequired: false, sourceBranch: 'original-pr' });
+
+    f.git(f.repo, 'branch', '-f', 'original-pr', f.ctx.baseSha);
+    write(draft, { ...json(draft), existingPr: { ...existingPr, headSha: f.ctx.baseSha } });
+    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(output, 'result.json'))).toMatchObject({ action: 'update', publicationRequired: true, sourceBranch: 'original-pr' });
+    write(draft, { repository: 'example/project', pushRemote: 'origin', summary: 'New development and checks passed' });
+    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(output, 'result.json'))).toMatchObject({ action: 'create', publicationRequired: true, sourceBranch: f.ctx.branch });
+
+    write(draft, { ...json(draft), existingPr });
+    expect((await plan()).code).not.toBe(0); // The remote moved since the PR observation.
+    write(draft, { ...json(draft), existingPr: { ...existingPr, headSha: f.ctx.baseSha } });
+    writeFileSync(join(f.worktree, 'value.txt'), 'unreviewed edit');
+    expect((await plan()).code).not.toBe(0);
+  });
   it('discovers required checks from preflight only when the launch plan is empty', async () => {
     const f = fixture(), input = json(f.params), checked = json(f.preflight);
     const expected = input.params.validation_commands;

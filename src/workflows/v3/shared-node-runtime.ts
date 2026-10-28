@@ -62,6 +62,7 @@ import {
 } from './journal.js';
 import { materialize, writeState } from './state.js';
 import { normalizeGateWaitInput } from './gate-policy.js';
+import { resolveV3GatePrompt } from './gate-context.js';
 import {
   v3GateWaitId,
   writePendingWait,
@@ -2917,7 +2918,7 @@ export async function runWorkflow(
     },
   ): boolean {
     const waitId = v3GateWaitId(node.id, instanceId, material?.hostApproval);
-    const gate = material?.gate ?? normalizeGateWaitInput(node.humanGate!);
+    const gate = material?.gate ?? goalGatePolicy(node);
     const hostApproval = material?.hostApproval;
     const resolveGate = deps.resolveGate;
     if (!resolveGate) {
@@ -3005,11 +3006,16 @@ export async function runWorkflow(
     }
   }
 
+  function goalGatePolicy(node: V3Node): ReturnType<typeof normalizeGateWaitInput> {
+    return { ...normalizeGateWaitInput(node.humanGate!),
+      prompt: resolveV3GatePrompt(node.humanGate!, runDir, readJournal(journalPath)) };
+  }
+
   function startGate(node: V3Node, instanceId?: string): boolean {
     // Instance-level waitId so a revisit's fresh gate (`A#002-gate`) gets its own
     // wait file + card nonce, never overwriting the superseded `A#001-gate`
     // (stale-card protection). Legacy/no-instance → `<nodeId>-gate`.
-    let gate = normalizeGateWaitInput(node.humanGate!);
+    let gate = isHostNode(node) ? normalizeGateWaitInput(node.humanGate) : goalGatePolicy(node);
     let hostApproval: { attemptId: string; approvalDigest: string; inputHash: string } | undefined;
     if (isHostNode(node)) {
       if (!instanceId) throw new Error(`v3 runtime: host gate "${node.id}" has no instance`);
@@ -3254,7 +3260,7 @@ export async function runWorkflow(
         waits.push({
           nodeId: node.id,
           waitId: `${instanceId ?? node.id}-gate`,
-          ...normalizeGateWaitInput(node.humanGate!),
+          ...goalGatePolicy(node),
         });
       }
     }

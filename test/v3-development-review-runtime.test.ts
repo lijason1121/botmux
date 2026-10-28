@@ -23,7 +23,7 @@ const validateManifest: ValidateManifest = async (path, outputDir) => {
   catch (error) { return { ok: false, problems: [String(error)] }; }
 };
 
-async function fixture(mode: 'repair' | 'reject' | 'auth') {
+async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged') {
   const context = { actor: { larkAppId: 'cli_dev', openId: 'ou_owner' }, chatId: 'oc_fixture' };
   const bots = [
     { larkAppId: 'cli_dev', cliId: 'codex', workingDir: root },
@@ -54,7 +54,11 @@ async function fixture(mode: 'repair' | 'reject' | 'auth') {
     const result = Object.fromEntries(Object.entries(req.node.resultSchema?.properties ?? {}).map(([key, field]) => [key,
       field.enum?.[0] ?? ({ string: 'fixture', number: 1, boolean: true, object: {}, array: [] }[field.type]),
     ]));
-    if (req.node.id.endsWith(`.${loop.exit.node}`)) result.passed = mode === 'repair' && req.node.id.includes('.i002.');
+    if (req.node.id.endsWith(`.${loop.exit.node}`)) result.passed = mode === 'unchanged' || (mode === 'repair' && req.node.id.includes('.i002.'));
+    if (req.node.id === 'prepare-mr') {
+      result.publicationRequired = mode !== 'unchanged';
+      result.approvalSummary = 'Repository: example/project; PR: https://example.invalid/pull/23; action: update; tests passed';
+    }
     const files: Manifest['files'] = [];
     for (const [name, output] of Object.entries(req.node.outputs ?? {})) {
       if (output.kind === 'directory') throw new Error('Fixture needs a real directory artifact adapter');
@@ -79,6 +83,9 @@ describe('created development-review preset on the production runtime', () => {
     const { run, loop, calls, events, outcome, gatedNode } = await fixture('repair');
     expect(outcome).toMatchObject({ reason: 'awaitingGate', pendingWaits: [expect.objectContaining({ nodeId: gatedNode.id })] });
     expect(calls.some(call => call.id === gatedNode.id)).toBe(false);
+    if (outcome.reason === 'awaitingGate') {
+      expect(outcome.pendingWaits[0]!.prompt).toContain('https://example.invalid/pull/23');
+    }
     expect(events.filter(event => event.type === 'loopIterationStarted')).toHaveLength(2);
     const correctness = run.resolvedRoles!.correctness.nodes.find(path => path.startsWith(`${loop.id}/`))!.split('/')[1]!;
     const checkCalls = calls.filter(call => call.id.endsWith(`.${correctness}`));
@@ -88,6 +95,14 @@ describe('created development-review preset on the production runtime', () => {
     expect(second.inputs.inputs.some(input => input.from.startsWith('previous.'))).toBe(true);
     expect(calls.filter(call => call.id.startsWith(`${loop.id}.`)).every(call =>
       call.inputs.inputs.some(input => input.from === 'prepare'))).toBe(true);
+  });
+
+  it('finishes an unchanged existing PR review without publication or an approval wait', async () => {
+    const { calls, events, outcome } = await fixture('unchanged');
+    expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+    expect(calls.some(call => call.id === 'create-mr')).toBe(false);
+    expect(calls.at(-1)?.id).toBe('complete');
+    expect(events.some(event => event.type === 'gateDispatched')).toBe(false);
   });
 
   it('exhausts the repair limit without reaching PR preparation or approval', async () => {

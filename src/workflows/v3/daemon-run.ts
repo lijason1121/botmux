@@ -80,6 +80,7 @@ import {
   type V3ErrorClass,
 } from './journal.js';
 import { materialize } from './state.js';
+import { resolveV3GatePrompt } from './gate-context.js';
 import { openV3WorkerAttempts } from './attempt-ledger.js';
 import { openV3HostEffects } from './host-effect-ledger.js';
 import { readAndVerifyV3PreparedHostInput } from './host-execution.js';
@@ -1003,6 +1004,15 @@ export function resolveV3GateClick(
   if (!canResolveGateWait(wait, input.by)) return { kind: 'unauthorized' };
   const resolution = selectedResolution(wait, input.selected);
   if (!resolution) return { kind: 'stale-run', reason: 'no-wait' };
+  if (resolution === 'approved' && dagNode?.humanGate?.contextFrom) {
+    try {
+      if (resolveV3GatePrompt(dagNode.humanGate, runDir, readJournal(journalPath)) !== wait.prompt) {
+        return { kind: 'stale-run', reason: 'stale-node' };
+      }
+    } catch {
+      return { kind: 'stale-run', reason: 'stale-node' };
+    }
+  }
 
   const settled = resolveWaitOnce(
     runDir,
@@ -1809,9 +1819,10 @@ function reconcileOneRun(
   if (recoveryDag) {
     for (const n of recoveryDag.nodes) {
       if (!n.humanGate?.prompt) continue;
+      if (!gateWaitingNodes.includes(n.id)) continue;
       const gate = normalizeGateWaitInput(n.humanGate);
       if (!isHostNode(n)) {
-        dagNodeGate.set(n.id, gate);
+        dagNodeGate.set(n.id, { ...gate, prompt: resolveV3GatePrompt(n.humanGate, runDir, events) });
         continue;
       }
       const instanceId = snap.nodes.get(n.id)?.effectiveInstanceId;

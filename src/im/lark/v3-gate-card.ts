@@ -12,6 +12,7 @@ import { config } from '../../config.js';
 import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
 import { DEFAULT_HUMAN_GATE_OPTIONS } from '../../workflows/v3/dag.js';
 import { splitV3HostGatePrompt } from '../../workflows/v3/host-bindings.js';
+import { splitV3GateContext } from '../../workflows/v3/gate-context.js';
 import { short, truncate, escapeMd } from './v3-card-common.js';
 
 export const V3_GATE_APPROVE_ACTION = 'v3_gate_approve';
@@ -68,7 +69,8 @@ export function buildV3GateCard(input: V3GateCardInput): string {
   const webDetailUrl = input.webDetailUrl ?? v3RunDetailUrl(input.runId);
   const promptMax = input.promptMaxChars ?? DEFAULT_PROMPT_MAX_CHARS;
   const hostPrompt = input.hostApproval ? splitV3HostGatePrompt(input.prompt) : undefined;
-  const prompt = truncate(hostPrompt?.authoredPrompt ?? input.prompt, promptMax);
+  const context = splitV3GateContext(input.prompt);
+  const prompt = truncate(hostPrompt?.authoredPrompt ?? context.prompt, promptMax);
   const resolution = input.resolution;
   const options = input.options ?? [...DEFAULT_HUMAN_GATE_OPTIONS];
   const approveOptions = input.approveOptions ?? (options.includes('approve') ? ['approve'] : [options[0]!]);
@@ -99,6 +101,11 @@ export function buildV3GateCard(input: V3GateCardInput): string {
       text: { tag: 'plain_text', content: prompt },
     },
   ];
+
+  if (context.text) {
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: context.text } });
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: `审批材料摘要：${context.sha256}` }] });
+  }
 
   if (input.hostApproval) {
     elements.push({ tag: 'hr' });

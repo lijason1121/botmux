@@ -64,6 +64,9 @@ export interface V3HumanGate {
   approveOptions?: string[];
   /** Empty = any operator allowed by the outer daemon permission gate. */
   approvers?: string[];
+  /** A required string in an upstream result, displayed as approval material.
+   * The reference is frozen with the DAG; it never changes gate policy. */
+  contextFrom?: { nodeId: string; field: string };
 }
 
 export const DEFAULT_HUMAN_GATE_OPTIONS: readonly string[] = ['approve', 'reject'];
@@ -590,6 +593,15 @@ export function validateDag(raw: unknown): V3Dag {
 
   // Cross-node reference checks — only meaningful once ids are collected.
   for (const node of nodes) {
+    if (node.humanGate?.contextFrom) {
+      const ref = node.humanGate.contextFrom;
+      const source = nodes.find(candidate => candidate.id === ref.nodeId);
+      if (node.type !== 'goal' || !node.depends.some(dep => dep.from === ref.nodeId) ||
+          source?.type !== 'goal' || source.resultSchema?.properties[ref.field]?.type !== 'string' ||
+          !source.resultSchema.required?.includes(ref.field)) {
+        problems.push(`node "${node.id}".humanGate.contextFrom must reference a required string result field of a direct goal dependency`);
+      }
+    }
     for (const dep of node.depends) {
       if (!ids.has(dep.from)) problems.push(`node "${node.id}" depends on unknown node "${dep.from}"`);
     }
@@ -852,7 +864,16 @@ function normHumanGate(raw: unknown, where: string, problems: string[]): V3Human
     }
   }
 
-  return { prompt: raw.prompt, options, approveOptions, approvers };
+  let contextFrom: V3HumanGate['contextFrom'];
+  if (raw.contextFrom !== undefined) {
+    const ref = raw.contextFrom;
+    if (!isObject(ref) || typeof ref.nodeId !== 'string' || !/^[A-Za-z0-9._-]+$/.test(ref.nodeId) ||
+        typeof ref.field !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref.field) ||
+        Object.keys(ref).sort().join(',') !== 'field,nodeId') {
+      problems.push(`${where}.humanGate.contextFrom must be { nodeId, field }`);
+    } else contextFrom = { nodeId: ref.nodeId, field: ref.field };
+  }
+  return { prompt: raw.prompt, options, approveOptions, approvers, ...(contextFrom ? { contextFrom } : {}) };
 }
 
 function parseUniqueStringList(

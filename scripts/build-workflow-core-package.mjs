@@ -117,6 +117,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/workflows/v3/core-control.ts',
     'src/workflows/v3/dag.ts',
     'src/workflows/v3/gate-policy.ts',
+    'src/workflows/v3/gate-context.ts',
     'src/workflows/v3/gate-wait-store.ts',
     'src/workflows/v3/host-bindings.ts',
     'src/workflows/v3/host-effect-ledger.ts',
