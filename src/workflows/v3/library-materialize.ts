@@ -10,8 +10,10 @@
 import {
   existsSync,
   mkdirSync,
+  realpathSync,
   renameSync,
   rmSync,
+  statSync,
 } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
@@ -244,6 +246,7 @@ export function buildSavedWorkflowRevisionBaseline(
     sourceRunId: loaded.envelope.runId,
     inputs,
     ...(roles ? { roles } : {}),
+    ...(roleDefinition?.execution ? { execution: roleDefinition.execution } : {}),
     contextRefs,
     specTemplate,
     specStatus: opts.specStatus ?? 'current',
@@ -404,6 +407,13 @@ export function materializeSavedWorkflowRun(
 
   const roles = validateSavedWorkflowRoles(input.revision.payload.roles, input.revision.payload.dagTemplate.nodes);
   const resolvedRoles = resolveSavedWorkflowRoles(roles, input.roleSelections, input.bots);
+  const execution = input.revision.payload.execution;
+  if (execution?.distinctRoles) {
+    const selected = execution.distinctRoles.map(name => resolvedRoles[name]?.bot);
+    if (selected.some(bot => !bot) || new Set(selected).size !== selected.length) {
+      throw new Error('Workflow execution requires distinct bots for independent roles');
+    }
+  }
   if (roles) assertSavedWorkflowSpecTemplateBindings(input.revision.payload.specTemplate,
     input.revision.payload.inputs, input.revision.payload.contextRefs, roles);
 
@@ -432,6 +442,15 @@ export function materializeSavedWorkflowRun(
     input.rawParams ?? {},
   );
   const resolvedContext = resolveContext(input.revision.payload.contextRefs, input.context);
+  let workingDirectory: string | undefined;
+  if (execution?.workingDirectoryParam !== undefined) {
+    const requested = resolvedParams[execution.workingDirectoryParam];
+    if (typeof requested !== 'string' || !requested.trim() || requested.includes('\0')) {
+      throw new Error('Workflow execution workspace requires a non-empty directory input');
+    }
+    workingDirectory = realpathSync(requested);
+    if (!statSync(workingDirectory).isDirectory()) throw new Error('Workflow execution workspace must be a directory');
+  }
   const nodes = cloneNodes(input.revision.payload.dagTemplate.nodes);
   if (roles) {
     const goals = savedWorkflowGoalPaths(nodes);
@@ -460,6 +479,11 @@ export function materializeSavedWorkflowRun(
     : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, renderSpec(v)])) : value;
   const spec = validateSpec({ ...(roles ? renderSpec(input.revision.payload.specTemplate) as object : input.revision.payload.specTemplate), runId });
   const botSnapshots = freezeDagBotSnapshots(dag, input.bots);
+  if (workingDirectory !== undefined) {
+    for (const [selector, snapshot] of botSnapshots) {
+      botSnapshots.set(selector, { ...snapshot, workingDir: workingDirectory });
+    }
+  }
   mkdirSync(input.baseDir, { recursive: true, mode: 0o700 });
 
   // Reserve the final run id across cooperating CLI/daemon processes. A plain

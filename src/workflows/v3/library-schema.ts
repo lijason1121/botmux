@@ -116,6 +116,8 @@ export interface SavedWorkflowRevisionPayloadV1 {
   sourceRunId?: string;
   inputs: Record<string, SavedWorkflowParamDef>;
   roles?: SavedWorkflowRoles;
+  /** Optional per-run workspace and independent-role constraints. */
+  execution?: { workingDirectoryParam?: string; distinctRoles?: string[] };
   contextRefs: SavedWorkflowBuiltinContextRef[];
   specTemplate: V3SpecTemplate;
   /** DAG is execution truth; this flag makes documentation drift explicit. */
@@ -704,6 +706,30 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
   let roles: SavedWorkflowRoles | undefined;
   try { roles = validateSavedWorkflowRoles(raw.roles, safeDag.nodes); }
   catch (err) { problems.push(err instanceof Error ? err.message : String(err)); }
+  let execution: SavedWorkflowRevisionPayloadV1['execution'];
+  if (raw.execution !== undefined) {
+    if (!isRecord(raw.execution) || Object.keys(raw.execution).length === 0 ||
+        Object.keys(raw.execution).some(key => !['workingDirectoryParam', 'distinctRoles'].includes(key))) {
+      problems.push('execution must contain only workingDirectoryParam and/or distinctRoles');
+    } else {
+      execution = {};
+      const param = raw.execution.workingDirectoryParam;
+      if (param !== undefined) {
+        if (typeof param !== 'string' || !Object.hasOwn(inputs, param) ||
+            inputs[param]?.type !== 'string' || inputs[param]?.sensitive === true) {
+          problems.push('execution.workingDirectoryParam must name a declared non-sensitive string input');
+        } else execution.workingDirectoryParam = param;
+      }
+      const distinct = raw.execution.distinctRoles;
+      if (distinct !== undefined) {
+        if (!Array.isArray(distinct) || distinct.length < 2 || distinct.length > 64 ||
+            new Set(distinct).size !== distinct.length || distinct.some(name =>
+              typeof name !== 'string' || !roles || !Object.hasOwn(roles, name))) {
+          problems.push('execution.distinctRoles must name at least two distinct declared roles');
+        } else execution.distinctRoles = [...distinct] as string[];
+      }
+    }
+  }
   if (dagTemplate) {
     try {
       assertSavedWorkflowTemplateBindings(dagTemplate, inputs, contextRefs, roles);
@@ -725,6 +751,7 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
     ...(sourceRunId ? { sourceRunId } : {}),
     inputs,
     ...(roles ? { roles } : {}),
+    ...(execution ? { execution } : {}),
     contextRefs,
     specTemplate,
     specStatus,
@@ -742,7 +769,7 @@ export function validateSavedWorkflowRevisionDraft(raw: unknown): SavedWorkflowR
   if (!isRecord(raw)) throw new SavedWorkflowSchemaError(['revision draft must be an object']);
   const allowed = new Set([
     'sourceRunId', 'inputs', 'contextRefs', 'specTemplate', 'specStatus',
-    'dagTemplate', 'safety', 'roles',
+    'dagTemplate', 'safety', 'roles', 'execution',
   ]);
   const extra = Object.keys(raw).filter((key) => !allowed.has(key));
   if (extra.length > 0) {

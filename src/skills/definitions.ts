@@ -1667,6 +1667,8 @@ description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排
 
 自然语言与命令是同一能力，用户不需要记 slash command：
 
+- 用户明确要求从零创建通用开发评审流程时，可用 \`botmux workflow create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot\`。这是经验证的内置预设作者入口，只创建当前用户/当前群的参数化 Saved Workflow，不读取旧任务、不伪造 sourceRun 或成功记录，也不自动运行任务。三个 Bot 必须来自真实配置且互不相同。创建后的 active 表示可运行定义，不能宣称已有真实需求端到端执行通过。任意文件导入、全局发布、unsafe 确认和参数蒸馏仍不由此入口代办。
+
 - “把刚才那个流程存下来（叫周报）” → \`botmux workflow save last 周报\`（IM 等价：\`/workflow save last 周报\`）。只保存已成功结束且属于当前用户/话题的 run；agent-facing CLI 固定为 chat scope。用户明确要求在**当前 Bot 的其它群**复用时，不得替用户执行 \`--global\`，请让用户本人在飞书显式发送 \`/workflow save last 周报 --global\`，由 daemon 校验 canOperate。\`--global\` 只表示当前 Bot 全局，不会对共享 dataDir 的其它 Bot 可见。
 - 参数蒸馏目前只做显式实验入口，不从自然语言自行触发。用户明确要求把成功 run 中的具体值抽成参数时，请让用户本人在飞书发送 \`/workflow save last <名称> --distill\`；agent-facing CLI 会拒绝该 flag。系统先生成不含原值的参数摘要卡，用户整包确认后才创建本群 Saved Workflow；P0 不支持 \`--global\`、\`--ack-unsafe\`、追加现有定义或局部接受。
 - “运行已保存的周报流程，region=sg” → \`botmux workflow run 周报 --param region=sg\`（IM 等价：\`/workflow run 周报 region=sg\`）。缺必填参数时只补问缺的项；名称有歧义时展示候选，不要猜。

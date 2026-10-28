@@ -85,6 +85,13 @@ describe('workflow feature kill-switch (BOTMUX_WORKFLOW_ENABLED=false)', () => {
     expect(result.output).toContain(DISABLED);
   });
 
+  it('refuses builtin preset creation when disabled before authentication or writes', () => {
+    const result = runCliWithWorkflow(['workflow', 'create', 'development-review'], false);
+    expect(result.status).toBe(2);
+    expect(result.output).toContain(DISABLED);
+    expect(existsSync(runsDir)).toBe(false);
+  });
+
   it('refuses `v3 run` when disabled', () => {
     const result = runCliWithWorkflow(['v3', 'run', 'nonexistent-dag.json'], false);
     expect(result.status).toBe(2);

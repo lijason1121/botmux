@@ -776,7 +776,7 @@ export async function instantiatePublishedSavedWorkflow(
   });
 }
 
-function requireActorContext(
+export function requireActorContext(
   context: SavedWorkflowActorContext,
   opts: { requireChat?: boolean } = {},
 ): SavedWorkflowActorContext {

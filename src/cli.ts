@@ -7594,6 +7594,8 @@ ${SEND_HELP_BODY}
                   [--timeout <seconds>] [--json]
                                        在现有 v3 沙箱/worker 路径运行一个 headless goal；
                                        同一 run-id 可安全重放终态或接续崩溃运行
+  workflow create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot
+                                       创建通用、角色可配置的开发评审 Saved Workflow
   workflow save [last|runId] [名称] [--role developer=loopId/goalId ...]
                                        把成功 run 固化为 chat scope Saved Workflow；
                                        发布当前 Bot 全局版本 / 确认 unsafe lint 请由用户在飞书显式发送 /workflow save ...

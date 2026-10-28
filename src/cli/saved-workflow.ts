@@ -302,6 +302,31 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
   const baseDir = runsBaseDir(args);
   const json = hasFlag(args, '--json');
 
+  if (sub === 'create') {
+    const { roleSelections, remaining } = collectSavedWorkflowRoleArgs(args, 'run');
+    for (let i = 0; i < remaining.length; i++) {
+      const token = remaining[i]!;
+      if (!token.startsWith('--') || token === '--json') continue;
+      if (token === '--library-dir') {
+        if (!remaining[++i] || remaining[i]!.startsWith('--')) throw new Error('--library-dir requires a value');
+        continue;
+      }
+      if (token.startsWith('--library-dir=') && token.slice('--library-dir='.length)) continue;
+      throw new Error(`workflow create does not accept ${token}`);
+    }
+    const positional = positionals(remaining, ['--library-dir']);
+    const presetId = positional[0];
+    if (!presetId) throw new Error('用法: botmux workflow create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot');
+    const { createPresetSavedWorkflow } = await import('../workflows/v3/preset-service.js');
+    const result = await createPresetSavedWorkflow({
+      dataDir, context, presetId, displayName: positional.slice(1).join(' ') || undefined,
+      roleSelections: roleSelections ?? {}, bots: loadBotConfigs(),
+    });
+    console.log(json ? JSON.stringify(result, null, 2) :
+      `✅ ${result.created ? '已创建' : '已存在'}：${result.metadata.displayName}\nworkflowId: ${result.metadata.workflowId}\nstatus: ${result.metadata.status}\norigin: authored_preset（通用定义；不代表已执行具体开发任务）`);
+    return;
+  }
+
   if (sub === 'save') {
     // Global publication is an IM authorization decision (`canOperate`), not
     // something an agent-facing child process can prove from session files.
