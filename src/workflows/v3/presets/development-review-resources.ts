@@ -107,6 +107,18 @@ function prepare(args) {
   requireThat(typeof params.target_branch === 'string' && !params.target_branch.startsWith('-'), 'invalid target branch');
   git(repository, ['check-ref-format', '--branch', params.target_branch]);
   const baseSha = git(repository, ['rev-parse', '--verify', '--end-of-options', params.target_branch + '^{commit}']);
+  const reviewTarget = checked.reviewTarget;
+  let startSha = baseSha;
+  if (reviewTarget !== undefined) {
+    requireThat(object(reviewTarget) && typeof reviewTarget.url === 'string' && /^https:\/\//.test(reviewTarget.url) &&
+      typeof reviewTarget.sourceBranch === 'string' && typeof reviewTarget.targetBranch === 'string' &&
+      /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(reviewTarget.headSha) && reviewTarget.baseSha === baseSha,
+      'review target must identify the current PR head and base');
+    git(repository, ['check-ref-format', '--branch', reviewTarget.sourceBranch]);
+    git(repository, ['check-ref-format', '--branch', reviewTarget.targetBranch]);
+    startSha = git(repository, ['rev-parse', '--verify', '--end-of-options', reviewTarget.headSha + '^{commit}']);
+    git(repository, ['merge-base', '--is-ancestor', baseSha, startSha]);
+  }
   roles(selected);
   // An empty launch-form plan delegates discovery to the authenticated preflight.
   // Explicit caller-supplied checks remain authoritative and cannot be replaced.
@@ -128,15 +140,15 @@ function prepare(args) {
   requireThat(worktree !== repository && !worktree.startsWith(path.join(repository, '.git') + path.sep), 'unsafe worktree location');
   if (!fs.existsSync(worktree)) {
     fs.mkdirSync(path.dirname(worktree), { recursive: true });
-    git(repository, ['worktree', 'add', '-b', branch, worktree, baseSha]);
+    git(repository, ['worktree', 'add', '-b', branch, worktree, startSha]);
   } else {
     requireThat(fs.realpathSync(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])) === fs.realpathSync(git(repository, ['rev-parse', '--path-format=absolute', '--git-common-dir'])), 'existing worktree belongs to another repository');
-    requireThat(git(worktree, ['branch', '--show-current']) === branch && git(worktree, ['rev-parse', 'HEAD']) === baseSha && !git(worktree, ['status', '--porcelain']), 'existing worktree is not this pristine preparation');
+    requireThat(git(worktree, ['branch', '--show-current']) === branch && git(worktree, ['rev-parse', 'HEAD']) === startSha && !git(worktree, ['status', '--porcelain']), 'existing worktree is not this pristine preparation');
   }
   const manifest = { preset: 'development-review', version: 1, files: [{ path: 'tools.mjs', sha256: digest(self) }] };
   atomic(path.join(output, 'resources.json'), manifest);
   const context = { schemaVersion: 1, runId: checked.runId, repo: repository, worktree, branch, targetBranch: params.target_branch,
-    baseSha, requirement, requirementSha256: sha(Buffer.from(requirement)), roles: selected,
+    baseSha, startSha, ...(reviewTarget ? { reviewTarget } : {}), requirement, requirementSha256: sha(Buffer.from(requirement)), roles: selected,
     validationCommands: commands, preflightSha256: digest(args.preflight), resourcesSha256: digest(path.join(output, 'resources.json')) };
   atomic(path.join(output, 'context.json'), context);
   atomic(path.join(output, 'result.json'), { ready: true, runId: checked.runId, baseSha });
@@ -229,6 +241,63 @@ function gate(args) {
     toolsSha256: digest(self), artifacts });
   fs.writeFileSync(path.join(path.dirname(args.out), 'feedback.md'), result.passed ? 'Gate passed for this candidate.\n' : 'Gate did not pass:\n' + problems.map(problem => '- ' + problem).join('\n') + '\n', { mode: 0o600 });
 }
+function delivery(args) {
+  const release = read(args.release), context = read(args.context), draft = read(args.draft);
+  const output = process.env.BOTMUX_GOAL_OUTPUT_DIR;
+  version(release, 'release'); version(context, 'context');
+  requireThat(output && context.runId === runtimeRunId() && release.passed === true && release.gate.passed === true, 'delivery requires the current passed gate');
+  commonRepository(context);
+  requireThat(release.toolsSha256 === digest(self) && release.artifacts.context.sha256 === digest(args.context), 'delivery context/tools mismatch');
+  for (const artifact of Object.values(release.artifacts)) requireThat(digest(artifact.path) === artifact.sha256, 'release evidence changed');
+  same(release.gate, context, ['runId', 'repo', 'baseSha'], 'delivery gate');
+  const headSha = git(context.worktree, ['rev-parse', 'HEAD']);
+  requireThat(headSha === release.gate.headSha && !git(context.worktree, ['status', '--porcelain']) &&
+    git(context.worktree, ['branch', '--show-current']) === context.branch, 'delivery candidate is no longer the clean task HEAD');
+  requireThat(git(context.repo, ['rev-parse', '--verify', '--end-of-options', context.targetBranch + '^{commit}']) === context.baseSha, 'delivery target base changed');
+  const existing = draft.existingPr;
+  requireThat(typeof draft.repository === 'string' && draft.repository.trim() && typeof draft.summary === 'string' && draft.summary.trim(), 'delivery repository and summary required');
+  if (context.reviewTarget) {
+    requireThat(object(existing), 'existing review PR must be reused');
+    same(existing, context.reviewTarget, ['url', 'sourceBranch', 'targetBranch'], 'existing review PR');
+  }
+  const sourceBranch = existing ? existing.sourceBranch : context.branch;
+  git(context.repo, ['check-ref-format', '--branch', sourceBranch]);
+  let action = headSha === context.baseSha ? 'none' : 'create';
+  if (existing) {
+    requireThat(existing.state === 'OPEN' && /^https:\/\//.test(existing.url) &&
+      typeof existing.targetBranch === 'string' && typeof draft.pushRemote === 'string' && !draft.pushRemote.startsWith('-'), 'open PR and configured push remote required');
+    // A configured remote selector, never a model-supplied shell command/URL.
+    git(context.repo, ['remote', 'get-url', draft.pushRemote]);
+    const remote = git(context.repo, ['ls-remote', '--exit-code', draft.pushRemote, 'refs/heads/' + sourceBranch]);
+    requireThat(remote.split(/\s+/)[0] === existing.headSha && existing.baseSha === context.baseSha, 'remote PR head/base changed');
+    action = headSha === existing.headSha ? 'reuse' : 'update';
+    if (action === 'update') git(context.worktree, ['merge-base', '--is-ancestor', existing.headSha, headSha]);
+  }
+  const title = fs.readFileSync(args.title, 'utf8').trim(), body = fs.readFileSync(args.body, 'utf8').trim();
+  requireThat(title && body, 'delivery title/body required');
+  const publicationRequired = action === 'create' || action === 'update';
+  if (publicationRequired) {
+    requireThat(typeof draft.pushRemote === 'string' && !draft.pushRemote.startsWith('-'), 'publication requires a configured push remote');
+    git(context.repo, ['remote', 'get-url', draft.pushRemote]);
+  }
+  const actionText = { none: '无新增改动，仅交付结果', reuse: '已有 PR 无需更新，仅交付评审结论', update: '推送修复到原 PR 源分支', create: '推送任务分支并新建 PR/MR' }[action];
+  const approvalSummary = [
+    '仓库：' + draft.repository, '动作：' + actionText,
+    'PR/MR：' + (existing ? existing.url : '新建'),
+    '分支：' + sourceBranch + ' → ' + (existing ? existing.targetBranch : context.targetBranch),
+    '推送远端：' + (publicationRequired ? draft.pushRemote : '无需推送'),
+    '提交：' + headSha, '基线：' + context.baseSha,
+    '变更与验证：' + draft.summary,
+    '标题：' + title, '正文：\n' + body,
+    '批准范围：仅上述候选的推送及 PR/MR 交付；不含合并、部署。',
+  ].join('\n');
+  requireThat(approvalSummary.length <= 6000, 'approval material too long; shorten the title/body/summary before approval');
+  atomic(path.join(output, 'result.json'), { schemaVersion: 1, runId: context.runId, action, publicationRequired,
+    repository: draft.repository, existingPr: existing || null, pushRemote: draft.pushRemote || null,
+    sourceBranch, targetBranch: existing ? existing.targetBranch : context.targetBranch,
+    headSha, baseSha: context.baseSha, approvalSummary,
+    releaseSha256: digest(args.release), draftSha256: digest(args.draft), titleSha256: digest(args.title), bodySha256: digest(args.body) });
+}
 function publish(args) {
   const output = process.env.BOTMUX_GOAL_OUTPUT_DIR, manifest = process.env.BOTMUX_GOAL_MANIFEST_PATH;
   requireThat(output && manifest, 'goal output/manifest environment required');
@@ -248,7 +317,7 @@ function publish(args) {
 }
 
 const args = { entries: [] }, mode = process.argv[2];
-const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary']);
+const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body']);
 try {
   for (let index = 3; index < process.argv.length; index++) {
     const flag = process.argv[index];
@@ -262,6 +331,7 @@ try {
   else if (mode === 'candidate') candidate(args);
   else if (mode === 'record') record(args);
   else if (mode === 'gate') gate(args);
+  else if (mode === 'delivery') delivery(args);
   else if (mode === 'publish') publish(args);
   else throw new Error('unsupported development-review tool mode');
 } catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 2; }
