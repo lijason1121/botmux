@@ -10,6 +10,10 @@ import { loadAuthorizedV3Run } from '../src/workflows/v3/run-envelope.js';
 import { buildDevRevLaunchCard, DEV_REV_CANCEL, DEV_REV_SUBMIT, handleDevRevLaunchAction, selectDevRevChatBots } from '../src/im/lark/dev-rev-launch-card.js';
 import { findV3CardRoute } from '../src/im/lark/card-action-routes.js';
 import { isDevRevLaunchCommand, parseV3SavedWorkflowCommand } from '../src/im/lark/v3-saved-workflow-command.js';
+import { stampBotmuxCallbackMarkers, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
+import { normalizeCardActionData } from '../src/im/lark/card-action-data.js';
+import { handleCardAction } from '../src/im/lark/card-handler.js';
+import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
 
 const context = { actor: { openId: 'ou_owner', larkAppId: 'cli_host' }, chatId: 'oc_here', rootMessageId: 'om_start' };
 const bots = [
@@ -160,6 +164,47 @@ describe('dev-rev interactive launcher', () => {
       cardMessageId: 'om_card', formValue: form, deps: { devRevLaunchDeps: deps } as any });
     expect(accepted.card.data.schema).toBe('2.0'); expect(deps.driveDetached).toHaveBeenCalledTimes(1);
     expect(findV3CardRoute(DEV_REV_CANCEL)?.name).toBe(route.name);
+  });
+  it.each(['submit', 'cancel'] as const)('accepts the actual stamped outbound card through %s callback ingress', async mode => {
+    const request = await bound();
+    // Use exactly the serialization transform applied by all Lark send/reply/update paths.
+    const wire = JSON.parse(stampBotmuxCallbackMarkers(buildDevRevLaunchCard(request)));
+    const formElement = wire.body.elements.find((x: any) => x.tag === 'form');
+    const button = mode === 'submit' ? formElement.elements.find((x: any) => x.name === 'start') :
+      wire.body.elements.find((x: any) => x.tag === 'button');
+    expect(button.value[BOTMUX_CALLBACK_MARKER_KEY]).toBe(1);
+    const handlerDeps = { activeSessions: new Map(), lastRepoScan: new Map(),
+      sessionReply: vi.fn(), devRevLaunchDeps: deps };
+    const gateway = createPluginCardActionGateway({ resolvePluginIds: () => [],
+      fallback: (event, appId) => handleCardAction(event, handlerDeps, appId) });
+    const event = normalizeCardActionData({ header: { event_type: 'card.action.trigger' }, event: {
+      operator: { open_id: context.actor.openId },
+      context: { open_message_id: 'om_card', open_chat_id: context.chatId },
+      action: { tag: 'button', value: button.value, ...(mode === 'submit' ? { form_value: form } : {}) },
+    } });
+    const result: any = await gateway.dispatch(event, context.actor.larkAppId);
+    expect(result.card?.data.schema).toBe('2.0');
+    expect(readDevRevLaunch(dataDir, request.id)).toMatchObject(mode === 'submit'
+      ? { started: true, cancelled: false } : { started: false, cancelled: true });
+    expect(deps.driveDetached).toHaveBeenCalledTimes(mode === 'submit' ? 1 : 0);
+  });
+  it.each([
+    { [BOTMUX_CALLBACK_MARKER_KEY]: 0 }, { [BOTMUX_CALLBACK_MARKER_KEY]: '1' },
+    { [BOTMUX_CALLBACK_MARKER_KEY]: 1, ownerOpenId: 'ou_forged' },
+    { [BOTMUX_CALLBACK_MARKER_KEY]: 1, unexpected: 'value' },
+  ])('keeps rejecting malformed marker or extra authority fields: %j', async extras => {
+    const request = await bound();
+    const result: any = await handleDevRevLaunchAction({ action: DEV_REV_SUBMIT, id: request.id,
+      nonce: request.nonce, ...extras }, form, context.actor.openId, context.actor.larkAppId, 'om_card', deps);
+    expect(existsSync(baseDir)).toBe(false); expect(result.toast?.type).toBe('error');
+    expect(deps.driveDetached).not.toHaveBeenCalled();
+  });
+  it('does not mistake the marker for authorization of another group member', async () => {
+    const request = await bound();
+    const result: any = await handleDevRevLaunchAction({ action: DEV_REV_SUBMIT, id: request.id,
+      nonce: request.nonce, [BOTMUX_CALLBACK_MARKER_KEY]: 1 }, form, 'ou_other', context.actor.larkAppId, 'om_card', deps);
+    expect(existsSync(baseDir)).toBe(false); expect(result.toast?.type).toBe('error');
+    expect(deps.driveDetached).not.toHaveBeenCalled();
   });
 });
 
