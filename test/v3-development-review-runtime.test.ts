@@ -81,9 +81,11 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged') {
 describe('created development-review preset on the production runtime', () => {
   it('repairs after a rejection and suspends before any PR creation', async () => {
     const { run, loop, calls, events, outcome, gatedNode } = await fixture('repair');
-    expect(outcome).toMatchObject({ reason: 'awaitingGate', pendingWaits: [expect.objectContaining({ nodeId: gatedNode.id })] });
+    expect(outcome.reason).toBe('awaitingGate');
     expect(calls.some(call => call.id === gatedNode.id)).toBe(false);
     if (outcome.reason === 'awaitingGate') {
+      expect(outcome.pendingWaits).toHaveLength(1);
+      expect(outcome.pendingWaits[0]!.nodeId).toBe(gatedNode.id);
       expect(outcome.pendingWaits[0]!.prompt).toContain('https://example.invalid/pull/23');
     }
     expect(events.filter(event => event.type === 'loopIterationStarted')).toHaveLength(2);
