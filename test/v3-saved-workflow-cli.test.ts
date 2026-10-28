@@ -10,12 +10,24 @@ import {
   assertAgentFacingSaveScope,
   assertDaemonManagedRunBaseDir,
   collectSavedWorkflowRawParams,
+  collectSavedWorkflowRoleArgs,
   contextFromEnv,
   formatSavedWorkflowCliList,
   formatSavedWorkflowCliShow,
 } from '../src/cli/saved-workflow.js';
 
 describe('Saved Workflow CLI param parsing', () => {
+  it('parses separate role declarations and selections, preserving literal bot names', () => {
+    expect(collectSavedWorkflowRoleArgs(['flow', '--role', 'developer=loop/work', '--role=developer=publish'], 'save'))
+      .toMatchObject({ remaining: ['flow'], roleNodes: { developer: ['loop/work', 'publish'] } });
+    expect(collectSavedWorkflowRoleArgs(['flow', '--role', 'developer=My Codex', '--role=regression=MMX'], 'run'))
+      .toMatchObject({ remaining: ['flow'], roleSelections: { developer: 'My Codex', regression: 'MMX' } });
+    for (const args of [['--role'], ['--role=developer='], ['--role', '__proto__=Codex'],
+      ['--role', 'developer=A', '--role', 'developer=B']]) {
+      expect(() => collectSavedWorkflowRoleArgs(args, 'run')).toThrow(/role/i);
+    }
+  });
+
   it('accepts explicit and bare key=value inputs into an own-property-only map', () => {
     const parsed = collectSavedWorkflowRawParams([
       'weekly-report',
@@ -41,6 +53,8 @@ describe('Saved Workflow CLI param parsing', () => {
       '--base-dir=/tmp/runs=staging',
       '--run-id',
       'run=id',
+      '--role', 'developer=Codex',
+      '--role=regression=MMX',
       'city=上海',
     ]);
 

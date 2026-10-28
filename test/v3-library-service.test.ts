@@ -556,6 +556,26 @@ describe('Saved Workflow application service', () => {
     expect(materialized.envelope.chatBinding?.ownerOpenId).not.toBe(OWNER.openId);
   });
 
+  it('allows shared default execution but reserves explicit role choices to the definition owner', async () => {
+    const revision = parameterizedRevision();
+    revision.roles = { developer: { nodes: ['work'], defaultBot: 'cli_test' } };
+    const created = await createSavedWorkflow(dataDir, { displayName: 'shared roles', owner: OWNER,
+      scope: { kind: 'global' }, revision, publish: true });
+    const common = { dataDir, ref: created.metadata.workflowId, rawParams: { city: { kind: 'string' as const, value: '上海' } },
+      bots: [bot(), { larkAppId: 'cli_extra', name: 'Extra', cliId: 'codex', workingDir: '/work' } as any] };
+    const defaults = await instantiatePublishedSavedWorkflow({ ...common, context: context(OTHER),
+      baseDir: runsDir, runId: 'member-defaults' });
+    expect(defaults.dag.nodes[0]!.bot).toBe('cli_test');
+    const rejectedRoot = join(runsDir, 'member-override');
+    await expect(instantiatePublishedSavedWorkflow({ ...common, context: context(OTHER),
+      roleSelections: { developer: 'Extra' }, baseDir: rejectedRoot, runId: 'rejected' }))
+      .rejects.toThrow(/owner|所有者/);
+    expect(existsSync(rejectedRoot)).toBe(false);
+    const owner = await instantiatePublishedSavedWorkflow({ ...common, context: context(OWNER),
+      roleSelections: { developer: 'Extra' }, baseDir: runsDir, runId: 'owner-override' });
+    expect(owner.dag.nodes[0]!.bot).toBe('cli_extra');
+  });
+
   it.each(['group', 'p2p'] as const)(
     'carries authenticated %s chatType into a Saved Workflow schedule run',
     async (chatType) => {

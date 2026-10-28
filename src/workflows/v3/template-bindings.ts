@@ -5,6 +5,7 @@ import type {
   SavedWorkflowParamDef,
 } from './library-schema.js';
 import type { V3Node } from './dag.js';
+import { savedWorkflowRoleMarkerSpans, type SavedWorkflowRoles } from './workflow-roles.js';
 import {
   collectV3HostBindingRefs,
   parseV3HostBindingRef,
@@ -80,6 +81,7 @@ export function assertSavedWorkflowSpecTemplateBindings(
   specTemplate: V3SpecTemplate,
   inputs: Record<string, SavedWorkflowParamDef>,
   contextRefs: readonly SavedWorkflowBuiltinContextRef[],
+  roles?: SavedWorkflowRoles,
 ): void {
   const allowed = (path: string): boolean =>
     path === 'specTemplate.title' ||
@@ -96,6 +98,9 @@ export function assertSavedWorkflowSpecTemplateBindings(
         throw new Error(`Saved Workflow spec marker is not allowed in structural field ${path}`);
       }
       const covered = new Array<boolean>(value.length).fill(false);
+      for (const span of savedWorkflowRoleMarkerSpans(value, roles)) {
+        for (let i = span.start; i < span.start + span.length; i++) covered[i] = true;
+      }
       MARKER_RE.lastIndex = 0;
       for (let match = MARKER_RE.exec(value); match; match = MARKER_RE.exec(value)) {
         const [whole, namespace, name] = match;
@@ -136,6 +141,7 @@ export function assertSavedWorkflowTemplateBindings(
   dagTemplate: V3DagTemplate,
   inputs: Record<string, SavedWorkflowParamDef>,
   contextRefs: readonly SavedWorkflowBuiltinContextRef[],
+  roles?: SavedWorkflowRoles,
 ): void {
   const allowedTextPath = (path: string): boolean =>
     path.endsWith('.goal') ||
@@ -152,6 +158,13 @@ export function assertSavedWorkflowTemplateBindings(
         );
       }
       const covered = new Array<boolean>(value.length).fill(false);
+      const roleSpans = savedWorkflowRoleMarkerSpans(value, roles);
+      if (roleSpans.length && !path.endsWith('.goal') && !path.endsWith('.override.systemPromptAppend')) {
+        throw new Error(`Saved Workflow role marker is not allowed in field ${path}`);
+      }
+      for (const span of roleSpans) {
+        for (let i = span.start; i < span.start + span.length; i++) covered[i] = true;
+      }
       MARKER_RE.lastIndex = 0;
       for (let match = MARKER_RE.exec(value); match; match = MARKER_RE.exec(value)) {
         const [whole, namespace, name] = match;
