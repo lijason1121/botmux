@@ -59,6 +59,7 @@ import { readGrillState } from './grill-state.js';
 import { loadDag } from './dag-loader.js';
 import { validateSpec } from './spec.js';
 import { parseFrozenBotSnapshots } from './bot-resolve.js';
+import type { SavedWorkflowRoleNodes } from './workflow-roles.js';
 
 export interface SavedWorkflowActorContext {
   actor: SavedWorkflowOwner;
@@ -111,6 +112,7 @@ interface SaveTerminalRunBase {
   /** Failed/blocked sources are draft-only and require this explicit opt-in. */
   allowDraft?: boolean;
   acknowledgeUnsafeLiterals?: boolean;
+  roleNodes?: SavedWorkflowRoleNodes;
   now?: Date;
 }
 
@@ -178,6 +180,7 @@ function comparableRevisionDraft(payload: SavedWorkflowWriteResult['revision']['
   return {
     ...(payload.sourceRunId ? { sourceRunId: payload.sourceRunId } : {}),
     inputs: payload.inputs,
+    ...(payload.roles ? { roles: payload.roles } : {}),
     contextRefs: payload.contextRefs,
     specTemplate: payload.specTemplate,
     specStatus: payload.specStatus,
@@ -297,6 +300,7 @@ export interface InstantiatePublishedSavedWorkflowInput {
   ref: string;
   context: SavedWorkflowActorContext;
   rawParams?: Record<string, RawParamInput>;
+  roleSelections?: Record<string, string>;
   bots: BotConfig[];
   baseDir: string;
   runId?: string;
@@ -539,6 +543,7 @@ export async function saveTerminalRunAsWorkflow(
     input.allowDraft === true,
     input.acknowledgeUnsafeLiterals === true,
   );
+  if (input.roleNodes !== undefined) compileOptions.roleNodes = input.roleNodes;
   const compiled = compileSavedWorkflowFromRun(input.runDir, compileOptions);
 
   if (input.workflowId !== undefined) {
@@ -594,6 +599,7 @@ export async function saveTerminalRunAsWorkflowIdempotent(
     false,
     input.acknowledgeUnsafeLiterals === true,
   );
+  if (input.roleNodes !== undefined) compileOptions.roleNodes = input.roleNodes;
   const compiled = compileSavedWorkflowFromRun(input.runDir, compileOptions);
   const scope: SavedWorkflowScope = input.scope === 'global'
     ? { kind: 'global' }
@@ -735,6 +741,11 @@ export async function instantiatePublishedSavedWorkflow(
   // Re-check after the second store read so an archive/scope race cannot make a
   // definition executable after it ceased to be visible to this caller.
   assertMetadataVisibleInContext(current.metadata, context);
+  // Published defaults remain runnable by visible group members. Choosing a
+  // different executor from the local registry is owner authority.
+  if (Object.keys(input.roleSelections ?? {}).length && !sameOwner(current.metadata.owner, context.actor)) {
+    throw new SavedWorkflowPermissionError(current.metadata.workflowId);
+  }
   if (current.metadata.status !== 'active' || !current.metadata.publishedRevision) {
     throw new SavedWorkflowServiceError(
       'not_published',
@@ -746,6 +757,7 @@ export async function instantiatePublishedSavedWorkflow(
     metadata: current.metadata,
     revision: current.revision,
     rawParams: input.rawParams,
+    roleSelections: input.roleSelections,
     context: {
       initiatorOpenId: context.actor.openId,
       chatBinding: {
@@ -859,6 +871,7 @@ function exactCompileOptions(
   ) {
     throw new Error('cannot save workflow: definition snapshot identity does not match run envelope');
   }
+  if (payload.roles) opts.roleNodes = Object.fromEntries(Object.entries(payload.roles).map(([name, role]) => [name, role.nodes]));
   opts.inputs = payload.inputs;
   opts.contextRefs = payload.contextRefs;
   opts.specStatus = payload.specStatus;

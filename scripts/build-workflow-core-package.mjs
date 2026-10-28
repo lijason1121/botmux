@@ -133,6 +133,7 @@ function assertBundleInputsAllowed(metafile) {
     'src/workflows/v3/shared-runtime.ts',
     'src/workflows/v3/state.ts',
     'src/workflows/v3/template-bindings.ts',
+    'src/workflows/v3/workflow-roles.ts',
   ]);
   const packageSourcePrefix = 'packages/workflow-core/src/';
   const unexpected = Object.keys(metafile.inputs)

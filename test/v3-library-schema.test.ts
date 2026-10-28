@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { validateSavedWorkflowRoles } from '../src/workflows/v3/workflow-roles.js';
 
 import {
   SAVED_WORKFLOW_METADATA_SCHEMA_VERSION,
@@ -70,6 +71,44 @@ function payload(overrides: Partial<SavedWorkflowRevisionPayloadV1> = {}): Saved
 }
 
 describe('v3 Saved Workflow library schema', () => {
+  it('rejects slash-bearing ids and duplicate paths at the role-binding boundary', () => {
+    const node = dagTemplate().nodes[0]!;
+    expect(() => validateSavedWorkflowRoles({ role: { nodes: ['research'], defaultBot: 'cli_research' } }, [node, node]))
+      .toThrow(/ambiguous role goal path/);
+    expect(() => validateSavedWorkflowRoles({ role: { nodes: ['loop/research'], defaultBot: 'cli_research' } },
+      [{ ...node, id: 'loop/research' }])).toThrow(/invalid role goal path segment/);
+    expect(() => validateDagTemplate({ schemaVersion: 2, nodes: [{ ...node, id: 'loop/research' }] }))
+      .toThrow(/path-safe/);
+  });
+
+  it('roundtrips explicit roles while rejecting invalid bindings and identity markers outside narrative fields', () => {
+    const original = payload();
+    const roles = { developer: { nodes: ['research'], defaultBot: 'cli_research' } };
+    original.roles = roles;
+    original.dagTemplate.nodes[0]!.goal = 'Run by ${roles.developer.label} (${roles.developer.cliId})';
+    original.specTemplate.requirement = 'Run by ${roles.developer.bot}';
+    expect(loadSavedWorkflowRevision(buildSavedWorkflowRevision(original)).payload.roles).toEqual(roles);
+    for (const invalidRoles of [
+      { developer: { nodes: ['missing'], defaultBot: 'cli_research' } },
+      { developer: { nodes: ['research', 'research'], defaultBot: 'cli_research' } },
+      { developer: roles.developer, regression: roles.developer },
+      { developer: { nodes: ['research'], defaultBot: 'other' } },
+      JSON.parse('{"__proto__":{"nodes":["research"],"defaultBot":"cli_research"}}'),
+    ]) expect(() => validateSavedWorkflowRevisionPayload({ ...original, roles: invalidRoles })).toThrow(/role/i);
+    for (const marker of ['${roles.developer.secret}', '${roles.missing.label}', '${roles.developer.label.more}']) {
+      const changed = structuredClone(original);
+      changed.dagTemplate.nodes[0]!.goal = marker;
+      expect(() => validateSavedWorkflowRevisionPayload(changed)).toThrow();
+    }
+    const gate = structuredClone(original);
+    gate.dagTemplate.nodes[0]!.humanGate = { prompt: '${roles.developer.label}' };
+    gate.safety.gateDigest = computeSavedWorkflowGateDigest(gate.dagTemplate);
+    expect(() => validateSavedWorkflowRevisionPayload(gate)).toThrow(/structural\/safety/);
+    const bot = structuredClone(original);
+    bot.dagTemplate.nodes[0]!.bot = '${roles.developer.bot}';
+    expect(() => validateSavedWorkflowRevisionPayload(bot)).toThrow();
+  });
+
   it('keeps a Unicode display name while workflowId remains path-safe', () => {
     expect(mintSavedWorkflowId('12345678-1234-1234-1234-1234567890ab'))
       .toBe('wf_123456781234123412341234567890ab');

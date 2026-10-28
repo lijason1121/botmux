@@ -18,11 +18,13 @@ import {
 } from '../workflows/v3/library-service.js';
 import { SAVED_WORKFLOW_PARAM_NAME_RE } from '../workflows/v3/library-schema.js';
 import { postWorkflowDaemonMutation } from '../workflows/v3/daemon-ipc-client.js';
+import { collectSavedWorkflowRoleArgs, savedWorkflowRoleSummary } from '../workflows/v3/workflow-roles.js';
+export { collectSavedWorkflowRoleArgs } from '../workflows/v3/workflow-roles.js';
 
 const FORBIDDEN_PARAM_NAMES = new Set(['__proto__', 'prototype', 'constructor']);
-const RUN_FLAGS_WITH_VALUE = new Set(['--library-dir', '--base-dir', '--run-id']);
+const RUN_FLAGS_WITH_VALUE = new Set(['--library-dir', '--base-dir', '--run-id', '--role']);
 const SAVE_FLAGS_WITH_VALUE = new Set([
-  '--library-dir', '--base-dir', '--workflow-id', '--expected-revision',
+  '--library-dir', '--base-dir', '--workflow-id', '--expected-revision', '--role',
 ]);
 const SAVE_BOOLEAN_FLAGS = new Set(['--json', '--allow-draft']);
 
@@ -52,6 +54,7 @@ export function formatSavedWorkflowCliShow(
     `status: ${loaded.metadata.status}`,
     `revision: v${loaded.revision.payload.humanVersion} (${loaded.revision.revisionId})`,
     `params: ${params.length > 0 ? params.join(', ') : '(无)'}`,
+    ...(loaded.revision.payload.roles ? [`roles: ${Object.entries(loaded.revision.payload.roles).map(([name, role]) => `${name}=${role.defaultBot} [${role.nodes.join(', ')}]`).join('; ')}`] : []),
   ].join('\n');
 }
 
@@ -305,8 +308,9 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
     // Keep this path chat-scoped and require the daemon-owned slash command
     // for the privileged scope transition.
     assertAgentFacingSaveScope(args);
+    const { roleNodes } = collectSavedWorkflowRoleArgs(args, 'save');
     const positional = positionals(args, [
-      '--library-dir', '--base-dir', '--workflow-id', '--expected-revision',
+      '--library-dir', '--base-dir', '--workflow-id', '--expected-revision', '--role',
     ]);
     const source = positional[0] ?? 'last';
     const displayName = positional.slice(1).join(' ').trim() || undefined;
@@ -321,6 +325,7 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
       expectedLatestRevision: argValue(args, '--expected-revision'),
       allowDraft: hasFlag(args, '--allow-draft'),
       acknowledgeUnsafeLiterals: false,
+      ...(roleNodes ? { roleNodes } : {}),
     } : {
       dataDir,
       runDir,
@@ -329,6 +334,7 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
       scope: 'chat',
       allowDraft: hasFlag(args, '--allow-draft'),
       acknowledgeUnsafeLiterals: false,
+      ...(roleNodes ? { roleNodes } : {}),
     });
     if (json) console.log(JSON.stringify(result, null, 2));
     else {
@@ -344,7 +350,8 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
 
   if (sub === 'run') {
     assertDaemonManagedRunBaseDir(baseDir);
-    const positional = positionals(args, ['--library-dir', '--base-dir', '--param', '--param-json', '--run-id']);
+    const { roleSelections } = collectSavedWorkflowRoleArgs(args, 'run');
+    const positional = positionals(args, ['--library-dir', '--base-dir', '--param', '--param-json', '--run-id', '--role']);
     const ref = positional.find((token) => !token.includes('='));
     if (!ref) throw new Error('用法: botmux workflow run <名称|workflowId> [--param key=value]');
     const materialized = await instantiatePublishedSavedWorkflow({
@@ -352,13 +359,16 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
       ref,
       context,
       rawParams: collectSavedWorkflowRawParams(args),
+      ...(roleSelections ? { roleSelections } : {}),
       bots: loadBotConfigs(),
       baseDir,
       runId: argValue(args, '--run-id'),
     });
     await startMaterializedRun(materialized.runId, context.actor.larkAppId);
-    if (json) console.log(JSON.stringify({ runId: materialized.runId, runDir: materialized.runDir }, null, 2));
-    else console.log(`✅ Saved Workflow 已启动：${materialized.runId}`);
+    if (json) console.log(JSON.stringify({ runId: materialized.runId, runDir: materialized.runDir,
+      ...(materialized.resolvedRoles ? { resolvedRoles: materialized.resolvedRoles } : {}) }, null, 2));
+    else console.log(`✅ Saved Workflow 已启动：${materialized.runId}` +
+      (materialized.resolvedRoles ? `\n${savedWorkflowRoleSummary(materialized.resolvedRoles)}` : ''));
     return;
   }
 

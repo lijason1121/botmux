@@ -105,6 +105,34 @@ function seedSucceededAdHocRun(
 }
 
 describe('Saved Workflow compiler', () => {
+  it('does not require an unused default snapshot for a loop whose goals all choose explicit bots', () => {
+    const base = fresh('v3-lib-loop-');
+    try {
+      const loaded = loadAuthorizedV3Run(seedSucceededAdHocRun(base));
+      loaded.dag.nodes = [{ id: 'review', type: 'loop', depends: [], inputs: [], maxIterations: 2,
+        body: { nodes: [{ id: 'work', type: 'goal', goal: 'review', bot: 'Reviewer', depends: [], inputs: [],
+          resultSchema: { type: 'object', properties: { passed: { type: 'boolean' } }, required: ['passed'] } }] },
+        exit: { node: 'work', when: { path: 'result.passed', equals: true } } }];
+      loaded.botSnapshots = { Reviewer: { larkAppId: 'cli_reviewer', cliId: 'codex', workingDir: '/source' } };
+      const built = buildSavedWorkflowRevisionBaseline(loaded);
+      expect(built.revision.dagTemplate.nodes[0]!.body!.nodes[0]!.bot).toBe('cli_reviewer');
+      expect(built.revision.dagTemplate.nodes[0]!.bot).toBeUndefined();
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('declares a role using the actually frozen source bot identity', () => {
+    const base = fresh('v3-lib-role-compile-');
+    try {
+      const compiled = compileSavedWorkflowFromRun(seedSucceededAdHocRun(base), {
+        roleNodes: { developer: ['work'] },
+      } as any);
+      expect((compiled.revision as any).roles).toEqual({ developer: { nodes: ['work'], defaultBot: 'cli_test' } });
+      expect(() => compileSavedWorkflowFromRun(join(base, 'source-run'), {
+        roleNodes: { developer: ['unknown'] },
+      } as any)).toThrow(/role.*unknown/i);
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
   it('solidifies a successful run exactly and canonicalizes default bot to larkAppId', () => {
     const base = fresh('v3-lib-compile-');
     try {
@@ -135,6 +163,8 @@ describe('Saved Workflow compiler', () => {
         'Use api_key=abcdef123456 from /root/private/config.json',
       );
       expect(() => compileSavedWorkflowFromRun(runDir)).toThrow(/lint requires confirmation/);
+      expect(() => compileSavedWorkflowFromRun(runDir, { roleNodes: { developer: ['work'] } }))
+        .toThrow(SavedWorkflowUnsafeLiteralError);
       const compiled = compileSavedWorkflowFromRun(runDir, { acknowledgeUnsafeLiterals: true });
       expect(compiled.lintWarnings).toEqual(expect.arrayContaining([
         expect.stringContaining('embedded secret'),
@@ -349,6 +379,126 @@ describe('Saved Workflow compiler', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Saved Workflow execution roles', () => {
+  it('binds three independent loop roles and multiple development goals by stable ids', async () => {
+    const root = fresh('v3-lib-loop-roles-');
+    try {
+      const loaded = loadAuthorizedV3Run(seedSucceededAdHocRun(join(root, 'source')));
+      const goal = (id: string, bot: string): V3Node => ({ id, bot, type: 'goal', goal: 'work', depends: [], inputs: [],
+        resultSchema: { type: 'object', properties: { passed: { type: 'boolean' } }, required: ['passed'] } });
+      loaded.dag.nodes = [{ id: 'review', type: 'loop', depends: [], inputs: [], maxIterations: 2,
+        body: { nodes: [goal('develop', 'Dev'), goal('check', 'Check'), goal('regress', 'Regress')] },
+        exit: { node: 'regress', when: { path: 'result.passed', equals: true } } }, goal('publish', 'Dev')];
+      loaded.botSnapshots = {
+        Dev: { larkAppId: 'cli_dev', cliId: 'codex', workingDir: '/source' },
+        Check: { larkAppId: 'cli_check', cliId: 'claude-code', workingDir: '/source' },
+        Regress: { larkAppId: 'cli_regress', cliId: 'minimax', workingDir: '/source' },
+      };
+      const declarations = { developer: ['review/develop', 'publish'], correctness: ['review/check'], regression: ['review/regress'] };
+      const baseline = buildSavedWorkflowRevisionBaseline(loaded, { roleNodes: declarations });
+      expect(baseline.revision.roles).toMatchObject({ developer: { defaultBot: 'cli_dev' },
+        correctness: { defaultBot: 'cli_check' }, regression: { defaultBot: 'cli_regress' } });
+      expect(() => buildSavedWorkflowRevisionBaseline(loaded, { roleNodes: { combined: ['review/develop', 'review/regress'] } })).toThrow(/inconsistent default bot/);
+      expect(() => buildSavedWorkflowRevisionBaseline(loaded, { roleNodes: { invalid: ['review'] } })).toThrow(/unknown goal/);
+      const saved = await createSavedWorkflow(join(root, 'data'), { displayName: 'three roles', owner: OWNER,
+        scope: { kind: 'chat', chatId: BINDING.chatId }, revision: baseline.revision, publish: true });
+      const run = materializeSavedWorkflowRun({ ...saved, context: { chatBinding: BINDING }, baseDir: join(root, 'runs'),
+        bots: [{ larkAppId: 'cli_dev', cliId: 'codex' }, { larkAppId: 'cli_check', cliId: 'claude-code' },
+          { larkAppId: 'cli_regress', cliId: 'minimax' }] as any,
+        roleSelections: { developer: 'cli_check', regression: 'cli_dev' } });
+      expect(run.dag.nodes[0]!.body!.nodes.map(n => n.bot)).toEqual(['cli_check', 'cli_check', 'cli_dev']);
+      expect(run.dag.nodes[1]!.bot).toBe('cli_check');
+      expect(loadAuthorizedV3Run(run.runDir).resolvedRoles).toEqual(run.resolvedRoles);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('changes actual node/snapshot identity, renders only narrative markers, and integrity-pins the actual binding', async () => {
+    const root = fresh('v3-lib-role-run-');
+    try {
+      const compiled = compileSavedWorkflowFromRun(seedSucceededAdHocRun(join(root, 'source')), {
+        roleNodes: { developer: ['work'] },
+      });
+      compiled.revision.dagTemplate.nodes[0]!.goal = '${roles.developer.label} writes using ${roles.developer.bot} (${roles.developer.cliId}); repo=${params.repo_path}, chat=${context.chatId}';
+      compiled.revision.inputs = { repo_path: { type: 'string', default: 'project' } };
+      compiled.revision.contextRefs = ['chatId'];
+      compiled.revision.dagTemplate.nodes[0]!.humanGate = { prompt: 'Approve the development role output', approvers: ['ou_owner'] };
+      compiled.revision.specTemplate.requirement = 'Work by ${roles.developer.label}';
+      const schema = await import('../src/workflows/v3/library-schema.js');
+      compiled.revision.dagTemplate = schema.validateDagTemplate(compiled.revision.dagTemplate);
+      compiled.revision.safety.gateDigest = schema.computeSavedWorkflowGateDigest(compiled.revision.dagTemplate);
+      const saved = await createSavedWorkflow(join(root, 'data'), {
+        displayName: 'role workflow', owner: OWNER, scope: { kind: 'chat', chatId: BINDING.chatId },
+        revision: compiled.revision, publish: true,
+      });
+      const bots = [
+        { larkAppId: 'cli_test', name: 'Original', cliId: 'claude-code', workingDir: '/work' },
+        { larkAppId: 'cli_codex', name: 'Codex', cliId: 'codex', workingDir: '/work' },
+      ] as any;
+      const common = { ...saved, context: { chatBinding: BINDING }, bots, baseDir: join(root, 'runs') };
+      const memberRoot = join(root, 'member-runs');
+      expect(() => materializeSavedWorkflowRun({ ...common, baseDir: memberRoot,
+        context: { initiatorOpenId: 'ou_member', chatBinding: { ...BINDING, ownerOpenId: 'ou_member' } },
+        roleSelections: { developer: 'Codex' } })).toThrow(/owner|所有者/);
+      expect(existsSync(memberRoot)).toBe(false);
+      expect(() => materializeSavedWorkflowRun({ ...common, baseDir: memberRoot,
+        context: { initiatorOpenId: OWNER.openId, chatBinding: { ...BINDING, ownerOpenId: 'ou_member' } },
+        roleSelections: { developer: 'Codex' } })).toThrow(/owner|所有者/);
+      const run = materializeSavedWorkflowRun({ ...common, runId: 'selected', roleSelections: { developer: 'Codex' } });
+      expect(run.dag.nodes[0]).toMatchObject({ bot: 'cli_codex', goal: 'Codex writes using cli_codex (codex); repo=${params.repo_path}, chat=${context.chatId}',
+        humanGate: compiled.revision.dagTemplate.nodes[0]!.humanGate });
+      expect(run.botSnapshots.get('cli_codex')).toMatchObject({ larkAppId: 'cli_codex', cliId: 'codex' });
+      expect(run.spec.requirement).toBe('Work by Codex');
+      expect(run.dag.nodes[0]!.override!.systemPromptAppend).toContain('developer: Codex (cli_codex, codex)');
+      expect(run.envelope.artifacts.resolvedRoles).toMatchObject({ path: 'roles.resolved.json' });
+      const loaded = loadAuthorizedV3Run(run.runDir);
+      expect(loaded.resolvedRoles).toEqual({ developer: { nodes: ['work'], bot: 'cli_codex', label: 'Codex', cliId: 'codex' } });
+      appendEvent(join(run.runDir, 'journal.ndjson'), { type: 'runStarted', runId: run.runId });
+      appendEvent(join(run.runDir, 'journal.ndjson'), { type: 'runSucceeded' });
+      const direct = compileSavedWorkflowFromRun(run.runDir);
+      expect(direct.revision.inputs).toEqual(compiled.revision.inputs);
+      expect(direct.revision.contextRefs).toEqual(['chatId']);
+      const resaved = await saveTerminalRunAsWorkflow({ dataDir: join(root, 'data'), runDir: run.runDir,
+        context: { actor: OWNER, chatId: BINDING.chatId }, displayName: 'role workflow again' });
+      expect(resaved.revision.payload.roles!.developer!.defaultBot).toBe('cli_codex');
+      expect(resaved.revision.payload.inputs).toEqual(compiled.revision.inputs);
+      expect(resaved.revision.payload.contextRefs).toEqual(['chatId']);
+      expect(resaved.revision.payload.dagTemplate.nodes[0]!.goal).toBe(compiled.revision.dagTemplate.nodes[0]!.goal);
+      expect(resaved.revision.payload.dagTemplate.nodes[0]!.override?.systemPromptAppend).toBeUndefined();
+      expect(resaved.revision.payload.specTemplate.requirement).toBe('Work by ${roles.developer.label}');
+      const another = materializeSavedWorkflowRun({ ...common, ...resaved, runId: 'resaved', roleSelections: { developer: 'Original' } });
+      expect(another.dag.nodes[0]!.goal).toBe('Original writes using cli_test (claude-code); repo=${params.repo_path}, chat=${context.chatId}');
+      const defaultRun = materializeSavedWorkflowRun({ ...common, runId: 'default' });
+      expect(defaultRun.dag.nodes[0]!.bot).toBe('cli_test');
+      bots[1].name = 'Changed'; bots[1].cliId = 'minimax';
+      expect(loadAuthorizedV3Run(run.runDir).resolvedRoles).toEqual(loaded.resolvedRoles);
+      writeJson(join(run.runDir, 'roles.resolved.json'), { developer: { bot: 'cli_test' } });
+      expect(() => loadAuthorizedV3Run(run.runDir)).toThrow(/roles.resolved.json.*digest|digest.*roles.resolved.json/i);
+      writeJson(join(run.runDir, 'roles.resolved.json'), {
+        developer: { nodes: ['work'], bot: 'cli_test', label: 'Changed', cliId: 'claude-code' },
+      });
+      writeJson(join(run.runDir, 'run.json'), { ...run.envelope, artifacts: { ...run.envelope.artifacts,
+        resolvedRoles: artifactRef(run.runDir, 'roles.resolved.json') } });
+      expect(() => loadAuthorizedV3Run(run.runDir)).toThrow(/disagrees with goal or frozen bot/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('rejects invalid roles/bots before even creating the runs root', async () => {
+    const root = fresh('v3-lib-role-invalid-');
+    try {
+      const compiled = compileSavedWorkflowFromRun(seedSucceededAdHocRun(join(root, 'source')), { roleNodes: { developer: ['work'] } });
+      const saved = await createSavedWorkflow(join(root, 'data'), {
+        displayName: 'roles', owner: OWNER, scope: { kind: 'chat', chatId: BINDING.chatId }, revision: compiled.revision, publish: true,
+      });
+      for (const roleSelections of [{ wrong: 'Codex' }, { developer: 'Missing bot' }, { developer: '' }]) {
+        const baseDir = join(root, `runs-${Object.keys(roleSelections)[0]}`);
+        expect(() => materializeSavedWorkflowRun({ ...saved, context: { chatBinding: BINDING }, roleSelections,
+          bots: [{ larkAppId: 'cli_test', cliId: 'claude-code' } as any], baseDir })).toThrow();
+        expect(existsSync(baseDir)).toBe(false);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

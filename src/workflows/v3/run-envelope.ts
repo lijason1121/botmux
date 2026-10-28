@@ -38,6 +38,7 @@ import { validateDag, type V3Dag } from './dag.js';
 import { validateSpec } from './spec.js';
 import type { Spec } from './contract.js';
 import type { RunChatBinding } from './grill-state.js';
+import { assertResolvedSavedWorkflowRoles } from './workflow-roles.js';
 
 export const V3_RUN_ENVELOPE_FILE = 'run.json';
 export const V3_RUN_ENVELOPE_SCHEMA_VERSION = 1 as const;
@@ -54,6 +55,7 @@ export type V3RunArtifactPath =
   | 'spec.json'
   | 'bots.snapshot.json'
   | 'params.resolved.json'
+  | 'roles.resolved.json'
   | 'definition.snapshot.json';
 
 export interface V3ArtifactRef<Path extends V3RunArtifactPath = V3RunArtifactPath> {
@@ -125,6 +127,7 @@ const savedDefinitionEnvelopeSchema = z.object({
     spec: artifactRefSchema('spec.json'),
     botSnapshots: artifactRefSchema('bots.snapshot.json'),
     resolvedParams: artifactRefSchema('params.resolved.json'),
+    resolvedRoles: artifactRefSchema('roles.resolved.json').optional(),
     definitionSnapshot: artifactRefSchema('definition.snapshot.json'),
   }).strict(),
   authorization: z.object({
@@ -549,6 +552,7 @@ export interface LoadedAuthorizedV3Run {
   /** Shape validation belongs to the bot-snapshot materializer; kept as exact JSON here. */
   botSnapshots?: unknown;
   resolvedParams?: unknown;
+  resolvedRoles?: unknown;
   definitionSnapshot?: unknown;
   /** Exact idempotency request for `botmux goal run`, when present. */
   goalRequest?: unknown;
@@ -559,6 +563,7 @@ export interface LoadedAuthorizedV3Run {
     spec?: Buffer;
     botSnapshots?: Buffer;
     resolvedParams?: Buffer;
+    resolvedRoles?: Buffer;
     definitionSnapshot?: Buffer;
     goalRequest?: Buffer;
   };
@@ -620,6 +625,7 @@ export function loadAuthorizedV3Run(
   let spec: Spec | undefined;
   let botSnapshots: unknown;
   let resolvedParams: unknown;
+  let resolvedRoles: unknown;
   let definitionSnapshot: unknown;
   let goalRequest: unknown;
 
@@ -655,6 +661,11 @@ export function loadAuthorizedV3Run(
     bytes.resolvedParams = paramBytes;
     resolvedParams = parseJsonArtifact(paramBytes, 'params.resolved.json');
   }
+  if ('resolvedRoles' in envelope.artifacts && envelope.artifacts.resolvedRoles) {
+    const roleBytes = verifyArtifact(runDir, envelope.artifacts.resolvedRoles);
+    bytes.resolvedRoles = roleBytes;
+    resolvedRoles = parseJsonArtifact(roleBytes, 'roles.resolved.json');
+  }
   if ('definitionSnapshot' in envelope.artifacts) {
     const definitionBytes = verifyArtifact(runDir, envelope.artifacts.definitionSnapshot);
     bytes.definitionSnapshot = definitionBytes;
@@ -686,9 +697,18 @@ export function loadAuthorizedV3Run(
         'definition.snapshot.json',
       );
     }
+    try {
+      assertResolvedSavedWorkflowRoles(resolvedRoles,
+        snapshot.definition && typeof snapshot.definition === 'object'
+          ? (snapshot.definition as Record<string, unknown>).roles : undefined,
+        dag.nodes, botSnapshots);
+    } catch (err) {
+      throw new RunEnvelopeIntegrityError('artifact_invalid_content',
+        err instanceof Error ? err.message : String(err), 'roles.resolved.json');
+    }
   }
 
-  return { envelope, dag, spec, botSnapshots, resolvedParams, definitionSnapshot, goalRequest, bytes };
+  return { envelope, dag, spec, botSnapshots, resolvedParams, resolvedRoles, definitionSnapshot, goalRequest, bytes };
 }
 
 function canonicalize(value: unknown): unknown {

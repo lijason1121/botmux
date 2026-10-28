@@ -1,4 +1,5 @@
 /** Lightweight IM parser for the Saved Workflow portion of `/workflow`. */
+import { collectSavedWorkflowRoleArgs, type SavedWorkflowRoleNodes } from '../../workflows/v3/workflow-roles.js';
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SAFE_PARAM_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
@@ -16,8 +17,9 @@ export type V3SavedWorkflowCommand =
       acknowledgeUnsafeLiterals: boolean;
       /** Ask the host to propose a parameterized definition before publishing. */
       distill: boolean;
+      roleNodes?: SavedWorkflowRoleNodes;
     }
-  | { kind: 'run'; ref: string; rawParams: Record<string, string> }
+  | { kind: 'run'; ref: string; rawParams: Record<string, string>; roleSelections?: Record<string, string> }
   | { kind: 'cancel'; runId: string }
   | { kind: 'list' }
   | { kind: 'show'; ref: string }
@@ -71,7 +73,11 @@ export function parseV3SavedWorkflowCommand(content: string): V3SavedWorkflowCom
     if (source !== 'last' && !SAFE_RUN_ID.test(source)) {
       return { kind: 'invalid', error: 'save 的 runId 非法' };
     }
-    const rest = tokens.slice(source === 'last' && firstSaveArg?.startsWith('--') ? 1 : 2);
+    const rawRest = tokens.slice(source === 'last' && firstSaveArg?.startsWith('--') ? 1 : 2);
+    let roleArgs;
+    try { roleArgs = collectSavedWorkflowRoleArgs(rawRest, 'save'); }
+    catch (err) { return { kind: 'invalid', error: err instanceof Error ? err.message : String(err) }; }
+    const rest = roleArgs.remaining;
     const supportedFlags = new Set(['--global', '--ack-unsafe', '--distill']);
     const malformedDistill = rest.find((token) =>
       token === '--distil' || token.startsWith('--distill='));
@@ -103,6 +109,7 @@ export function parseV3SavedWorkflowCommand(content: string): V3SavedWorkflowCom
     if (distill && acknowledgeUnsafeLiterals) {
       return { kind: 'invalid', error: '参数蒸馏不接受 --ack-unsafe；疑似敏感内容会直接拒绝固化' };
     }
+    if (distill && roleArgs.roleNodes) return { kind: 'invalid', error: '--role 声明不与参数蒸馏混用' };
     return {
       kind: 'save',
       source,
@@ -110,13 +117,18 @@ export function parseV3SavedWorkflowCommand(content: string): V3SavedWorkflowCom
       global,
       acknowledgeUnsafeLiterals,
       distill,
+      ...(roleArgs.roleNodes ? { roleNodes: roleArgs.roleNodes } : {}),
     };
   }
 
-  const runTokens = tokenizeWorkflowRunTail(tail.slice(tokens[0]!.length).trim());
-  if (!runTokens) {
+  const tokenizedRun = tokenizeWorkflowRunTail(tail.slice(tokens[0]!.length).trim());
+  if (!tokenizedRun) {
     return { kind: 'invalid', error: 'run 参数引号未闭合；多词值请写成 key="multi word"' };
   }
+  let roleArgs;
+  try { roleArgs = collectSavedWorkflowRoleArgs(tokenizedRun, 'run'); }
+  catch (err) { return { kind: 'invalid', error: err instanceof Error ? err.message : String(err) }; }
+  const runTokens = roleArgs.remaining;
   const firstParamIndex = runTokens.findIndex((token) => token.includes('='));
   const refTokens = firstParamIndex === -1 ? runTokens : runTokens.slice(0, firstParamIndex);
   const ref = refTokens.join(' ').trim();
@@ -145,7 +157,7 @@ export function parseV3SavedWorkflowCommand(content: string): V3SavedWorkflowCom
     }
     rawParams[key] = token.slice(eq + 1);
   }
-  return { kind: 'run', ref, rawParams };
+  return { kind: 'run', ref, rawParams, ...(roleArgs.roleSelections ? { roleSelections: roleArgs.roleSelections } : {}) };
 }
 
 /** Minimal IM quoting: preserve ordinary bytes, but let a value contain spaces
@@ -186,9 +198,9 @@ function tokenizeWorkflowRunTail(value: string): string[] | undefined {
 export function v3SavedWorkflowUsage(): string {
   return [
     'Saved Workflow：',
-    '/workflow save [last|runId] [名称] [--global（当前 Bot 全局）] [--ack-unsafe]',
+    '/workflow save [last|runId] [名称] [--role developer=loopId/goalId ...] [--global（当前 Bot 全局）] [--ack-unsafe]',
     '/workflow save [last|runId] <名称> --distill（参数化后保存到本群）',
-    '/workflow run <名称或 workflowId> [key=value ...]（多词值可用 key="multi word"）',
+    '/workflow run <名称或 workflowId> [key=value ...] [--role developer=BotName ...]（多词值可用 key="multi word"）',
     '/workflow cancel <runId>',
     '/workflow list',
     '/workflow show <名称或 workflowId>',

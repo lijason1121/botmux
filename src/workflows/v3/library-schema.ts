@@ -17,7 +17,8 @@ import type { V3Node } from './dag.js';
 import { DagValidationError, isGoalNode, isLoopNode, validateDag } from './dag.js';
 import type { Spec } from './contract.js';
 import { SpecValidationError, validateSpec } from './spec.js';
-import { assertSavedWorkflowTemplateBindings } from './template-bindings.js';
+import { assertSavedWorkflowTemplateBindings, assertSavedWorkflowSpecTemplateBindings } from './template-bindings.js';
+import { validateSavedWorkflowRoles, type SavedWorkflowRoles } from './workflow-roles.js';
 
 // Compatibility export for callers that historically imported the encoder
 // from the Saved Workflow schema module.
@@ -114,6 +115,7 @@ export interface SavedWorkflowRevisionPayloadV1 {
   createdBy: SavedWorkflowOwner;
   sourceRunId?: string;
   inputs: Record<string, SavedWorkflowParamDef>;
+  roles?: SavedWorkflowRoles;
   contextRefs: SavedWorkflowBuiltinContextRef[];
   specTemplate: V3SpecTemplate;
   /** DAG is execution truth; this flag makes documentation drift explicit. */
@@ -699,9 +701,13 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
     else throw err;
   }
   const safeDag = dagTemplate ?? { nodes: [] };
+  let roles: SavedWorkflowRoles | undefined;
+  try { roles = validateSavedWorkflowRoles(raw.roles, safeDag.nodes); }
+  catch (err) { problems.push(err instanceof Error ? err.message : String(err)); }
   if (dagTemplate) {
     try {
-      assertSavedWorkflowTemplateBindings(dagTemplate, inputs, contextRefs);
+      assertSavedWorkflowTemplateBindings(dagTemplate, inputs, contextRefs, roles);
+      if (roles && specTemplate) assertSavedWorkflowSpecTemplateBindings(specTemplate, inputs, contextRefs, roles);
     } catch (err) {
       problems.push(
         `dagTemplate bindings: ${err instanceof Error ? err.message : String(err)}`,
@@ -718,6 +724,7 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
     createdBy,
     ...(sourceRunId ? { sourceRunId } : {}),
     inputs,
+    ...(roles ? { roles } : {}),
     contextRefs,
     specTemplate,
     specStatus,
@@ -735,7 +742,7 @@ export function validateSavedWorkflowRevisionDraft(raw: unknown): SavedWorkflowR
   if (!isRecord(raw)) throw new SavedWorkflowSchemaError(['revision draft must be an object']);
   const allowed = new Set([
     'sourceRunId', 'inputs', 'contextRefs', 'specTemplate', 'specStatus',
-    'dagTemplate', 'safety',
+    'dagTemplate', 'safety', 'roles',
   ]);
   const extra = Object.keys(raw).filter((key) => !allowed.has(key));
   if (extra.length > 0) {

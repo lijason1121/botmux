@@ -3,6 +3,18 @@ import { parseV3SavedWorkflowCommand } from '../src/im/lark/v3-saved-workflow-co
 import { stripBotMentions } from '../src/im/lark/message-parser.js';
 
 describe('parseV3SavedWorkflowCommand', () => {
+  it('keeps role choices separate from params and rejects duplicate or malformed roles', () => {
+    expect(parseV3SavedWorkflowCommand('/workflow run 开发流程 --role developer=Codex --role regression="My MMX" repo=demo'))
+      .toMatchObject({ kind: 'run', ref: '开发流程', roleSelections: { developer: 'Codex', regression: 'My MMX' }, rawParams: { repo: 'demo' } });
+    expect(parseV3SavedWorkflowCommand('/workflow save last 开发流程 --role developer=review/code --role correctness=review/audit'))
+      .toMatchObject({ kind: 'save', displayName: '开发流程', roleNodes: { developer: ['review/code'], correctness: ['review/audit'] } });
+    for (const tail of ['--role developer=A --role developer=B', '--role developer=', '--role __proto__=A', '--role']) {
+      expect(parseV3SavedWorkflowCommand(`/workflow run 开发流程 ${tail}`)).toMatchObject({ kind: 'invalid' });
+    }
+    expect(parseV3SavedWorkflowCommand('/workflow save last 开发流程 --role developer=work --distill'))
+      .toMatchObject({ kind: 'invalid' });
+  });
+
   it('keeps ordinary ad-hoc goals out of the saved-command parser', () => {
     expect(parseV3SavedWorkflowCommand('/workflow 调研竞品并出报告')).toBeNull();
     expect(parseV3SavedWorkflowCommand('/workflow new 调研')).toBeNull();

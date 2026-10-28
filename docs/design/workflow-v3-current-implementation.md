@@ -679,6 +679,21 @@ Scope：
 
 ### 9.5 运行 Saved Workflow
 
+Saved Workflow 可以显式声明执行角色。保存时，`--role developer=loopId/goalId` 把角色绑定到稳定的 goal 节点路径；顶层 goal 直接写 id。同一角色可重复声明以绑定多个 goal，但这些 goal 的源冻结 bot 必须一致。loop、host、重复节点及跨角色重复绑定均拒绝。默认机器人身份取自源 run 的冻结快照。
+
+```text
+/workflow save last 开发审查 --role developer=review/develop --role correctness=review/check --role regression=review/regression
+/workflow run 开发审查 --role developer=Codex --role correctness=Claude --role regression=MMX
+```
+
+CLI 使用同样的 `--role` 参数。运行时选择会通过已有 bot registry 解析成真实 `node.bot` 与 bot snapshot；未提供选择时使用保存的默认 app identity。显式 `--role` 选择仅允许定义 owner（同 app + openId）；其它可见群成员仍可不传 `--role` 运行作者默认绑定。服务层与低层物化器均在启动前校验此边界。未知角色、未知/不支持的 bot、重复选择和非法绑定会在创建 run/启动意图/worker 前失败。普通参数仍通过 `key=value` 或 CLI 的 `--param` 提供，不能用参数插值修改 bot 字段。
+
+有角色的运行会封存 `roles.resolved.json` 并将摘要纳入 `run.json`；恢复时核对该文件、DAG 及 bot snapshot，配置变更不会改写已启动的角色身份。goal 附加指令及启动响应包含实际角色与 bot/CLI 对照，便于报告核对。不含 roles 的旧 revision 保持原有默认行为。
+
+角色身份叙述仅支持 `${roles.developer.label}`、`${roles.developer.bot}`、`${roles.developer.cliId}` 三种字段，且只允许在 goal、`override.systemPromptAppend` 和 Spec 叙述中出现。`label` 为选中 bot 的显示名称（缺省使用 app identity）；不能读取其它配置字段。Human Gate 的提示、审批人、选项和 digest 边界不变，禁止角色 marker。保存不会自动重写自然语言里硬编码的名称/appId、旧 SHA、私有资产路径或业务约束；角色可配置并不代表这类源任务已通用化。
+
+当前 `--role` 声明不能与 IM `--distill` 混用，会明确拒绝；agent-facing CLI 对 `--distill`、`--global`、`--ack-unsafe` 的原有限制仍生效。本段描述源码能力；更新模板/skill 文本不代表已安装 CLI、运行中的 daemon 或全局 skill 已同步。
+
 ```text
 /workflow run 周报 repo=botmux days=7
 ```

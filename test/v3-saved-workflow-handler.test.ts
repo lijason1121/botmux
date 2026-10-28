@@ -159,13 +159,15 @@ describe('Saved Workflow execution seam', () => {
       command: {
         kind: 'save', source: 'last', displayName: 'Weekly Report', global: false,
         acknowledgeUnsafeLiterals: true, distill: false,
+        roleNodes: { developer: ['work'] },
       },
     }, deps);
     expect(result.effect).toBe('save_committed');
     expect(result.message).toContain('✅ 已固化 Saved Workflow：Weekly Report');
     expect(result.message).toContain('scope: 本群');
     expect(deps.saveRun).toHaveBeenCalledTimes(1);
-    expect(deps.saveRun).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeUnsafeLiterals: true }));
+    expect(deps.saveRun).toHaveBeenCalledWith(expect.objectContaining({ acknowledgeUnsafeLiterals: true,
+      roleNodes: { developer: ['work'] } }));
   });
 
   it('never degrades a distillation save into the exact-save execution seam', async () => {
@@ -215,13 +217,16 @@ describe('Saved Workflow execution seam', () => {
         runId: 'weekly-260710-120000-000-deadbeef',
         runDir: '/tmp/run',
         envelope: { source: { workflowId: 'wf_abc', humanVersion: 2 } },
+        resolvedRoles: { developer: { nodes: ['work'], bot: 'cli_dev', label: 'Chosen bot', cliId: 'codex' } },
       }),
     });
     const result = await executeV3SavedWorkflowCommand({
       ...EXECUTION_BASE,
-      command: { kind: 'run', ref: 'Weekly Report', rawParams: {} },
+      command: { kind: 'run', ref: 'Weekly Report', rawParams: {}, roleSelections: { developer: 'Chosen bot' } },
     }, deps);
     expect(result.effect).toBe('run_started');
+    expect(deps.instantiate).toHaveBeenCalledWith(expect.objectContaining({ roleSelections: { developer: 'Chosen bot' } }));
+    expect(result.message).toContain('developer: Chosen bot (cli_dev, codex)');
     expect(deps.persistStartIntent).toHaveBeenCalledTimes(1);
     expect(deps.driveDetached).toHaveBeenCalledTimes(1);
   });
