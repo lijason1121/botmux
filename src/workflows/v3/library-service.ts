@@ -832,7 +832,7 @@ export async function instantiatePublishedSavedWorkflow(
   return executorNote ? { ...materialized, executorNote } : materialized;
 }
 
-function requireActorContext(
+export function requireActorContext(
   context: SavedWorkflowActorContext,
   opts: { requireChat?: boolean } = {},
 ): SavedWorkflowActorContext {

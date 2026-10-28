@@ -1136,3 +1136,14 @@ Workflow v3 的核心不是“让多个 Agent 顺序聊天”，而是以下约�
 10. **权限随上下文传播**：app、chat、caller 和 owner 都是运行授权的一部分。
 
 这套设计使 Workflow 能在 Agent 输出不稳定、daemon 可能重启、用户审批跨时间发生、外部副作用存在不确定窗口的条件下，仍保持可恢复、可审计和 fail-closed。
+
+
+### 内置开发评审预设的显式创建
+
+`botmux workflow create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot` 从经过测试的内置工厂创建当前 actor/chat 的 Saved Workflow。它与成功 run 的 exact-save 分开：定义没有 sourceRunId，不制造 journal，不读取历史任务数据；active 仅表示定义可执行。任意 JSON 导入、unsafe 确认、蒸馏及全局权限不在该入口开放。
+
+预设将 repo_path、requirement、target_branch、validation_commands 作为运行输入，角色选择仍通过既有 `workflow run --role` 冻结。固定准备与准入资源直接随定义封存，后续节点依赖准备产物，避免引用旧 run 目录。正式推送/创建 PR 前保留运行期 humanGate。
+
+创建不执行代码任务或发送 PR；真实外部任务执行仍需另行提供参数及通过运行期审批。相同 owner/chat/name 与完全相同定义的重试返回同一对象；定义或默认身份不同则拒绝覆盖。
+
+可选 revision.execution 策略将已声明的非敏感字符串参数作为本轮workingDir，物化前解析为存在的真实目录并冻结到所有bot快照；distinctRoles要求指定角色实际bot互不相同。策略参数、身份冲突或目录缺失在创建run之前失败。没有该策略的旧定义仍使用原bot工作目录；策略随Saved definition重新保存保留。
