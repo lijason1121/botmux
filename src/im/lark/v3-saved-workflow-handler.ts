@@ -26,6 +26,7 @@ import type { V3NodeExecutorPolicy } from '../../workflows/v3/node-executor-mode
 import type { V3SavedWorkflowCommand } from './v3-saved-workflow-command.js';
 import { v3SavedWorkflowAdHocRunEscapeHint } from './v3-saved-workflow-command.js';
 import { isHumanInboundTurnId } from '../../core/reply-target.js';
+import { savedWorkflowRoleSummary } from '../../workflows/v3/workflow-roles.js';
 
 export type ExecutableV3SavedWorkflowCommand = Exclude<V3SavedWorkflowCommand, { kind: 'invalid' }>;
 
@@ -214,6 +215,7 @@ export async function executeV3SavedWorkflowCommand(
           `status: ${metadata.status}`,
           `revision: v${loaded.revision.payload.humanVersion} (${loaded.revision.revisionId})`,
           `params: ${params.length > 0 ? params.join(', ') : '(无)'}`,
+          ...(loaded.revision.payload.roles ? [`roles: ${Object.entries(loaded.revision.payload.roles).map(([name, role]) => `${name}=${role.defaultBot} [${role.nodes.join(', ')}]`).join('; ')}`] : []),
         ].join('\n'),
       };
     }
@@ -285,6 +287,7 @@ export async function executeV3SavedWorkflowCommand(
         ...(command.displayName ? { displayName: command.displayName } : {}),
         scope: command.global ? 'global' : 'chat',
         acknowledgeUnsafeLiterals: command.acknowledgeUnsafeLiterals,
+        ...(command.roleNodes ? { roleNodes: command.roleNodes } : {}),
       });
       return {
         effect: 'save_committed',
@@ -311,6 +314,7 @@ export async function executeV3SavedWorkflowCommand(
       ref: command.ref,
       context,
       rawParams,
+      ...(command.roleSelections ? { roleSelections: command.roleSelections } : {}),
       bots: deps.loadBots(),
       baseDir,
       ...(nodeExecutorPolicy ? { nodeExecutorPolicy } : {}),
@@ -334,6 +338,7 @@ export async function executeV3SavedWorkflowCommand(
       message:
         `✅ Saved Workflow 已启动：${materialized.runId}\n` +
         `definition: ${materialized.envelope.source.workflowId} v${materialized.envelope.source.humanVersion}` +
+        (materialized.resolvedRoles ? `\n${savedWorkflowRoleSummary(materialized.resolvedRoles)}` : '') +
         executorNote,
     };
   } catch (err) {

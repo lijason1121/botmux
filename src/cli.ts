@@ -8198,10 +8198,10 @@ ${SEND_HELP_BODY}
                                        在现有 v3 沙箱/worker 路径运行一个 headless goal；
                                        同一 run-id 可安全重放终态或接续崩溃运行；三项 Codex 参数必须成组传入，
                                        且仅支持无 wrapper、未开沙箱的 Codex bot
-  workflow save [last|runId] [名称]
+  workflow save [last|runId] [名称] [--role developer=loopId/goalId ...]
                                        把成功 run 固化为 chat scope Saved Workflow；
                                        发布当前 Bot 全局版本 / 确认 unsafe lint 请由用户在飞书显式发送 /workflow save ...
-  workflow run <名称|workflowId> [--param key=value ...]
+  workflow run <名称|workflowId> [--param key=value ...] [--role developer=BotName ...]
   workflow list [--json] | show <名称|workflowId>
                                        运行 / 查看 Saved Workflow
   workflow new|spec-finalize|approve-spec|revise-spec|architect|revise-dag [...]
