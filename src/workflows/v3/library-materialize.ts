@@ -28,6 +28,7 @@ import {
 } from '../shared/params.js';
 import { isGoalNode, isLoopNode, validateDag, type V3Dag, type V3Node } from './dag.js';
 import {
+  botToSnapshot, resolveBotConfig,
   freezeDagBotSnapshots,
   parseFrozenBotSnapshots,
   serializeFrozenBotSnapshots,
@@ -47,6 +48,7 @@ import {
   formatSavedWorkflowChatSideEffectProblems,
   validateDagTemplate,
   validateSpecTemplate,
+  validateSavedWorkflowRevisionPayload,
   type LoadedSavedWorkflowRevision,
   type SavedWorkflowBuiltinContextRef,
   type SavedWorkflowMetadata,
@@ -66,11 +68,17 @@ import {
   type V3RunInitiator,
   type V3SavedDefinitionRunEnvelope,
 } from './run-envelope.js';
-import type { BotSnapshot, Spec } from './contract.js';
+import { isV3SupportedCli, type BotSnapshot, type Spec } from './contract.js';
 import {
   assertSavedWorkflowTemplateBindings,
+  assertSavedWorkflowSpecTemplateBindings,
   collectSavedWorkflowTemplateBindings,
 } from './template-bindings.js';
+import {
+  deriveSavedWorkflowRoles, validateSavedWorkflowRoles,
+  savedWorkflowGoalPaths, renderSavedWorkflowRoleText, savedWorkflowRoleSummary,
+  type SavedWorkflowRoleNodes, type SavedWorkflowRoles, type ResolvedSavedWorkflowRoles,
+} from './workflow-roles.js';
 
 export interface CompiledSavedWorkflowFromRun {
   displayName: string;
@@ -113,11 +121,13 @@ export interface CompileSavedWorkflowFromRunOptions {
   specStatus?: 'current' | 'stale';
   /** Explicit user confirmation after reviewing free-text lint warnings. */
   acknowledgeUnsafeLiterals?: boolean;
+  /** Explicit stable goal paths; defaults are derived from frozen source bots. */
+  roleNodes?: SavedWorkflowRoleNodes;
 }
 
 export type BuildSavedWorkflowRevisionBaselineOptions = Pick<
   CompileSavedWorkflowFromRunOptions,
-  'inputs' | 'contextRefs' | 'specStatus'
+  'inputs' | 'contextRefs' | 'specStatus' | 'roleNodes'
 >;
 
 export interface BuiltSavedWorkflowRevisionBaseline {
@@ -138,6 +148,12 @@ function canonicalizeNodeBots(
   return nodes.map((node) => {
     if (!isGoalNode(node) && !isLoopNode(node)) return { ...node };
     const selector = node.bot ?? inheritedSelector ?? '';
+    if (isLoopNode(node)) {
+      // A loop never executes a bot. Materialize inheritance on each goal;
+      // an unused loop/default selector need not exist in frozen snapshots.
+      const { bot: _bot, ...loop } = node;
+      return { ...loop, body: { nodes: canonicalizeNodeBots(node.body.nodes, snapshots, selector) } };
+    }
     const snapshot = snapshots.get(selector);
     if (!snapshot) {
       throw new Error(
@@ -145,13 +161,7 @@ function canonicalizeNodeBots(
         `${JSON.stringify(selector || '<default>')} (node ${node.id})`,
       );
     }
-    const next: V3Node = { ...node, bot: snapshot.larkAppId };
-    if (isLoopNode(next)) {
-      next.body = {
-        nodes: canonicalizeNodeBots(next.body.nodes, snapshots, selector),
-      };
-    }
-    return next;
+    return { ...node, bot: snapshot.larkAppId };
   });
 }
 
@@ -181,6 +191,16 @@ export function collectSavedWorkflowReusableTextWarnings(
   }
 }
 
+function pinnedRoleDefinition(loaded: LoadedAuthorizedV3Run): LoadedSavedWorkflowRevision['payload'] | undefined {
+  const pinnedDefinition = loaded.envelope.source.kind === 'saved_definition' &&
+    loaded.definitionSnapshot && typeof loaded.definitionSnapshot === 'object'
+    ? (loaded.definitionSnapshot as Record<string, unknown>).definition : undefined;
+  const roleDefinition = pinnedDefinition && typeof pinnedDefinition === 'object' &&
+    (pinnedDefinition as Record<string, unknown>).roles !== undefined
+    ? validateSavedWorkflowRevisionPayload(pinnedDefinition) : undefined;
+  return roleDefinition;
+}
+
 /**
  * Pure exact-revision compiler over one already authenticated/digest-checked
  * run read. It performs no path or journal IO, so callers cannot accidentally
@@ -200,6 +220,7 @@ export function buildSavedWorkflowRevisionBaseline(
     spec: loaded.spec,
     snapshots,
     sourceRunId: loaded.envelope.runId,
+    roleDefinition: pinnedRoleDefinition(loaded),
   }, opts);
 }
 
@@ -209,7 +230,7 @@ export function buildSavedWorkflowRevisionBaseline(
  * run (§5.1). Pure: no path or journal IO.
  */
 export function buildSavedWorkflowRevisionFromFlow(
-  flow: { dag: V3Dag; spec: Spec; snapshots: ReadonlyMap<string, BotSnapshot>; sourceRunId?: string },
+  flow: { dag: V3Dag; spec: Spec; snapshots: ReadonlyMap<string, BotSnapshot>; sourceRunId?: string; roleDefinition?: LoadedSavedWorkflowRevision['payload'] },
   opts: BuildSavedWorkflowRevisionBaselineOptions = {},
 ): BuiltSavedWorkflowRevisionBaseline {
   const hasLegacySelector = (nodes: V3Dag['nodes']): boolean => nodes.some((node) =>
@@ -221,12 +242,34 @@ export function buildSavedWorkflowRevisionFromFlow(
     );
   }
   const normalizedNodes = canonicalizeNodeBots(cloneNodes(flow.dag.nodes), flow.snapshots);
+  // A role run contains rendered names and a host-added binding summary. On
+  // re-save retain the pinned reusable narrative, while deriving new defaults
+  // from the bots that actually executed this source run.
+  const roleDefinition = flow.roleDefinition;
+  if (roleDefinition) {
+    const templates = savedWorkflowGoalPaths(roleDefinition.dagTemplate.nodes);
+    for (const [path, node] of savedWorkflowGoalPaths(normalizedNodes)) {
+      const template = templates.get(path);
+      if (!template) throw new Error(`cannot save role workflow: source goal ${path} is absent from pinned definition`);
+      node.goal = template.goal;
+      const { systemPromptAppend: _rendered, ...other } = node.override ?? {};
+      const text = template.override?.systemPromptAppend;
+      if (text !== undefined) node.override = { ...other, systemPromptAppend: text };
+      else if (Object.keys(other).length) node.override = other;
+      else delete node.override;
+    }
+  }
   const dagTemplate = validateDagTemplate({ schemaVersion: 2, nodes: normalizedNodes });
   const { runId: _runId, ...specWithoutRunId } = flow.spec;
-  const specTemplate = validateSpecTemplate(specWithoutRunId);
-  const inputs = opts.inputs ?? {};
-  const contextRefs = opts.contextRefs ?? collectSavedWorkflowTemplateBindings(dagTemplate).context;
-  assertSavedWorkflowTemplateBindings(dagTemplate, inputs, contextRefs);
+  const specTemplate = validateSpecTemplate(roleDefinition?.specTemplate ?? specWithoutRunId);
+  const inputs = opts.inputs ?? roleDefinition?.inputs ?? {};
+  const roleNodes = opts.roleNodes ?? (roleDefinition?.roles && Object.fromEntries(
+    Object.entries(roleDefinition.roles).map(([name, role]) => [name, role.nodes]),
+  ));
+  const roles = deriveSavedWorkflowRoles(roleNodes, dagTemplate.nodes);
+  const contextRefs = opts.contextRefs ?? roleDefinition?.contextRefs ?? collectSavedWorkflowTemplateBindings(dagTemplate).context;
+  assertSavedWorkflowTemplateBindings(dagTemplate, inputs, contextRefs, roles);
+  if (roles) assertSavedWorkflowSpecTemplateBindings(specTemplate, inputs, contextRefs, roles);
   const lintWarnings = formatSavedWorkflowChatSideEffectProblems(
     collectSavedWorkflowChatSideEffectProblems(dagTemplate),
   );
@@ -235,6 +278,7 @@ export function buildSavedWorkflowRevisionFromFlow(
   const revision: SavedWorkflowRevisionDraft = {
     ...(flow.sourceRunId !== undefined ? { sourceRunId: flow.sourceRunId } : {}),
     inputs,
+    ...(roles ? { roles } : {}),
     contextRefs,
     specTemplate,
     specStatus: opts.specStatus ?? 'current',
@@ -390,6 +434,7 @@ export function compileDashboardSavedWorkflowFromRun(
     spec,
     snapshots: scope,
     sourceRunId: loaded.envelope.runId,
+    roleDefinition: pinnedRoleDefinition(loaded),
   }, opts);
   if (built.lintWarnings.length > 0 && opts.acknowledgeUnsafeLiterals !== true) {
     throw new SavedWorkflowUnsafeLiteralError(built.lintWarnings);
@@ -657,6 +702,7 @@ export interface MaterializeSavedWorkflowRunInput {
   metadata: SavedWorkflowMetadata;
   revision: LoadedSavedWorkflowRevision;
   rawParams?: Record<string, RawParamInput>;
+  roleSelections?: Record<string, string>;
   context?: SavedWorkflowMaterializeContext;
   bots: BotConfig[];
   baseDir: string;
@@ -679,7 +725,31 @@ export interface MaterializedSavedWorkflowRun {
   resolvedParams: Record<string, unknown>;
   resolvedContext: Partial<Record<SavedWorkflowBuiltinContextRef, string>>;
   botSnapshots: Map<string, BotSnapshot>;
+  resolvedRoles?: ResolvedSavedWorkflowRoles;
   envelope: V3SavedDefinitionRunEnvelope;
+}
+
+/** Resolve and freeze before any run directory, start intent, or worker exists. */
+function resolveSavedWorkflowRoles(
+  roles: SavedWorkflowRoles | undefined, selections: Record<string, string> | undefined, bots: BotConfig[],
+): ResolvedSavedWorkflowRoles {
+  for (const name of Object.keys(selections ?? {})) {
+    if (!roles || !Object.hasOwn(roles, name)) throw new Error(`unknown workflow role: ${name}`);
+  }
+  const resolved: ResolvedSavedWorkflowRoles = Object.create(null);
+  for (const [name, role] of Object.entries(roles ?? {})) {
+    const selector = selections && Object.hasOwn(selections, name) ? selections[name]! : role.defaultBot;
+    if (typeof selector !== 'string' || !selector.trim()) throw new Error(`role ${name} requires a bot selector`);
+    const bot = resolveBotConfig(selector, bots);
+    const snapshot = botToSnapshot(bot);
+    if (!isV3SupportedCli(snapshot.cliId)) throw new Error(`role ${name} uses unsupported CLI ${snapshot.cliId}`);
+    const label = bot.name?.trim() || snapshot.larkAppId;
+    if ([label, snapshot.larkAppId].some(value => value.includes('${') || /[\x00-\x1f\x7f]/.test(value))) {
+      throw new Error(`role ${name} bot identity contains invalid narrative bytes`);
+    }
+    resolved[name] = { nodes: [...role.nodes], bot: snapshot.larkAppId, label, cliId: snapshot.cliId };
+  }
+  return resolved;
 }
 
 function resolveContext(
@@ -730,16 +800,28 @@ export function materializeSavedWorkflowRun(
       `Saved Workflow '${input.metadata.workflowId}' cannot be materialized outside its chat scope`,
     );
   }
+  if (Object.keys(input.roleSelections ?? {}).length) {
+    const boundOwner = input.context?.chatBinding?.ownerOpenId;
+    const initiator = input.context?.initiatorOpenId ?? boundOwner;
+    if (initiator !== input.metadata.owner.openId || (boundOwner !== undefined && boundOwner !== initiator)) {
+      throw new Error('Only the Saved Workflow owner may select execution roles');
+    }
+  }
   assertSavedWorkflowTemplateBindings(
     input.revision.payload.dagTemplate,
     input.revision.payload.inputs,
     input.revision.payload.contextRefs,
+    input.revision.payload.roles,
   );
+
+  const roles = validateSavedWorkflowRoles(input.revision.payload.roles, input.revision.payload.dagTemplate.nodes);
+  const resolvedRoles = resolveSavedWorkflowRoles(roles, input.roleSelections, input.bots);
+  if (roles) assertSavedWorkflowSpecTemplateBindings(input.revision.payload.specTemplate,
+    input.revision.payload.inputs, input.revision.payload.contextRefs, roles);
 
   const now = input.now ?? new Date();
   const runId = input.runId ?? mintV3RunId(input.metadata.displayName, now);
   if (!isValidRunId(runId)) throw new Error(`invalid Saved Workflow runId: ${JSON.stringify(runId)}`);
-  mkdirSync(input.baseDir, { recursive: true, mode: 0o700 });
   const runDir = join(input.baseDir, runId);
 
   const sensitiveParams = Object.entries(input.revision.payload.inputs)
@@ -762,17 +844,37 @@ export function materializeSavedWorkflowRun(
     input.rawParams ?? {},
   );
   const resolvedContext = resolveContext(input.revision.payload.contextRefs, input.context);
+  const nodes = cloneNodes(input.revision.payload.dagTemplate.nodes);
+  if (roles) {
+    const goals = savedWorkflowGoalPaths(nodes);
+    for (const role of Object.values(resolvedRoles)) {
+      for (const path of role.nodes) goals.get(path)!.bot = role.bot;
+    }
+    const summary = `Workflow role bindings (host-frozen):\n${savedWorkflowRoleSummary(resolvedRoles)}`;
+    for (const node of goals.values()) {
+      node.goal = renderSavedWorkflowRoleText(node.goal!, resolvedRoles);
+      const instructions = node.override?.systemPromptAppend;
+      node.override = { ...node.override, systemPromptAppend:
+        `${instructions ? `${renderSavedWorkflowRoleText(instructions, resolvedRoles)}\n\n` : ''}${summary}` };
+    }
+  }
   const dag = validateDag({
     ...(input.revision.payload.dagTemplate.schemaVersion !== undefined
       ? { schemaVersion: input.revision.payload.dagTemplate.schemaVersion }
       : {}),
     runId,
-    nodes: cloneNodes(input.revision.payload.dagTemplate.nodes),
+    nodes,
   });
-  const spec = validateSpec({ ...input.revision.payload.specTemplate, runId });
+  // Only strings already admitted by the narrative-field validator are rendered.
+  const renderSpec = (value: unknown): unknown => typeof value === 'string'
+    ? renderSavedWorkflowRoleText(value, resolvedRoles)
+    : Array.isArray(value) ? value.map(renderSpec)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, renderSpec(v)])) : value;
+  const spec = validateSpec({ ...(roles ? renderSpec(input.revision.payload.specTemplate) as object : input.revision.payload.specTemplate), runId });
   const botSnapshots = freezeDagBotSnapshots(dag, input.bots, input.nodeExecutor === 'bot'
     ? { defaultSelector: input.context?.chatBinding?.larkAppId }
     : {});
+  mkdirSync(input.baseDir, { recursive: true, mode: 0o700 });
 
   // Reserve the final run id across cooperating CLI/daemon processes. A plain
   // exists+rename sequence can replace an empty directory on POSIX when two
@@ -798,6 +900,7 @@ export function materializeSavedWorkflowRun(
         params: resolvedParams,
         context: resolvedContext,
       });
+      if (roles) writeJson0600(join(stagedRunDir, 'roles.resolved.json'), resolvedRoles);
       writeJson0600(join(stagedRunDir, 'definition.snapshot.json'), {
         schemaVersion: 1,
         workflowId: input.metadata.workflowId,
@@ -815,6 +918,7 @@ export function materializeSavedWorkflowRun(
         botSnapshots: artifactRef(stagedRunDir, 'bots.snapshot.json'),
         resolvedParams: artifactRef(stagedRunDir, 'params.resolved.json'),
         definitionSnapshot: artifactRef(stagedRunDir, 'definition.snapshot.json'),
+        ...(roles ? { resolvedRoles: artifactRef(stagedRunDir, 'roles.resolved.json') } : {}),
       };
       const envelope = makeSavedDefinitionRunEnvelope({
         runId,
@@ -849,6 +953,7 @@ export function materializeSavedWorkflowRun(
         resolvedParams,
         resolvedContext,
         botSnapshots,
+        ...(roles ? { resolvedRoles } : {}),
         envelope,
       };
     } catch (err) {
