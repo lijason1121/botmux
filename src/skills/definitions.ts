@@ -1667,6 +1667,8 @@ description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排
 
 自然语言与命令是同一能力，用户不需要记 slash command：
 
+- 飞书中直接发送 \`/workflow run dev-rev\`，由 daemon 打开内置开发评审启动卡：选择仓库、三个不同的本群已配置机器人，填写需求文字或文档链接后提交。无需预先保存流程或填写分支；基线取仓库默认分支，验证命令由认证预检读取仓库规则确定，需求文档须先读取正文。此入口需要操作权限，提交只接受发起人在原群和原 Bot 的原卡片操作。只有无其它参数的精确快捷命令进入表单；普通 Saved Workflow run 保持现有路径。不要用自制 callback 卡或伪造群成员代替原生表单。重复点击恢复同一请求，PR/MR 创建前仍保留原生人工审批。
+
 - 用户明确要求从零创建通用开发评审流程时，可用 \`botmux workflow create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot\`。这是经验证的内置预设作者入口，只创建当前用户/当前群的参数化 Saved Workflow，不读取旧任务、不伪造 sourceRun 或成功记录，也不自动运行任务。三个 Bot 必须来自真实配置且互不相同。创建后的 active 表示可运行定义，不能宣称已有真实需求端到端执行通过。任意文件导入、全局发布、unsafe 确认和参数蒸馏仍不由此入口代办。
 
 - “把刚才那个流程存下来（叫周报）” → \`botmux workflow save last 周报\`（IM 等价：\`/workflow save last 周报\`）。只保存已成功结束且属于当前用户/话题的 run；agent-facing CLI 固定为 chat scope。用户明确要求在**当前 Bot 的其它群**复用时，不得替用户执行 \`--global\`，请让用户本人在飞书显式发送 \`/workflow save last 周报 --global\`，由 daemon 校验 canOperate。\`--global\` 只表示当前 Bot 全局，不会对共享 dataDir 的其它 Bot 可见。

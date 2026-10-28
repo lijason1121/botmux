@@ -48,6 +48,7 @@ import {
   handleV3DistillationAction,
   isV3DistillationAction,
 } from './v3-distillation-card-handler.js';
+import { handleDevRevLaunchAction, isDevRevLaunchAction } from './dev-rev-launch-card.js';
 
 // ─── 前缀 → handler（不依赖 session 的 dashboard / issue 卡片回调）──────────────
 
@@ -191,6 +192,12 @@ export const V3_CARD_ROUTES: readonly V3CardRoute[] = [
         ctx.cardMessageId,
         ctx.deps.v3DistillationDeps,
       ),
+  },
+  {
+    name: 'devRevLaunch',
+    matches: isDevRevLaunchAction,
+    run: ctx => ctx.deps.devRevLaunchDeps && handleDevRevLaunchAction(
+      ctx.value, ctx.formValue, ctx.operatorOpenId, ctx.larkAppId, ctx.cardMessageId, ctx.deps.devRevLaunchDeps),
   },
 ];
 

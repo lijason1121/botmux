@@ -134,7 +134,7 @@ describe('前缀路由表', () => {
 
 describe('v3 路由表', () => {
   it('表序钉死：gate → blocked → revisitGrant → loopGrant → runSave → distillation', () => {
-    expect(V3_CARD_ROUTES.map(r => r.name)).toEqual(['gate', 'blocked', 'revisitGrant', 'loopGrant', 'runSave', 'distillation']);
+    expect(V3_CARD_ROUTES.map(r => r.name)).toEqual(['gate', 'blocked', 'revisitGrant', 'loopGrant', 'runSave', 'distillation', 'devRevLaunch']);
   });
 
   const v3Cases: Array<[string, string, () => ReturnType<typeof vi.fn>, string]> = [

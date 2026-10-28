@@ -59,6 +59,7 @@ import type { V3LoopGrantCardHandlerDeps } from './v3-loop-grant-card-handler.js
 import type { V3RevisitGrantCardHandlerDeps } from './v3-revisit-grant-card-handler.js';
 import type { V3RunSaveCardHandlerDeps } from './v3-run-save-card-handler.js';
 import type { V3DistillationCardHandlerDeps } from './v3-distillation-card-handler.js';
+import type { DevRevLaunchDeps } from '../../workflows/v3/dev-rev-launch.js';
 import {
   findCardPrefixRoute,
   findV3CardRoute,
@@ -154,6 +155,7 @@ export interface CardHandlerDeps {
   v3RunSaveDeps?: V3RunSaveCardHandlerDeps;
   /** v3 参数蒸馏提案的接受/拒绝动作。 */
   v3DistillationDeps?: V3DistillationCardHandlerDeps;
+  devRevLaunchDeps?: DevRevLaunchDeps;
   /** 标准完成卡里的 requester-only 非阻塞后续提案。 */
   completionProposalDeps?: CompletionProposalCardHandlerDeps;
   /** VC meeting invite/consumer card actions. Implemented in daemon to

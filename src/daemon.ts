@@ -724,6 +724,7 @@ import {
 } from './im/lark/workflow-slash-command.js';
 import {
   parseV3SavedWorkflowCommand,
+  isDevRevLaunchCommand,
   v3SavedWorkflowUsage,
 } from './im/lark/v3-saved-workflow-command.js';
 import {
@@ -734,6 +735,10 @@ import {
   resolveV3SavedWorkflowMessageTargets,
   type V3SavedWorkflowExecutionEffect,
 } from './im/lark/v3-saved-workflow-handler.js';
+import { bindDevRevLaunchCard, createDevRevLaunch, DevRevLaunchError } from './workflows/v3/dev-rev-launch.js';
+import { buildDevRevLaunchCard, selectDevRevChatBots } from './im/lark/dev-rev-launch-card.js';
+import { listChatBotMembers, resolveUserUnionId } from './im/lark/client.js';
+import { createEphemeralPool } from './workflows/v3/ephemeral-pool.js';
 import {
   createV3GateRunner,
   preflightV3RunStart,
@@ -5897,6 +5902,13 @@ async function recoverV3DistillationProposalsForBot(larkAppId: string): Promise<
   }
 }
 
+async function devRevChatBotChoices(larkAppId: string, chatId: string) {
+  // `configured` rows are returned only after that app's live is_in_chat succeeds.
+  // Observed external bots and receiver-scoped open_ids are not execution identities.
+  const roster = await listChatBotMembers(larkAppId, chatId);
+  return selectDevRevChatBots(loadBotConfigs(), roster);
+}
+
 async function handleV3SavedWorkflowCommandIfAny(
   invocation: V3SavedWorkflowImInvocation,
 ): Promise<boolean> {
@@ -5992,6 +6004,28 @@ async function handleV3SavedWorkflowCommandIfAny(
   };
   const dataDir = dirname(v3DefaultBaseDir());
   const baseDir = v3DefaultBaseDir();
+  if (isDevRevLaunchCommand(command)) {
+    if (!operatorCanOperate) {
+      await notify('❌ 开发评审启动表单需要当前机器人的操作权限。', 'authorization');
+      return true;
+    }
+    try {
+      const dirs = getProjectScanDirsForBot(larkAppId).filter(dir => existsSync(dir));
+      const projects = dirs.length ? scanMultipleProjects(dirs, 3, { ...repoPickerScanOptions(), includeWorktrees: false }) : [];
+      const request = await createDevRevLaunch({ dataDir, context, requestKey: messageId,
+        repos: projects.map(project => ({ path: project.path, label: `${project.name} · ${project.path}` })),
+        bots: await devRevChatBotChoices(larkAppId, chatId) });
+      const card = buildDevRevLaunchCard(request), uuid = `dev-rev-${request.id}`;
+      const cardMessageId = targets.replyAnchor.startsWith('oc_')
+        ? await sendMessage(larkAppId, targets.replyAnchor, card, 'interactive', uuid)
+        : await replyMessage(larkAppId, targets.replyAnchor, card, 'interactive', true, uuid);
+      await bindDevRevLaunchCard(dataDir, request.id, cardMessageId);
+    } catch (error) {
+      logger.warn(`[dev-rev-launch] open failed: ${error instanceof Error ? error.name : 'unknown'}`);
+      await notify(error instanceof DevRevLaunchError ? error.message : '❌ 启动表单暂不可用，请检查仓库目录与群机器人权限后重试。', 'failed');
+    }
+    return true;
+  }
   if (command.kind === 'save' && command.distill) {
     if (!command.displayName) {
       await notify('❌ 参数蒸馏必须显式指定模板名称。', 'validation');
@@ -6519,6 +6553,25 @@ const v3ProgressCardManager = new V3ProgressCardManager({
 // (cold-attach).  postCard / notifyTerminal use the daemon's Lark sender; the
 // run logic + in-flight guard live in createV3GateRunner.
 const v3GateRunner = createV3GateRunner({
+  makeRunNode: resolveLarkAppSecret => {
+    const owners = new Map<string, Promise<string | undefined>>();
+    return createEphemeralPool({ resolveLarkAppSecret,
+      resolveOwnerOpenId: (sourceAppId, sourceOpenId, targetAppId) => {
+        const key = JSON.stringify([sourceAppId, sourceOpenId, targetAppId]);
+        let pending = owners.get(key);
+        if (!pending) {
+          pending = (async () => {
+            const identity = await resolveUserUnionId(sourceAppId, sourceOpenId);
+            if (!identity.unionId) return undefined;
+            const target = await resolveTargetAppOpenId(targetAppId, identity.unionId);
+            return target.status === 'resolved' ? target.openId : undefined;
+          })();
+          owners.set(key, pending);
+        }
+        return pending;
+      },
+    }).runNode;
+  },
   postCard: async (binding, gate, runId) => {
     const card = buildV3GateCard({
       runId,
@@ -7210,6 +7263,15 @@ const cardDeps: CardHandlerDeps = {
       `[v3-distillation:${proposalId}] card action failed: ` +
       stableV3DistillationErrorCode(err),
     ),
+  },
+  devRevLaunchDeps: {
+    dataDir: dirname(v3DefaultBaseDir()), baseDir: v3DefaultBaseDir(),
+    resolveMessageChatId: getMessageChatId,
+    authorize: (appId, chatId, operator) => isWorkflowFeatureEnabled() && canOperate(appId, chatId, operator),
+    listChatBots: devRevChatBotChoices, loadBots: loadBotConfigs,
+    persistStartIntent: persistV3StartIntent,
+    driveDetached: runId => v3GateRunner.driveDetached(runId),
+    onError: (id, error) => logger.warn(`[dev-rev-launch:${id}] action failed: ${error instanceof Error ? error.name : 'unknown'}`),
   },
   // 授权成功后重放触发本次申请的原始消息，用户无需再 @ 一遍。
   // replayMessageEvent 由 startLarkEventDispatcher 内部注入到 handlers 上。

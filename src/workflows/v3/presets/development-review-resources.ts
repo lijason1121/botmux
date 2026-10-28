@@ -108,7 +108,18 @@ function prepare(args) {
   git(repository, ['check-ref-format', '--branch', params.target_branch]);
   const baseSha = git(repository, ['rev-parse', '--verify', '--end-of-options', params.target_branch + '^{commit}']);
   roles(selected);
-  const commands = plan(params.validation_commands);
+  // An empty launch-form plan delegates discovery to the authenticated preflight.
+  // Explicit caller-supplied checks remain authoritative and cannot be replaced.
+  const commands = plan(Array.isArray(params.validation_commands) && params.validation_commands.length === 0
+    ? checked.validationCommands : params.validation_commands);
+  const requirement = checked.resolvedRequirement === undefined ? params.requirement : checked.resolvedRequirement;
+  requireThat(typeof requirement === 'string' && requirement.trim(), 'resolved requirement required');
+  if (/^https?:\/\/\S+$/i.test(params.requirement.trim())) {
+    requireThat(typeof checked.resolvedRequirement === 'string' && checked.resolvedRequirement.trim() &&
+      Array.isArray(checked.requirementSources) && checked.requirementSources.length > 0 &&
+      checked.requirementSources.every(source => object(source) && source.url === params.requirement.trim() && source.read === true),
+      'document requirement must be read before preparation');
+  }
   requireThat(typeof checked.worktreePath === 'string' && path.isAbsolute(checked.worktreePath) && checked.worktreeAllowed === true, 'preflight must approve a task-owned worktree location');
   const branch = checked.branch;
   requireThat(typeof branch === 'string' && branch.includes(checked.runId), 'task branch must identify this run');
@@ -125,7 +136,7 @@ function prepare(args) {
   const manifest = { preset: 'development-review', version: 1, files: [{ path: 'tools.mjs', sha256: digest(self) }] };
   atomic(path.join(output, 'resources.json'), manifest);
   const context = { schemaVersion: 1, runId: checked.runId, repo: repository, worktree, branch, targetBranch: params.target_branch,
-    baseSha, requirement: params.requirement, requirementSha256: sha(Buffer.from(params.requirement)), roles: selected,
+    baseSha, requirement, requirementSha256: sha(Buffer.from(requirement)), roles: selected,
     validationCommands: commands, preflightSha256: digest(args.preflight), resourcesSha256: digest(path.join(output, 'resources.json')) };
   atomic(path.join(output, 'context.json'), context);
   atomic(path.join(output, 'result.json'), { ready: true, runId: checked.runId, baseSha });

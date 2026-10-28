@@ -384,6 +384,31 @@ describe('v3 ephemeral pool', () => {
     }
   });
 
+  it.each([undefined, 'ou_target_owner', 'ou_source_owner'])(
+    'cross-app worker owner uses only verified target-app identity: %s', async resolved => {
+      const worker = new ScriptedWorker(), factory = factoryFor(worker);
+      const resolveOwnerOpenId = vi.fn(async () => resolved);
+      const req: RunNodeRequest = { ...request(), chatBinding: {
+        larkAppId: 'cli_source', chatId: 'oc_chat', ownerOpenId: 'ou_source_owner',
+      } };
+      const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret', resolveOwnerOpenId });
+      const promise = pool.runNode(req); await worker.waitForInit();
+      expect(resolveOwnerOpenId).toHaveBeenCalledWith('cli_source', 'ou_source_owner', req.botSnapshot.larkAppId);
+      expect(worker.init?.ownerOpenId).toBe(resolved === 'ou_target_owner' ? resolved : undefined);
+      worker.emitExit(0); await promise;
+    });
+  it('does not spawn a worker when cross-app owner resolution throws', async () => {
+    const worker = new ScriptedWorker(), factory = factoryFor(worker);
+    const req: RunNodeRequest = { ...request(), chatBinding: {
+      larkAppId: 'cli_source', chatId: 'oc_chat', ownerOpenId: 'ou_source_owner',
+    } };
+    const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret',
+      resolveOwnerOpenId: async () => { throw new Error('identity service unavailable'); } });
+    await expect(pool.runNode(req)).rejects.toThrow('identity service unavailable');
+    expect(factory.lastOpts).toBeUndefined();
+  });
+
   it('threads the run chat binding into worker init so CLI children get real BOTMUX_* identity env', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);

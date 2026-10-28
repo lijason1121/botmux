@@ -59,6 +59,8 @@ export { GOAL_COMMAND } from './contract.js';
 const WORKFLOW_INNER_TURN_GRACE_MS = 60_000;
 
 export interface EphemeralPoolDeps {
+  /** Cross-app open_ids must be resolved by the trusted host, never copied. */
+  resolveOwnerOpenId?: (sourceAppId: string, sourceOpenId: string, targetAppId: string) => Promise<string | undefined>;
   /**
    * Secrets are intentionally not frozen into the runDir.  Resolve the live
    * secret by the frozen larkAppId at spawn time.
@@ -113,7 +115,7 @@ export function createEphemeralPool(deps: EphemeralPoolDeps): { runNode: RunNode
 }
 
 type RunNodeInternalDeps = Required<Pick<EphemeralPoolDeps, 'factory' | 'workerPath' | 'quiesceMs' | 'cancelGraceMs' | 'manifestPollMs' | 'manifestSettleMs'>> &
-  Pick<EphemeralPoolDeps, 'resolveLarkAppSecret' | 'resolveBot'>;
+  Pick<EphemeralPoolDeps, 'resolveLarkAppSecret' | 'resolveBot' | 'resolveOwnerOpenId'>;
 
 async function runNodeImpl(
   req: RunNodeRequest,
@@ -140,9 +142,18 @@ async function runNodeImpl(
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'pre_aborted');
     return { status: 'cancelled', manifestPath, cancelReason: cancelSignal.reason };
   }
+  const binding = req.chatBinding;
+  let ownerOpenId: string | undefined;
   let secret: string | undefined;
   try {
     secret = await deps.resolveLarkAppSecret(req.botSnapshot.larkAppId);
+    if (secret && binding?.ownerOpenId) {
+      if (binding.larkAppId === req.botSnapshot.larkAppId) ownerOpenId = binding.ownerOpenId;
+      else if (deps.resolveOwnerOpenId) {
+        const resolved = await deps.resolveOwnerOpenId(binding.larkAppId, binding.ownerOpenId, req.botSnapshot.larkAppId);
+        if (resolved?.startsWith('ou_') && resolved !== binding.ownerOpenId) ownerOpenId = resolved;
+      }
+    }
   } catch (err) {
     closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
     throw err;
@@ -282,7 +293,7 @@ async function runNodeImpl(
     chatId: req.chatBinding?.chatId ?? `v3-chat-${req.runId}`,
     ...(req.chatBinding?.chatType ? { chatType: req.chatBinding.chatType } : {}),
     rootMessageId: req.chatBinding?.rootMessageId ?? `v3-root-${req.attemptId}`,
-    ...(req.chatBinding?.ownerOpenId ? { ownerOpenId: req.chatBinding.ownerOpenId } : {}),
+    ...(ownerOpenId ? { ownerOpenId } : {}),
     workingDir: cwd,
     cliId: req.botSnapshot.cliId,
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
