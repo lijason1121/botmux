@@ -499,6 +499,12 @@ function push(args) {
 function verifyPublication(args) {
   ownOutput(args.out, 'verification.json');
   const { deliveryPlan, context } = boundPlan(args);
+  // The approval decision is check-delivery's, which may be stricter than the developer's plan.
+  const routed = read(args.route);
+  requireThat(object(routed) && routed.schemaVersion === 1 && routed.runId === context.runId && routed.planSha256 === digest(args.plan) &&
+    routed.action === deliveryPlan.action && routed.publicationRequired === true && typeof routed.approvalRequired === 'boolean' &&
+    routed.directPublish === !routed.approvalRequired && (!routed.directPublish || (deliveryPlan.directPublish && routed.identityConfirmed === true)),
+  'routing result is not bound to this plan');
   const observed = read(args.observed);
   requireThat(object(observed) && typeof observed.url === 'string' && /^https:\/\//.test(observed.url), 'observed PR URL required');
   if (deliveryPlan.existingPr) requireThat(observed.url === deliveryPlan.existingPr.url, 'published to a different PR');
@@ -513,7 +519,8 @@ function verifyPublication(args) {
   }
   atomic(args.out, { schemaVersion: 1, verified: true, runId: context.runId, mode: deliveryPlan.mode, action: deliveryPlan.action,
     url: observed.url, sourceBranch: deliveryPlan.sourceBranch, targetBranch: deliveryPlan.targetBranch, headSha: deliveryPlan.headSha,
-    approvalRequired: deliveryPlan.approvalRequired, planSha256: digest(args.plan) });
+    approvalRequired: routed.approvalRequired, directPublish: routed.directPublish, identityConfirmed: routed.identityConfirmed === true,
+    planSha256: digest(args.plan), routeSha256: digest(args.route) });
 }
 function publish(args) {
   const output = process.env.BOTMUX_GOAL_OUTPUT_DIR, manifest = process.env.BOTMUX_GOAL_MANIFEST_PATH;
@@ -533,7 +540,7 @@ function publish(args) {
   atomic(manifest, { schemaVersion: 1, status: 'ok', summary: args.summary || 'Products delivered; decisions are in the artifacts.', files });
 }
 const args = { entries: [] }, mode = process.argv[2];
-const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment', 'observed-identity']);
+const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment', 'observed-identity', 'route']);
 try {
   for (let index = 3; index < process.argv.length; index++) {
     const flag = process.argv[index];
