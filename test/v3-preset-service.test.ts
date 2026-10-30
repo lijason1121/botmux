@@ -87,6 +87,7 @@ describe('reviewed preset creation', () => {
     const runs = join(dataDir, 'test-runs');
     const repo = join(dataDir, 'new-repo'); mkdirSync(repo);
     const rawParams = {
+      mode: { kind: 'string' as const, value: 'new' },
       repo_path: { kind: 'string' as const, value: repo },
       requirement: { kind: 'string' as const, value: 'Implement a new task' },
       target_branch: { kind: 'string' as const, value: 'main' },
@@ -113,7 +114,7 @@ describe('reviewed preset creation', () => {
   it('rejects role collisions and missing workspaces before publishing a run directory', async () => {
     const saved = await create();
     const baseDir = join(dataDir, 'not-published');
-    const params = { repo_path: { kind: 'string' as const, value: join(dataDir, 'missing') },
+    const params = { mode: { kind: 'string' as const, value: 'new' }, repo_path: { kind: 'string' as const, value: join(dataDir, 'missing') },
       requirement: { kind: 'string' as const, value: 'New task' }, target_branch: { kind: 'string' as const, value: 'main' },
       validation_commands: { kind: 'json' as const, value: [{ id: 'runtime', argv: ['node', '--version'] }] } };
     await expect(instantiatePublishedSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId,
