@@ -220,10 +220,18 @@ export interface BotSnapshot {
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /** Frozen Claude config profile dir (`CLAUDE_CONFIG_DIR`).  Without it a
+   *  workflow worker falls back to `~/.claude` and loses the bot's own
+   *  settings/model while still getting the bot's env (gateway mismatch). */
+  cliConfigDir?: string;
   /** Frozen configured launch prefix.  Workflow workers must use
    *  the same gateway/runtime selection as ordinary bot sessions. */
   wrapperCli?: string;
   model?: string;
+  /** Frozen per-bot launch tuning, gated per CLI exactly like an ordinary
+   *  session's first-fork freeze (worker-pool sessionAgentConfig). */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  modelBackendVariant?: 'standard' | 'max';
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. Tri-state:
    *  'oncall' (fs-policy whitelist) or 'scratch' (full-root COW). */
@@ -309,6 +317,9 @@ export interface RunNodeResult {
    *  attemptDir). */
   manifestPath: string;
   sessionInfo?: WorkerSessionInfo;
+  /** Why a `status:'fail'` process ended (CLI-reported abort, timeout, …).
+   *  Lets the runtime name the root cause when no manifest was written. */
+  failureDetail?: string;
 }
 
 /**
