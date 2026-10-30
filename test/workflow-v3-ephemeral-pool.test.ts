@@ -329,6 +329,66 @@ describe('v3 ephemeral pool', () => {
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
   });
 
+  it('a worker error fails the node at once and carries the message as failureDetail', async () => {
+    const worker = new ScriptedWorker();
+    const req = request();
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'error', message: 'Goal cleared after an unrecoverable error (model unavailable)' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      failureDetail: 'Goal cleared after an unrecoverable error (model unavailable)',
+    });
+  });
+
+  it('passes the frozen reasoningEffort / modelBackendVariant to worker init', async () => {
+    const worker = new ScriptedWorker();
+    const req = request();
+    req.botSnapshot.cliId = 'traex';
+    req.botSnapshot.reasoningEffort = 'xhigh';
+    req.botSnapshot.modelBackendVariant = 'max';
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init?.reasoningEffort).toBe('xhigh');
+    expect(worker.init?.modelBackendVariant).toBe('max');
+    worker.emitExit(0);
+    await promise;
+  });
+
+  it('passes the frozen cliConfigDir to worker init', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    req.botSnapshot.cliId = 'claude-code';
+    req.botSnapshot.cliConfigDir = '~/.botmux/bots/app/claude-profile';
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init?.cliConfigDir).toBe('~/.botmux/bots/app/claude-profile');
+    worker.emitExit(0);
+    await promise;
+  });
+
   it('passes the frozen wrapperCli to worker init', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);

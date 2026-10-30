@@ -153,6 +153,18 @@ export function isTranscriptRateLimitEvent(ev: TranscriptEvent): boolean {
 
 /** Concatenated text blocks of an API-error record, used to recover a human
  *  retry clock ("... resets 10:40pm") when present. Returns '' if none. */
+/** Claude Code's `/goal` ends itself after an API failure it will not retry
+ *  ("Goal cleared after an unrecoverable error (<label>): …"; its own backoff
+ *  for transient errors runs before this). The record is the CLI's verdict that
+ *  this goal will make no further progress, so a workflow worker can fail the
+ *  node at once instead of idling until the node deadline. */
+export function claudeGoalAbortNotice(ev: TranscriptEvent | null | undefined): string | undefined {
+  if (!ev || typeof ev !== 'object' || ev.type !== 'system' || (ev as any).isSidechain === true) return undefined;
+  const content = (ev as any).content;
+  if (typeof content !== 'string') return undefined;
+  return /^Goal cleared after an unrecoverable error\b/.test(content) ? content : undefined;
+}
+
 export function apiErrorMessageText(ev: TranscriptEvent): string {
   const content = ev.message?.content;
   if (typeof content === 'string') return content;

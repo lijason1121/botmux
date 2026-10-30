@@ -193,6 +193,26 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
     }
   });
 
+  it('进程失败且无 manifest → nodeFailed 消息以 failureDetail 根因开头', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-rt-detail-'));
+    try {
+      const runNode: RunNode = async (req) => ({
+        status: 'fail',
+        manifestPath: join(req.attemptDir, 'manifest.json'),
+        failureDetail: 'Goal cleared after an unrecoverable error (model unavailable)',
+      });
+      const deps: V3RuntimeDeps = { runNode, validateManifest, resolveBotSnapshot };
+      const outcome = await runWorkflow(validateDag(TWO_NODE), deps, { baseDir: base });
+      if (outcome.reason !== 'terminal') throw new Error('expected terminal outcome');
+      const events = readJournal(join(outcome.runDir, 'journal.ndjson'));
+      const failed = events.find((e) => e.type === 'nodeFailed') as any;
+      expect(failed.errorClass).toBe('workerError');
+      expect(failed.message).toMatch(/^Goal cleared after an unrecoverable error \(model unavailable\); /);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('manifest 非法（绝对 path 越权）→ manifestInvalid → blocked（两档语义升级）', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-rt-bad-'));
     try {

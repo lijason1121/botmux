@@ -12,6 +12,13 @@ import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js'
  * file is edited.)
  */
 
+import { cliSupportsConfigDir, normalizeCliConfigDir } from '../../core/cli-config-dir.js';
+import {
+  CODEX_REASONING_EFFORTS,
+  isBackendVariantCliId,
+  isCodexReasoningEffort,
+  isConfigurableReasoningCliId,
+} from '../../services/codex-reasoning-effort.js';
 import { normalizeEnvPolicy } from '../../core/env-policy.js';
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
 import { newSessionCodexInstanceState, type SessionCliInstanceBindingV1 } from '../../services/codex-instance-pool.js';
@@ -79,8 +86,11 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     ...(bot.envPolicy ? { envPolicy: normalizeEnvPolicy(bot.envPolicy) } : {}),
     cliId: bot.cliId,
     ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
+    ...(bot.cliConfigDir && cliSupportsConfigDir(bot.cliId) ? { cliConfigDir: bot.cliConfigDir } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.reasoningEffort && isConfigurableReasoningCliId(bot.cliId) ? { reasoningEffort: bot.reasoningEffort } : {}),
+    ...(bot.modelBackendVariant && isBackendVariantCliId(bot.cliId) ? { modelBackendVariant: bot.modelBackendVariant } : {}),
     ...(bot.sandbox === true || bot.sandbox === 'oncall'
       ? { sandbox: true }
       : bot.sandbox === 'scratch' ? { sandbox: 'scratch' } : {}),
@@ -154,8 +164,11 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'cliRuntime',
     'cliId',
     'cliPathOverride',
+    'cliConfigDir',
     'wrapperCli',
     'model',
+    'reasoningEffort',
+    'modelBackendVariant',
     'envPolicy',
     'sandbox',
     'sandboxPaths',
@@ -187,10 +200,16 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     if (typeof obj.workingDir !== 'string' || obj.workingDir.length === 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].workingDir must be a non-empty string`);
     }
-    for (const field of ['cliPathOverride', 'wrapperCli', 'model'] as const) {
+    for (const field of ['cliPathOverride', 'cliConfigDir', 'wrapperCli', 'model'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'string') {
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
+    }
+    if (obj.reasoningEffort !== undefined && !isCodexReasoningEffort(obj.reasoningEffort)) {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].reasoningEffort must be one of ${CODEX_REASONING_EFFORTS.join(', ')}`);
+    }
+    if (obj.modelBackendVariant !== undefined && obj.modelBackendVariant !== 'standard' && obj.modelBackendVariant !== 'max') {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].modelBackendVariant must be standard or max`);
     }
     for (const field of ['sandbox', 'sandboxNetwork'] as const) {
       if (obj[field] !== undefined && typeof obj[field] !== 'boolean') {
@@ -238,8 +257,11 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.envPolicy ? { envPolicy: normalizeEnvPolicy(obj.envPolicy) } : {}),
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(obj.cliConfigDir !== undefined ? { cliConfigDir: normalizeCliConfigDir(obj.cliConfigDir) } : {}),
       ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
+      ...(obj.reasoningEffort !== undefined ? { reasoningEffort: obj.reasoningEffort as BotSnapshot['reasoningEffort'] } : {}),
+      ...(obj.modelBackendVariant !== undefined ? { modelBackendVariant: obj.modelBackendVariant as BotSnapshot['modelBackendVariant'] } : {}),
       ...(obj.sandbox === 'scratch' ? { sandbox: 'scratch' as const }
         : obj.sandbox === true || obj.sandbox === 'oncall' ? { sandbox: true as const } : {}),
       ...(obj.scratchStorage !== undefined ? { scratchStorage: obj.scratchStorage as 'tmpfs' | 'disk' } : {}),

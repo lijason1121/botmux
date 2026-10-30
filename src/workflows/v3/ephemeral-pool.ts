@@ -299,8 +299,11 @@ async function runNodeImpl(
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
+    cliConfigDir: req.botSnapshot.cliConfigDir,
     wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
+    reasoningEffort: req.botSnapshot.reasoningEffort,
+    modelBackendVariant: req.botSnapshot.modelBackendVariant,
     envPolicy: req.botSnapshot.envPolicy,
     ...v3WorkerSessionEnv(req.botSnapshot.larkAppId, deps.resolveBot),
     // Workflow workers require CLI bypass permissions by product contract.
@@ -331,7 +334,7 @@ async function runNodeImpl(
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
-    let pendingResult: { status: 'ok' | 'fail'; reason: string } | undefined;
+    let pendingResult: { status: 'ok' | 'fail'; reason: string; detail?: string } | undefined;
     let quiesceTimer: NodeJS.Timeout | undefined;
     let sigtermTimer: NodeJS.Timeout | undefined;
     let sigkillTimer: NodeJS.Timeout | undefined;
@@ -347,7 +350,7 @@ async function runNodeImpl(
     let cancelReason: unknown;
 
     const hardDeadline = setTimeout(() => {
-      finish('fail', 'timeout');
+      finish('fail', 'timeout', `node timed out after ${Math.round(req.timeoutMs / 1000)}s`);
     }, req.timeoutMs);
 
     function sessionInfo(): WorkerSessionInfo {
@@ -389,10 +392,10 @@ async function runNodeImpl(
       }, 250 + deps.cancelGraceMs);
     }
 
-    function finish(status: RunNodeResult['status'], reason: string): void {
+    function finish(status: RunNodeResult['status'], reason: string, detail?: string): void {
       if (settled || cancelRequested || pendingResult) return;
       if (status === 'cancelled') return;
-      pendingResult = { status, reason };
+      pendingResult = { status, reason, ...(detail ? { detail } : {}) };
       void appendLine(stderrPath(req), `[v3] worker outcome claimed status=${status} reason=${reason}; waiting for worker exit`);
       requestWorkerExit();
     }
@@ -505,11 +508,15 @@ async function runNodeImpl(
           break;
         case 'error':
           void appendLine(stderrPath(req), `[worker] ${event.message}`);
-          finish('fail', 'worker-error');
+          finish('fail', 'worker-error', event.message);
           break;
         case 'claude_exit':
           void appendLine(stderrPath(req), `[worker] cli exit code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`);
-          finish(event.code === 0 ? 'ok' : 'fail', 'cli-exit');
+          finish(
+            event.code === 0 ? 'ok' : 'fail',
+            'cli-exit',
+            `CLI exited code=${event.code ?? 'null'} signal=${event.signal ?? 'null'}`,
+          );
           break;
       }
     });
@@ -547,7 +554,10 @@ async function runNodeImpl(
       const status = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
       const reason = pendingResult?.reason ?? 'worker-exit';
       void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
-      resolve({ status, manifestPath, sessionInfo: sessionInfo() });
+      const failureDetail = status === 'fail'
+        ? pendingResult?.detail ?? `worker exited code=${code ?? 'null'}`
+        : undefined;
+      resolve({ status, manifestPath, sessionInfo: sessionInfo(), ...(failureDetail ? { failureDetail } : {}) });
     });
 
     try {

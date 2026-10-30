@@ -46,6 +46,30 @@ describe('blocker #2: sandboxPaths threads through the workflow chain', () => {
     expect(() => parseFrozenBotSnapshots(malformed)).toThrow('wrapperCli must be a string');
   });
 
+  it('freezes and round-trips the claude-code cliConfigDir profile', () => {
+    const snap = botToSnapshot(bot({ cliConfigDir: '~/.botmux/bots/app_x/claude-profile' }), '/w');
+    expect(snap.cliConfigDir).toBe('~/.botmux/bots/app_x/claude-profile');
+    const frozen = serializeFrozenBotSnapshots(new Map([['app_x', snap]]));
+    const roundTrip = parseFrozenBotSnapshots(JSON.parse(JSON.stringify(frozen)));
+    expect(roundTrip.get('app_x')!.cliConfigDir).toBe('~/.botmux/bots/app_x/claude-profile');
+    expect(botToSnapshot(bot({ cliId: 'codex', cliConfigDir: '/p' } as Partial<BotConfig>), '/w').cliConfigDir).toBeUndefined();
+    const malformed = JSON.parse(JSON.stringify(frozen));
+    malformed.app_x.cliConfigDir = 'relative/profile';
+    expect(() => parseFrozenBotSnapshots(malformed)).toThrow('cliConfigDir');
+  });
+
+  it('freezes reasoningEffort / modelBackendVariant only for CLIs that honor them', () => {
+    const claude = botToSnapshot(bot({ reasoningEffort: 'xhigh', modelBackendVariant: 'max' }), '/w');
+    expect(claude.reasoningEffort).toBe('xhigh');
+    expect(claude.modelBackendVariant).toBeUndefined();
+    const traex = botToSnapshot(bot({ cliId: 'traex', reasoningEffort: 'high', modelBackendVariant: 'max' }), '/w');
+    const roundTrip = parseFrozenBotSnapshots(JSON.parse(JSON.stringify(serializeFrozenBotSnapshots(new Map([['app_x', traex]])))));
+    expect(roundTrip.get('app_x')).toMatchObject({ reasoningEffort: 'high', modelBackendVariant: 'max' });
+    const malformed = JSON.parse(JSON.stringify(serializeFrozenBotSnapshots(new Map([['app_x', traex]]))));
+    malformed.app_x.reasoningEffort = 'turbo';
+    expect(() => parseFrozenBotSnapshots(malformed)).toThrow('reasoningEffort');
+  });
+
   it('botToSnapshot carries the three tiers', () => {
     const snap = botToSnapshot(bot(), '/w');
     expect(snap.sandboxPaths).toEqual({

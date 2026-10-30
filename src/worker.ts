@@ -87,7 +87,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, claudeGoalAbortNotice, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
@@ -9302,6 +9302,7 @@ function bridgeIngest(): void {
   // signal — read it here (event-driven, once per record) instead of scraping
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
+  maybeFailWorkflowOnGoalAbort(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
   claudeTranscriptTurnEnd.observe(result.events);
   if (claudeTranscriptTurnEnd.endedForMs() !== undefined) scheduleStaleProgramStatusCheck();
@@ -9309,6 +9310,30 @@ function bridgeIngest(): void {
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
   emitReadyTurns({ explicitTerminalOnly: true });
+}
+
+let workflowGoalAbortSent = false;
+let workflowLastApiErrorText: string | undefined;
+/** Workflow nodes drive Claude through one `/goal`. When Claude clears that
+ *  goal on an unrecoverable API error nothing will ever write the manifest, so
+ *  report it as a worker error (the pool fails the node now, naming the cause)
+ *  instead of letting the node idle until its hard deadline. */
+function maybeFailWorkflowOnGoalAbort(events: readonly TranscriptEvent[]): void {
+  if (!isWorkflowWorker() || workflowGoalAbortSent || workflowFinalOutputSent) return;
+  for (const ev of events) {
+    if (ev.isApiErrorMessage === true && (ev as any).isSidechain !== true) {
+      const text = apiErrorMessageText(ev).trim();
+      if (text) workflowLastApiErrorText = text;
+      continue;
+    }
+    const notice = claudeGoalAbortNotice(ev);
+    if (!notice) continue;
+    workflowGoalAbortSent = true;
+    const message = workflowLastApiErrorText ? `${notice} Cause: ${workflowLastApiErrorText}` : notice;
+    log(`Workflow goal aborted by CLI; failing node: ${message}`);
+    send({ type: 'error', message });
+    return;
+  }
 }
 
 /** Scan newly-drained Claude transcript events for a structured rate-limit

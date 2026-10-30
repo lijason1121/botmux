@@ -34,6 +34,7 @@ import {
   classifyClaudeTerminalEvent,
   isSyntheticNoModelReplyEvent,
   apiErrorMessageText,
+  claudeGoalAbortNotice,
   transcriptShowsTurnDurationMarker,
   transcriptHoldsConversation,
   type TranscriptEvent,
@@ -1895,5 +1896,18 @@ describe('transcriptHoldsConversation', () => {
   it('does not take a nested "type":"user" for a conversation record', () => {
     appendLine({ type: 'file-history-snapshot', snapshot: { note: { type: 'user' } } });
     expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+});
+
+describe('claudeGoalAbortNotice', () => {
+  const notice = 'Goal cleared after an unrecoverable error (model unavailable): "Read $BOTMUX_GOAL_PATH…". Run /goal again to continue.';
+  it('returns the CLI notice for a /goal abort record', () => {
+    expect(claudeGoalAbortNotice({ type: 'system', subtype: 'informational', content: notice } as TranscriptEvent)).toBe(notice);
+  });
+  it('ignores other system records, sidechains and non-system events', () => {
+    expect(claudeGoalAbortNotice({ type: 'system', subtype: 'informational', content: 'Goal set: x' } as TranscriptEvent)).toBeUndefined();
+    expect(claudeGoalAbortNotice({ type: 'system', content: notice, isSidechain: true } as TranscriptEvent)).toBeUndefined();
+    expect(claudeGoalAbortNotice({ type: 'user', content: notice } as TranscriptEvent)).toBeUndefined();
+    expect(claudeGoalAbortNotice(undefined)).toBeUndefined();
   });
 });
