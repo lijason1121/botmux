@@ -147,10 +147,10 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   const verifyPublication = goal('verify-publication', bots.regression, [
     '由独立回归评审机器人只读核验发布结果，不推送、不评论、不修改PR或代码。delivery-plan来自开发机器人，必须经固定脚本与本角色gate产出的release-candidate绑定后才可信。',
     '用官方CLI只读查询delivery-plan对应的PR，写observed-pr.json：{url,state,sourceBranch,targetBranch,headSha}；action=comment时再取回实际发布的那条评论正文原文写入observed-comment.md。开发机器人的mr-result.json只用于找到PR和评论链接，不能代替本角色的查询。',
-    '执行固定tools.mjs verify-publication --context <context> --release <release-candidate> --plan <delivery-plan> --observed observed-pr.json [--observed-comment observed-comment.md] --out <本输出目录/verification.json>，附固定hash参数。工具核对计划提交等于gate通过的提交、远端分支持有该提交、PR指向正确分支，或评论原文与计划一致。工具失败即发布与评审结果不符：如实写失败Manifest并说明差异，不得重试改写或自行宣称通过。',
+    '执行固定tools.mjs verify-publication --context <context> --release <release-candidate> --plan <delivery-plan> --route <check-delivery的route结果> --observed observed-pr.json [--observed-comment observed-comment.md] --out <本输出目录/verification.json>，附固定hash参数。工具核对计划提交等于gate通过的提交、远端分支持有该提交、PR指向正确分支，或评论原文与计划一致；是否经人工审批以check-delivery的路由结果为准，不取开发者计划中的审批字段。工具失败即发布与评审结果不符：如实写失败Manifest并说明差异，不得重试改写或自行宣称通过。',
     HASH_INSTRUCTION, '用固定publish工具交付 --entry verification json verification.json --entry observed-pr json observed-pr.json，评论模式附 --entry observed-comment markdown observed-comment.md。',
   ].join('\n'), { verification: output('verification.json') }, ['create-mr', 'publish-direct', 'prepare-mr', 'development-review-loop', 'prepare'],
-  [ref('create-mr', 'mr-result'), ref('publish-direct', 'mr-result'), ref('prepare-mr', 'delivery-plan'), ref('development-review-loop', 'release-candidate'),
+  [ref('create-mr', 'mr-result'), ref('publish-direct', 'mr-result'), ref('prepare-mr', 'delivery-plan'), ref('check-delivery', 'route'), ref('development-review-loop', 'release-candidate'),
     ref('prepare', 'tools'), ref('prepare', 'context'), ref('prepare', 'resources')]);
   verifyPublication.depends = [{ from: 'create-mr' }, { from: 'publish-direct' }, { from: 'check-delivery', when: { path: 'result.publicationRequired', equals: true } },
     { from: 'prepare-mr' }, { from: 'development-review-loop' }, { from: 'prepare' }];
@@ -159,7 +159,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   // Runs once after verification, or straight after planning when nothing is published.
   const complete = goal('complete', bots.developer, [
     '交付本次最终task-report.md。action=none/reuse时只读确认原PR状态、URL及SHA，直接交付结论，不推送、不创建、不修改PR、不发评论。发布与核验节点跳过是无发布动作的正常结果，不是失败。',
-    '有发布时以verify-publication的verification.json为准写实际动作、URL、分支与SHA；无发布时以delivery-plan为准。报告写明模式、PR链接、head/base、是否推送或发布评论、是否经人工审批、正确性/回归结论、真实验证、评审意见含nit的处置结论和未验证环境；review模式列出已发给作者的意见。release-candidate.artifacts给出change-summary、validation和两份评审的路径，按需只读引用。区分原PR已有改动与本轮新增修复，不得将成立未修复的nit留到交付，不能只写Manifest成功。',
+    '有发布时以verify-publication的verification.json为准写实际动作、URL、分支、SHA及是否经人工审批；无发布时以delivery-plan为准。报告写明模式、PR链接、head/base、是否推送或发布评论、是否经人工审批、正确性/回归结论、真实验证、评审意见含nit的处置结论和未验证环境；review模式列出已发给作者的意见。release-candidate.artifacts给出change-summary、validation和两份评审的路径，按需只读引用。区分原PR已有改动与本轮新增修复，不得将成立未修复的nit留到交付，不能只写Manifest成功。',
     HASH_INSTRUCTION, '使用固定publish工具交付 --entry task-report markdown task-report.md。',
   ].join('\n'), { 'task-report': output('task-report.md', 'markdown') }, ['verify-publication', 'prepare-mr', 'development-review-loop', 'prepare'],
   [ref('verify-publication', 'verification'), ref('prepare-mr', 'delivery-plan'), ref('development-review-loop', 'gate-result'),
