@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createDevelopmentReviewPreset } from '../src/workflows/v3/presets/development-review.js';
+import { upgradeDevelopmentReviewPreset } from '../src/workflows/v3/presets/development-review-upgrade.js';
 import { DEVELOPMENT_REVIEW_RESOURCES, DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256 } from '../src/workflows/v3/presets/development-review-resources.js';
 import { collectSavedWorkflowReusableTextWarnings } from '../src/workflows/v3/library-materialize.js';
 import { validateSavedWorkflowRevisionPayload } from '../src/workflows/v3/library-schema.js';
@@ -75,6 +76,16 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
 }
 
 describe('authored development-review preset', () => {
+  it('upgrades the complete previous preset while preserving configured role defaults', () => {
+    const previous = JSON.parse(readFileSync(new URL('./fixtures/development-review/v2.json', import.meta.url), 'utf8'));
+    const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
+    const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
+      typeof value === 'string' ? Object.entries(BOTS).reduce((v, [role, bot]) => v === bot ? selected[role as keyof typeof selected] : v, value) : value);
+    expect(upgradeDevelopmentReviewPreset(bound)).toEqual(createDevelopmentReviewPreset(selected));
+    bound.specTemplate.requirement += ' customized behavior';
+    expect(upgradeDevelopmentReviewPreset(bound)).toBeUndefined();
+    expect(upgradeDevelopmentReviewPreset(createDevelopmentReviewPreset(selected))).toBeUndefined();
+  });
   it('is a source-free, lint-clean and schema-valid executable definition with explicit dependencies', () => {
     const draft = createDevelopmentReviewPreset(BOTS), warnings: string[] = [];
     collectSavedWorkflowReusableTextWarnings(draft, 'draft', warnings);
@@ -102,6 +113,51 @@ describe('authored development-review preset', () => {
 });
 
 describe('fixed development-review executable resources', () => {
+  it.each(['correctness', 'regression'] as const)('rejects an approve carrying a %s nit and returns actionable feedback', async role => {
+    const f = await evidenceFixture();
+    const finding = { blocking: false, location: 'value.txt:1', impact: 'An unnecessary duplicate remains', evidence: 'The same value is assigned twice' };
+    write(f[role], { ...json(f[role]), findings: [finding] });
+    expect(await f.gate()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(f.result).passed).toBe(false);
+    expect(json(f.result).unresolvedFindings).toEqual([{ role, ...finding }]);
+    expect(json(join(f.gated, 'release-candidate.json')).passed).toBe(false);
+    expect(readFileSync(join(f.gated, 'feedback.md'), 'utf8')).toContain(finding.evidence);
+    expect(readFileSync(f.result, 'utf8')).not.toContain('private-review-evidence-canary');
+  });
+
+  it('returns both reviewers findings for assessment, then requires clean reviews of the next candidate', async () => {
+    const f = await evidenceFixture();
+    const finding = { blocking: false, location: 'value.txt:1', impact: 'A redundant line remains', evidence: 'Duplicate line in the candidate' };
+    for (const role of ['correctness', 'regression'] as const) write(f[role], { ...json(f[role]), decision: 'changes_requested', findings: [finding] });
+    expect(await f.gate()).toMatchObject({ code: 0 });
+    expect(json(f.result)).toMatchObject({ passed: false, unresolvedFindings: [
+      { role: 'correctness', ...finding }, { role: 'regression', ...finding },
+    ] });
+
+    writeFileSync(join(f.worktree, 'value.txt'), 'resolved\n'); f.git(f.worktree, 'add', 'value.txt'); f.git(f.worktree, 'commit', '-qm', 'resolve finding');
+    const implemented = f.out('development-review-loop.i002.implement'), candidate = join(implemented, 'candidate.json'), validation = join(implemented, 'validation.json');
+    expect(await f.tool('candidate', ['--context', f.context, '--round', '2'], implemented)).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', f.context, '--candidate', candidate, '--round', '2'], implemented)).toMatchObject({ code: 0 });
+    const output = f.out('development-review-loop.i002.verify-review-gate'), result = join(output, 'result.json');
+    const args = f.gateArgs.map(value => value === f.candidate ? candidate : value === f.validation ? validation : value === f.result ? result : value === '1' ? '2' : value);
+    expect(await f.tool('gate', args, output)).toMatchObject({ code: 0 });
+    expect(json(result).passed).toBe(false); // Old approvals/findings cannot authorize the new head.
+    for (const role of ['correctness', 'regression'] as const) write(f[role], { ...json(f[role]), ...json(candidate), decision: 'approve', findings: [],
+      candidateSha256: sha(candidate), validationSha256: sha(validation) });
+    expect(await f.tool('gate', args, output)).toMatchObject({ code: 0 });
+    expect(json(result)).toMatchObject({ passed: true, unresolvedFindings: [], round: 2, headSha: json(candidate).headSha });
+  });
+
+  it('never forwards a forged reviewers findings as authenticated developer feedback', async () => {
+    const f = await evidenceFixture();
+    const finding = { blocking: false, location: 'value.txt:1', impact: 'Needs assessment', evidence: 'Authenticated finding evidence' };
+    write(f.correctness, { ...json(f.correctness), reviewerId: BOTS.developer, findings: [{ ...finding, evidence: 'forged-finding-canary' }] });
+    write(f.regression, { ...json(f.regression), decision: 'changes_requested', findings: [finding] });
+    expect(await f.gate()).toMatchObject({ code: 0 });
+    expect(json(f.result)).toMatchObject({ passed: false, unresolvedFindings: [{ role: 'regression', ...finding }] });
+    expect(readFileSync(f.result, 'utf8')).not.toContain('forged-finding-canary');
+  });
+
   it('prepares an existing PR at its actual head and keeps the target base separate', async () => {
     const f = fixture();
     const baseSha = f.git(f.repo, 'rev-parse', 'HEAD');
