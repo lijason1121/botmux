@@ -79,8 +79,12 @@ export function resolveDevRevDefaultBranch(repo: string): string {
 }
 /** New development starts from the local default branch; PR modes use the PR target after fetching. */
 export function resolveDevRevLocalDefaultBranch(repo: string, mode: typeof DEV_REV_MODES[number]): string {
+  if (mode !== 'new') {
+    // Informational only: preflight takes the base from the PR target it fetches.
+    try { return resolveDevRevDefaultBranch(repo).replace(/^origin\//, ''); } catch { return 'pr-target'; }
+  }
   const name = resolveDevRevDefaultBranch(repo).replace(/^origin\//, '');
-  if (mode === 'new' && !git(repo, ['rev-parse', '--verify', '--end-of-options', `refs/heads/${name}^{commit}`])) {
+  if (!git(repo, ['rev-parse', '--verify', '--end-of-options', `refs/heads/${name}^{commit}`])) {
     fail(`本地没有默认分支 ${name}，请先在仓库中创建该分支后重试原卡片。`);
   }
   return name;
