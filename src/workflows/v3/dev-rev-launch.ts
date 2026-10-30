@@ -16,6 +16,7 @@ import { instantiatePublishedSavedWorkflow, listVisibleSavedWorkflows, loadVisib
 import { loadAuthorizedV3Run } from './run-envelope.js';
 
 export const DEV_REV_ROLES = ['developer', 'correctness', 'regression'] as const;
+export const DEV_REV_MODES = ['new', 'review', 'continue'] as const;
 const choice = z.object({ value: z.string().min(1), label: z.string().min(1).max(160) }).strict();
 const schema = z.object({
   schemaVersion: z.literal(1), id: z.string().regex(/^dl_[a-f0-9]{32}$/),
@@ -27,6 +28,8 @@ const schema = z.object({
   bots: z.array(choice.extend({ appId: z.string().min(1) })).max(100),
   runId: z.string().regex(/^devrev-[a-f0-9]{32}$/),
   submitted: z.object({ repo: z.string(), requirement: z.string().min(1).max(12000),
+    // Absent only on requests frozen before modes existed; their revision has no mode input.
+    mode: z.enum(DEV_REV_MODES).optional(),
     developer: z.string(), correctness: z.string(), regression: z.string(),
     targetBranch: z.string().min(1), workflowId: z.string().min(1), revisionId: z.string().min(1) }).strict().optional(),
   started: z.boolean().default(false), cancelled: z.boolean().default(false),
@@ -73,6 +76,14 @@ export function resolveDevRevDefaultBranch(repo: string): string {
     if (found.length > 1) break;
   }
   fail('无法唯一确定仓库默认分支，请先配置远端默认分支后重新提交。');
+}
+/** New development starts from the local default branch; PR modes use the PR target after fetching. */
+export function resolveDevRevLocalDefaultBranch(repo: string, mode: typeof DEV_REV_MODES[number]): string {
+  const name = resolveDevRevDefaultBranch(repo).replace(/^origin\//, '');
+  if (mode === 'new' && !git(repo, ['rev-parse', '--verify', '--end-of-options', `refs/heads/${name}^{commit}`])) {
+    fail(`本地没有默认分支 ${name}，请先在仓库中创建该分支后重试原卡片。`);
+  }
+  return name;
 }
 export async function createDevRevLaunch(input: {
   dataDir: string; context: SavedWorkflowActorContext; requestKey: string;
@@ -169,9 +180,9 @@ export async function submitDevRevLaunch(input: {
       return { runId: r.runId, cancelled: true, started: false };
     }
     if (!r.submitted) {
-      const form = z.object({ repo: z.string(), developer: z.string(), correctness: z.string(), regression: z.string(),
+      const form = z.object({ repo: z.string(), mode: z.enum(DEV_REV_MODES), developer: z.string(), correctness: z.string(), regression: z.string(),
         requirement: z.string().trim().min(1).max(12000) }).strict().safeParse(input.form);
-      if (!form.success) fail('请选择仓库和三个角色，并填写需求文字或文档链接。');
+      if (!form.success) fail('请选择仓库、模式和三个角色，并填写需求文字、文档链接或 PR 链接。');
       const f = form.data;
       const repo = r.repos.find(x => x.value === f.repo);
       if (!repo) fail('仓库选项无效，请重新选择。');
@@ -179,12 +190,12 @@ export async function submitDevRevLaunch(input: {
       if (actual.commonDir !== repo.commonDir) fail('仓库已变化，请重新打开启动卡片。');
       const selected = Object.fromEntries(DEV_REV_ROLES.map(role => [role, r.bots.find(x => x.value === f[role])?.appId]));
       if (Object.values(selected).some(x => !x) || new Set(Object.values(selected)).size !== 3) fail('三个角色必须选择不同的本群机器人。');
-      const targetBranch = resolveDevRevDefaultBranch(repo.path);
+      const targetBranch = resolveDevRevLocalDefaultBranch(repo.path, f.mode);
       // Validate live membership before authoring a definition or publishing a run.
       const members = new Set((await deps.listChatBots(input.appId, ctx.chatId)).map(x => x.appId));
       if (Object.values(selected).some(appId => !members.has(appId!))) fail('所选机器人已离群或无法确认成员身份，请重新打开卡片。');
       const saved = await ensurePreset(deps.dataDir, ctx, selected as Record<string, string>);
-      r.submitted = { repo: repo.value, requirement: f.requirement, targetBranch,
+      r.submitted = { repo: repo.value, mode: f.mode, requirement: f.requirement, targetBranch,
         developer: selected.developer!, correctness: selected.correctness!, regression: selected.regression!,
         workflowId: saved.metadata.workflowId, revisionId: saved.revision.revisionId };
       save(deps.dataDir, r); // Durable frozen submission before any run publication.
@@ -193,7 +204,8 @@ export async function submitDevRevLaunch(input: {
     const members = new Set((await deps.listChatBots(input.appId, ctx.chatId)).map(x => x.appId));
     if (DEV_REV_ROLES.some(role => !members.has(s[role]))) fail('所选机器人已离群，请重新发起。');
     const roleSelections = Object.fromEntries(DEV_REV_ROLES.map(role => [role, s[role]]));
-    const rawParams = { repo_path: { kind: 'string' as const, value: repo.path },
+    const rawParams = { ...(s.mode ? { mode: { kind: 'string' as const, value: s.mode } } : {}),
+      repo_path: { kind: 'string' as const, value: repo.path },
       requirement: { kind: 'string' as const, value: s.requirement },
       target_branch: { kind: 'string' as const, value: s.targetBranch },
       validation_commands: { kind: 'json' as const, value: [] } };

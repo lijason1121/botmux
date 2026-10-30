@@ -7,6 +7,7 @@ import { createDevelopmentReviewPreset, type DevelopmentReviewDefaultBots } from
 const PREVIOUS_DRAFT_SHA256 = new Set([
   '9b99b94f57d9a5ce37b067ee26f63d77798e1dfbbc3c793685e35dff95483394',
   'b5647a21da51ef16dd2bf6396a1ff3d3cdfd60512692f14867643d51062cb8aa',
+  '97114d9726341b447e6c5678fad48f0762087011bc284f646f20de3efaa50f08',
 ]);
 
 export function upgradeDevelopmentReviewPreset(draft: SavedWorkflowRevisionDraft): SavedWorkflowRevisionDraft | undefined {
