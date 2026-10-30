@@ -189,7 +189,7 @@ function record(args) {
 }
 function gate(args) {
   requireThat(process.env.BOTMUX_GOAL_OUTPUT_DIR && path.resolve(args.out) === path.join(path.resolve(process.env.BOTMUX_GOAL_OUTPUT_DIR), 'result.json'), 'gate result must use this goal output');
-  const problems = [];
+  const problems = [], unresolvedFindings = [];
   let candidate = {};
   try {
     const context = read(args.context); candidate = read(args.candidate);
@@ -221,17 +221,25 @@ function gate(args) {
     const reviews = [read(args.correctness), read(args.regression)];
     for (let index = 0; index < reviews.length; index++) {
       const review = reviews[index], role = index === 0 ? 'correctness' : 'regression';
-      version(review, role + ' review');
-      same(review, candidate, ['runId', 'repo', 'baseSha', 'headSha', 'round'], role + ' review');
-      requireThat(review.role === role && review.reviewerId === context.roles[role].bot, 'wrong/duplicate reviewer identity');
-      requireThat(review.candidateSha256 === digest(args.candidate) && review.validationSha256 === digest(args.validation) && review.contextSha256 === digest(args.context), 'review input provenance mismatch');
-      requireThat(review.decision === 'approve', 'review not approved');
-      requireThat(Array.isArray(review.findings) && review.findings.every(finding => object(finding) && finding.blocking === false), 'blocking/unclassified finding');
-      requireThat([review.coverage, review.evidence].every(items => Array.isArray(items) && items.length && items.every(item => typeof item === 'string' && item.trim())), 'review lacks nonempty string evidence/coverage');
+      try {
+        version(review, role + ' review');
+        same(review, candidate, ['runId', 'repo', 'baseSha', 'headSha', 'round'], role + ' review');
+        requireThat(review.role === role && review.reviewerId === context.roles[role].bot, 'wrong/duplicate reviewer identity');
+        requireThat(review.candidateSha256 === digest(args.candidate) && review.validationSha256 === digest(args.validation) && review.contextSha256 === digest(args.context), 'review input provenance mismatch');
+        requireThat([review.coverage, review.evidence].every(items => Array.isArray(items) && items.length && items.every(item => typeof item === 'string' && item.trim())), 'review lacks nonempty string evidence/coverage');
+        requireThat(Array.isArray(review.findings) && review.findings.every(finding => object(finding) && typeof finding.blocking === 'boolean' &&
+          ['location', 'impact', 'evidence'].every(key => typeof finding[key] === 'string' && finding[key].trim())), 'unclassified/incomplete finding');
+        // Only forward authenticated, candidate-bound findings, never the full
+        // independent report. Developers need both reviewers' actionable issues.
+        for (const finding of review.findings) unresolvedFindings.push({ role, blocking: finding.blocking,
+          location: finding.location, impact: finding.impact, evidence: finding.evidence });
+        if (review.findings.length) problems.push(role + ': unresolved findings (including nits)');
+        if (review.decision !== 'approve') problems.push(role + ': review not approved');
+      } catch (error) { problems.push(role + ': ' + error.message); }
     }
   } catch (error) { problems.push(error.message); }
   const result = { passed: problems.length === 0, reasons: problems, runId: candidate.runId, repo: candidate.repo,
-    baseSha: candidate.baseSha, headSha: candidate.headSha, round: candidate.round };
+    baseSha: candidate.baseSha, headSha: candidate.headSha, round: candidate.round, unresolvedFindings };
   atomic(args.out, result);
   const artifacts = {};
   for (const key of ['context', 'resources', 'candidate', 'validation', 'correctness', 'regression']) {
@@ -239,7 +247,8 @@ function gate(args) {
   }
   atomic(path.join(path.dirname(args.out), 'release-candidate.json'), { schemaVersion: 1, passed: result.passed, gate: result,
     toolsSha256: digest(self), artifacts });
-  fs.writeFileSync(path.join(path.dirname(args.out), 'feedback.md'), result.passed ? 'Gate passed for this candidate.\n' : 'Gate did not pass:\n' + problems.map(problem => '- ' + problem).join('\n') + '\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(path.dirname(args.out), 'feedback.md'), result.passed ? 'Gate passed for this candidate.\n' : 'Gate did not pass:\n' + problems.map(problem => '- ' + problem).join('\n') +
+    '\nFindings to assess and resolve (including nits):\n' + JSON.stringify(unresolvedFindings, null, 2) + '\n', { mode: 0o600 });
 }
 function delivery(args) {
   const release = read(args.release), context = read(args.context), draft = read(args.draft);
