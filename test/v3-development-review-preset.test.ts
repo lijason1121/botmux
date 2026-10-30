@@ -10,6 +10,7 @@ import { DEVELOPMENT_REVIEW_RESOURCES, DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA2
 import { collectSavedWorkflowReusableTextWarnings } from '../src/workflows/v3/library-materialize.js';
 import { validateSavedWorkflowRevisionPayload } from '../src/workflows/v3/library-schema.js';
 import { readAndValidateManifest } from '../src/workflows/v3/manifest.js';
+import { validateResult } from '../src/workflows/v3/shared-node-runtime.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const BOTS = { developer: 'cli_developer', correctness: 'cli_correctness', regression: 'cli_regression' };
@@ -77,7 +78,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -86,6 +87,22 @@ describe('authored development-review preset', () => {
     bound.specTemplate.requirement += ' customized behavior';
     expect(upgradeDevelopmentReviewPreset(bound)).toBeUndefined();
     expect(upgradeDevelopmentReviewPreset(createDevelopmentReviewPreset(selected))).toBeUndefined();
+  });
+  it('blocks a preflight whose fields prepare consumes have the wrong type, at preflight itself', () => {
+    const preflight = createDevelopmentReviewPreset(BOTS).dagTemplate.nodes.find(node => node.id === 'preflight')!;
+    const dir = mkdtempSync(join(tmpdir(), 'dev-rev-preflight-schema-')), path = join(dir, 'result.json');
+    try {
+      const check = (extra: Record<string, unknown>) => {
+        writeFileSync(path, JSON.stringify({ state: 'READY', repositoryAccess: true, ...extra }));
+        return validateResult(path, preflight.resultSchema!);
+      };
+      expect(check({}).ok).toBe(true);
+      expect(check({ resolvedRequirement: 'spec text', validationCommands: [] }).ok).toBe(true);
+      expect(check({ resolvedRequirement: { text: 'spec text' } }).problems).toEqual(['field "resolvedRequirement" must be of type string']);
+      expect(check({ validationCommands: { id: 'test' } }).problems).toEqual(['field "validationCommands" must be of type array']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('embeds ASCII-only tools so Bun and Node build identical bytes and digests', () => {
     expect(/^[\x00-\x7f]*$/.test(DEVELOPMENT_REVIEW_RESOURCES[0]!.content)).toBe(true);
