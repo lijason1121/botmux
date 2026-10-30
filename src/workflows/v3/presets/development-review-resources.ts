@@ -62,8 +62,9 @@ function cleanHead(context, expected, label) {
 function ownOutput(out, name) {
   requireThat(process.env.BOTMUX_GOAL_OUTPUT_DIR && path.resolve(out) === path.join(path.resolve(process.env.BOTMUX_GOAL_OUTPUT_DIR), name), name + ' must use this goal output');
 }
-// A delivery plan is valid only for the passed gate, context and fixed tools it was derived from.
-function boundPlan(args) {
+// A delivery plan is valid only for the passed gate, context and fixed tools it was derived from,
+// and only with the routing the context implies: the developer cannot skip an approval.
+function checkPlan(args) {
   const deliveryPlan = read(args.plan), context = read(args.context), release = read(args.release);
   version(deliveryPlan, 'delivery plan'); version(context, 'context'); version(release, 'release');
   requireThat(context.runId === runtimeRunId() && deliveryPlan.runId === context.runId, 'delivery plan wrong run');
@@ -72,19 +73,60 @@ function boundPlan(args) {
     deliveryPlan.releaseSha256 === digest(args.release) && deliveryPlan.contextSha256 === digest(args.context), 'delivery plan is not bound to the passed gate');
   requireThat(deliveryPlan.headSha === release.gate.headSha && deliveryPlan.baseSha === context.baseSha && deliveryPlan.mode === context.mode,
     'delivery plan publishes a commit the reviewers did not approve');
-  requireThat(deliveryPlan.publicationRequired === true, 'delivery plan has no publication');
-  // Re-derive the routing: the developer must not turn a gated publication into a direct one.
   const target = context.reviewTarget, action = deliveryPlan.action;
-  requireThat({ new: ['create'], continue: ['update'], review: ['comment'] }[context.mode].includes(action), 'delivery action does not fit the mode');
+  requireThat({ new: ['none', 'create'], continue: ['reuse', 'update'], review: ['comment'] }[context.mode].includes(action), 'delivery action does not fit the mode');
+  const pushes = action === 'create' || action === 'update', publication = pushes || action === 'comment';
   const direct = ownComment(context, action);
-  requireThat(deliveryPlan.approvalRequired === !direct && deliveryPlan.directPublish === direct, 'delivery plan skipped a required approval');
+  requireThat(deliveryPlan.publicationRequired === publication && deliveryPlan.approvalRequired === (publication && !direct) &&
+    deliveryPlan.directPublish === (publication && direct), 'delivery plan skipped a required approval');
   requireThat(deliveryPlan.targetBranch === context.targetBranch && deliveryPlan.sourceBranch === (target ? target.sourceBranch : context.branch) &&
     (target ? object(deliveryPlan.existingPr) && deliveryPlan.existingPr.url === target.url : deliveryPlan.existingPr === null), 'delivery plan targets another PR or branch');
+  requireThat(typeof deliveryPlan.repository === 'string' && deliveryPlan.repository.trim() && typeof deliveryPlan.summary === 'string' && deliveryPlan.summary.trim() &&
+    (!pushes || (typeof deliveryPlan.pushRemote === 'string' && REMOTE.test(deliveryPlan.pushRemote) && deliveryPlan.title && deliveryPlan.body)), 'delivery plan material incomplete');
   if (action === 'comment') {
-    requireThat(typeof deliveryPlan.commentBody === 'string' && deliveryPlan.commentBody && sha(Buffer.from(commentText(deliveryPlan.commentBody))) === deliveryPlan.commentSha256 &&
-      release.gate.unresolvedFindings.every(finding => deliveryPlan.commentBody.includes(finding.location)), 'planned comment does not carry every finding');
+    requireThat(typeof deliveryPlan.commentBody === 'string' && deliveryPlan.commentBody === commentText(deliveryPlan.commentBody) &&
+      sha(Buffer.from(deliveryPlan.commentBody)) === deliveryPlan.commentSha256 &&
+      deliveryPlan.commentBody.endsWith(reviewCommentBlock(release.gate)), 'planned comment does not carry every finding');
   }
   return { deliveryPlan, context, release };
+}
+function boundPlan(args) {
+  const bound = checkPlan(args);
+  requireThat(bound.deliveryPlan.publicationRequired === true, 'delivery plan has no publication');
+  return bound;
+}
+// The findings section is generated from the gate, never authored: a preface cannot drop or soften it.
+function reviewCommentBlock(gate) {
+  const findings = gate.unresolvedFindings, failures = gate.validationFailures || [];
+  const lines = ['---', findings.length || failures.length
+    ? '\u7ED3\u8BBA\uFF1A\u9700\u8981\u4FEE\u6539\uFF08' + findings.length + ' \u6761\u610F\u89C1\uFF0C' + failures.length + ' \u9879\u68C0\u67E5\u5931\u8D25\uFF09' : '\u7ED3\u8BBA\uFF1A\u8BC4\u5BA1\u901A\u8FC7\uFF0C\u65E0\u9057\u7559\u610F\u89C1'];
+  findings.forEach((finding, index) => lines.push((index + 1) + '. [' + (finding.blocking ? '\u963B\u585E' : '\u5EFA\u8BAE') + '] ' + finding.location,
+    '   \u5F71\u54CD\uFF1A' + finding.impact, '   \u8BC1\u636E\uFF1A' + finding.evidence));
+  if (failures.length) lines.push('\u68C0\u67E5\u5931\u8D25\uFF1A' + failures.join('\u3001'));
+  return commentText(lines.join('\n'));
+}
+// Approval material is rebuilt from the plan's checked fields, not taken from developer prose.
+function approvalMaterial(deliveryPlan, context) {
+  const action = deliveryPlan.action, pushes = action === 'create' || action === 'update', existing = deliveryPlan.existingPr;
+  const notes = [];
+  if (context.mode === 'new') {
+    const localTarget = git(context.repo, ['rev-parse', '--verify', '--end-of-options', 'refs/heads/' + context.targetBranch + '^{commit}']);
+    if (localTarget !== context.baseSha) notes.push('\u6CE8\u610F\uFF1A\u672C\u5730 ' + context.targetBranch + ' \u5DF2\u4ECE\u57FA\u7EBF ' + context.baseSha + ' \u524D\u8FDB\u5230 ' + localTarget + '\uFF0CPR \u5408\u5E76\u524D\u8BF7\u786E\u8BA4\u65E0\u51B2\u7A81\u3002');
+  }
+  const actionText = { none: '\u65E0\u65B0\u589E\u6539\u52A8\uFF0C\u4EC5\u4EA4\u4ED8\u7ED3\u679C', reuse: '\u5DF2\u6709 PR \u65E0\u9700\u66F4\u65B0\uFF0C\u4EC5\u4EA4\u4ED8\u8BC4\u5BA1\u7ED3\u8BBA', update: '\u63A8\u9001\u4FEE\u590D\u5230\u539F PR \u6E90\u5206\u652F',
+    create: '\u63A8\u9001\u4EFB\u52A1\u5206\u652F\u5E76\u65B0\u5EFA PR/MR', comment: deliveryPlan.directPublish ? '\u5728\u672C\u4EBA PR \u4E0A\u53D1\u5E03\u8BC4\u5BA1\u8BC4\u8BBA\uFF08\u65E0\u9700\u5BA1\u6279\uFF09' : '\u5728\u4ED6\u4EBA PR \u4E0A\u53D1\u5E03\u8BC4\u5BA1\u8BC4\u8BBA' }[action];
+  return [
+    '\u4ED3\u5E93\uFF1A' + deliveryPlan.repository, '\u52A8\u4F5C\uFF1A' + actionText,
+    'PR/MR\uFF1A' + (existing ? existing.url : '\u65B0\u5EFA'),
+    '\u5206\u652F\uFF1A' + deliveryPlan.sourceBranch + ' \u2192 ' + deliveryPlan.targetBranch,
+    '\u63A8\u9001\u8FDC\u7AEF\uFF1A' + (pushes ? deliveryPlan.pushRemote : '\u65E0\u9700\u63A8\u9001'),
+    '\u63D0\u4EA4\uFF1A' + deliveryPlan.headSha, '\u57FA\u7EBF\uFF1A' + deliveryPlan.baseSha,
+    ...notes,
+    '\u53D8\u66F4\u4E0E\u9A8C\u8BC1\uFF1A' + deliveryPlan.summary,
+    ...(pushes ? ['\u6807\u9898\uFF1A' + deliveryPlan.title, '\u6B63\u6587\uFF1A\n' + deliveryPlan.body] : []),
+    ...(action === 'comment' ? ['\u8BC4\u8BBA\u6B63\u6587\uFF1A\n' + deliveryPlan.commentBody] : []),
+    '\u6279\u51C6\u8303\u56F4\uFF1A\u4EC5\u4E0A\u8FF0' + (action === 'comment' ? '\u8BC4\u8BBA\u53D1\u5E03' : '\u5019\u9009\u7684\u63A8\u9001\u53CA PR/MR \u4EA4\u4ED8') + '\uFF1B\u4E0D\u542B\u5408\u5E76\u3001\u90E8\u7F72\u3002',
+  ].join('\n');
 }
 // Platforms may normalize line endings and surrounding whitespace of stored comments.
 function commentText(text) { return text.replace(/\r\n?/g, '\n').trim(); }
@@ -236,6 +278,17 @@ function candidate(args) {
   atomic(path.join(output, 'candidate.json'), { schemaVersion: 1, runId: context.runId, repo: context.repo, baseSha: context.baseSha,
     headSha, round, contextSha256: digest(args.context), resourcesSha256: context.resourcesSha256 });
 }
+function runChecks(context, output, prefix) {
+  return plan(context.validationCommands).map(command => {
+    const startedAtMs = Date.now(), before = git(context.worktree, ['rev-parse', 'HEAD']);
+    const result = spawnSync(command.argv[0], command.argv.slice(1), { cwd: context.worktree, encoding: 'utf8', timeout: command.timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024, shell: false });
+    const logfile = prefix + command.id + '.log';
+    fs.writeFileSync(path.join(output, logfile), (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : ''), { mode: 0o600 });
+    return { id: command.id, argv: command.argv, cwd: context.worktree, startedAtMs, completedAtMs: Date.now(), exitCode: result.status,
+      signal: result.signal, headBefore: before, headAfter: git(context.worktree, ['rev-parse', 'HEAD']),
+      log: { path: logfile, sha256: digest(path.join(output, logfile)) } };
+  });
+}
 function record(args) {
   const context = read(args.context), candidate = read(args.candidate), output = process.env.BOTMUX_GOAL_OUTPUT_DIR;
   version(context, 'context'); version(candidate, 'candidate'); commonRepository(context);
@@ -245,16 +298,7 @@ function record(args) {
   requireThat(candidate.contextSha256 === digest(args.context) && candidate.resourcesSha256 === context.resourcesSha256, 'candidate context/resource mismatch');
   requireThat(git(context.worktree, ['rev-parse', 'HEAD']) === candidate.headSha && !git(context.worktree, ['status', '--porcelain']), 'candidate must be the clean live HEAD');
   const validation = { schemaVersion: 1, runId: candidate.runId, repo: candidate.repo, baseSha: candidate.baseSha, headSha: candidate.headSha,
-    round: candidate.round, candidateSha256: digest(args.candidate), contextSha256: digest(args.context), checks: [] };
-  for (const command of plan(context.validationCommands)) {
-    const startedAtMs = Date.now(), before = git(context.worktree, ['rev-parse', 'HEAD']);
-    const result = spawnSync(command.argv[0], command.argv.slice(1), { cwd: context.worktree, encoding: 'utf8', timeout: command.timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024, shell: false });
-    const logfile = command.id + '.log';
-    fs.writeFileSync(path.join(output, logfile), (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : ''), { mode: 0o600 });
-    validation.checks.push({ id: command.id, argv: command.argv, cwd: context.worktree, startedAtMs, completedAtMs: Date.now(), exitCode: result.status,
-      signal: result.signal, headBefore: before, headAfter: git(context.worktree, ['rev-parse', 'HEAD']),
-      log: { path: logfile, sha256: digest(path.join(output, logfile)) } });
-  }
+    round: candidate.round, candidateSha256: digest(args.candidate), contextSha256: digest(args.context), checks: runChecks(context, output, '') };
   validation.completedAtMs = Date.now();
   atomic(path.join(output, 'validation.json'), validation);
 }
@@ -298,6 +342,12 @@ function gate(args) {
         validationFailures.push(expected.id);
       }
     }
+    // validation.json is developer-authored: re-run every check here and require the same outcome.
+    const rerun = runChecks(context, path.dirname(args.out), 'independent-');
+    atomic(path.join(path.dirname(args.out), 'independent-validation.json'), { schemaVersion: 1, runId: candidate.runId, headSha: candidate.headSha, checks: rerun });
+    requireThat(git(context.worktree, ['rev-parse', 'HEAD']) === candidate.headSha, 'independent validation changed HEAD');
+    rerun.forEach((check, index) => requireThat(check.exitCode === validation.checks[index].exitCode &&
+      (check.signal || null) === (validation.checks[index].signal || null), 'validation record contradicts the independent re-run: ' + check.id));
     const reviews = [read(args.correctness), read(args.regression)];
     for (let index = 0; index < reviews.length; index++) {
       const review = reviews[index], role = index === 0 ? 'correctness' : 'regression';
@@ -328,8 +378,10 @@ function gate(args) {
     baseSha: candidate.baseSha, headSha: candidate.headSha, round: candidate.round, unresolvedFindings, validationFailures };
   atomic(args.out, result);
   const artifacts = {};
-  for (const key of ['context', 'resources', 'candidate', 'validation', 'change-summary', 'correctness', 'regression']) {
-    if (typeof args[key] === 'string' && fs.existsSync(args[key])) artifacts[key] = { path: path.resolve(args[key]), sha256: digest(args[key]) };
+  const independent = path.join(path.dirname(args.out), 'independent-validation.json');
+  for (const [key, filename] of [...['context', 'resources', 'candidate', 'validation', 'change-summary', 'correctness', 'regression'].map(key => [key, args[key]]),
+    ['independent-validation', independent]]) {
+    if (typeof filename === 'string' && fs.existsSync(filename)) artifacts[key] = { path: path.resolve(filename), sha256: digest(filename) };
   }
   atomic(path.join(path.dirname(args.out), 'release-candidate.json'), { schemaVersion: 1, passed: result.passed, gate: result,
     toolsSha256: digest(self), artifacts });
@@ -353,21 +405,18 @@ function delivery(args) {
   requireThat(typeof draft.repository === 'string' && draft.repository.trim() && typeof draft.summary === 'string' && draft.summary.trim(), 'delivery repository and summary required');
   const mode = context.mode, target = context.reviewTarget, existing = draft.existingPr;
   let action, sourceBranch = context.branch, prHead = null, commentBody = null;
-  const notes = [];
   if (mode === 'new') {
     requireThat(existing === undefined || existing === null, 'new development must not attach another PR');
     action = headSha === context.baseSha ? 'none' : 'create';
-    const localTarget = git(context.repo, ['rev-parse', '--verify', '--end-of-options', 'refs/heads/' + context.targetBranch + '^{commit}']);
-    if (localTarget !== context.baseSha) notes.push('\u6CE8\u610F\uFF1A\u672C\u5730 ' + context.targetBranch + ' \u5DF2\u4ECE\u57FA\u7EBF ' + context.baseSha + ' \u524D\u8FDB\u5230 ' + localTarget + '\uFF0CPR \u5408\u5E76\u524D\u8BF7\u786E\u8BA4\u65E0\u51B2\u7A81\u3002');
   } else {
     requireThat(object(existing) && existing.state === 'OPEN', 'open existing PR required');
     same(existing, target, ['url', 'sourceBranch', 'targetBranch'], 'existing review PR');
     sourceBranch = existing.sourceBranch;
     if (mode === 'review') {
       requireThat(headSha === context.startSha, 'review mode must not change the PR head');
-      commentBody = commentText(fs.readFileSync(args.comment, 'utf8'));
-      requireThat(commentBody, 'review comment required');
-      for (const finding of release.gate.unresolvedFindings) requireThat(commentBody.includes(finding.location), 'review comment omits finding at ' + finding.location);
+      const preface = commentText(fs.readFileSync(args.comment, 'utf8'));
+      requireThat(preface, 'review comment required');
+      commentBody = commentText(preface + '\n\n' + reviewCommentBlock(release.gate));
       action = 'comment';
     } else {
       prHead = remoteHead(context.repo, draft.pushRemote, sourceBranch);
@@ -384,32 +433,38 @@ function delivery(args) {
   requireThat(!pushes || (title && body), 'delivery title/body required');
   const publicationRequired = pushes || action === 'comment';
   // Commenting on one's own PR needs no approval; pushing and others' PRs always do.
-  const ownPr = ownComment(context, action);
-  const approvalRequired = publicationRequired && !ownPr;
-  const actionText = { none: '\u65E0\u65B0\u589E\u6539\u52A8\uFF0C\u4EC5\u4EA4\u4ED8\u7ED3\u679C', reuse: '\u5DF2\u6709 PR \u65E0\u9700\u66F4\u65B0\uFF0C\u4EC5\u4EA4\u4ED8\u8BC4\u5BA1\u7ED3\u8BBA', update: '\u63A8\u9001\u4FEE\u590D\u5230\u539F PR \u6E90\u5206\u652F',
-    create: '\u63A8\u9001\u4EFB\u52A1\u5206\u652F\u5E76\u65B0\u5EFA PR/MR', comment: ownPr ? '\u5728\u672C\u4EBA PR \u4E0A\u53D1\u5E03\u8BC4\u5BA1\u8BC4\u8BBA\uFF08\u65E0\u9700\u5BA1\u6279\uFF09' : '\u5728\u4ED6\u4EBA PR \u4E0A\u53D1\u5E03\u8BC4\u5BA1\u8BC4\u8BBA' }[action];
-  const approvalSummary = [
-    '\u4ED3\u5E93\uFF1A' + draft.repository, '\u52A8\u4F5C\uFF1A' + actionText,
-    'PR/MR\uFF1A' + (existing ? existing.url : '\u65B0\u5EFA'),
-    '\u5206\u652F\uFF1A' + sourceBranch + ' \u2192 ' + context.targetBranch,
-    '\u63A8\u9001\u8FDC\u7AEF\uFF1A' + (pushes ? draft.pushRemote : '\u65E0\u9700\u63A8\u9001'),
-    '\u63D0\u4EA4\uFF1A' + headSha, '\u57FA\u7EBF\uFF1A' + context.baseSha,
-    ...notes,
-    '\u53D8\u66F4\u4E0E\u9A8C\u8BC1\uFF1A' + draft.summary,
-    ...(pushes ? ['\u6807\u9898\uFF1A' + title, '\u6B63\u6587\uFF1A\n' + body] : []),
-    ...(commentBody ? ['\u8BC4\u8BBA\u6B63\u6587\uFF1A\n' + commentBody] : []),
-    '\u6279\u51C6\u8303\u56F4\uFF1A\u4EC5\u4E0A\u8FF0' + (action === 'comment' ? '\u8BC4\u8BBA\u53D1\u5E03' : '\u5019\u9009\u7684\u63A8\u9001\u53CA PR/MR \u4EA4\u4ED8') + '\uFF1B\u4E0D\u542B\u5408\u5E76\u3001\u90E8\u7F72\u3002',
-  ].join('\n');
-  requireThat(!approvalRequired || approvalSummary.length <= 6000, 'approval material too long; shorten the title/body/summary/comment before approval');
-  atomic(path.join(output, 'result.json'), { schemaVersion: 1, runId: context.runId, mode, action, publicationRequired,
+  const approvalRequired = publicationRequired && !ownComment(context, action);
+  const result = { schemaVersion: 1, runId: context.runId, mode, action, publicationRequired,
     approvalRequired, directPublish: publicationRequired && !approvalRequired,
-    repository: draft.repository, existingPr: existing || null, pushRemote: pushes ? draft.pushRemote : null,
-    sourceBranch, targetBranch: context.targetBranch, headSha, baseSha: context.baseSha, prHead, approvalSummary,
+    repository: draft.repository, summary: draft.summary, existingPr: existing || null, pushRemote: mode === 'review' ? null : draft.pushRemote || null,
+    sourceBranch, targetBranch: context.targetBranch, headSha, baseSha: context.baseSha, prHead,
     title: title || null, body: body || null,
     commentBody, commentSha256: commentBody ? sha(Buffer.from(commentBody)) : null,
     releaseSha256: digest(args.release), contextSha256: digest(args.context), draftSha256: digest(args.draft),
-    titleSha256: args.title ? digest(args.title) : null, bodySha256: args.body ? digest(args.body) : null });
+    titleSha256: args.title ? digest(args.title) : null, bodySha256: args.body ? digest(args.body) : null };
+  result.approvalSummary = approvalMaterial(result, context);
+  requireThat(!approvalRequired || result.approvalSummary.length <= 6000, 'approval material too long; shorten the title/body/summary/comment before approval');
+  atomic(path.join(output, 'result.json'), result);
 }
+// Run by an independent reviewer bot before any publication: the engine routes on this result, not the developer's plan.
+function route(args) {
+  ownOutput(args.out, 'result.json');
+  const { deliveryPlan, context } = checkPlan(args);
+  cleanHead(context, deliveryPlan.headSha, 'delivery candidate');
+  let expected = 'comment';
+  if (context.mode === 'new') expected = deliveryPlan.headSha === context.baseSha ? 'none' : 'create';
+  if (context.mode === 'continue') {
+    const live = remoteHead(context.repo, deliveryPlan.pushRemote, deliveryPlan.sourceBranch);
+    requireThat(live === deliveryPlan.prHead, 'remote PR head changed since planning');
+    expected = live === deliveryPlan.headSha ? 'reuse' : 'update';
+  }
+  requireThat(deliveryPlan.action === expected, 'delivery action does not match the live repository');
+  const approvalSummary = approvalMaterial(deliveryPlan, context);
+  requireThat(!deliveryPlan.approvalRequired || approvalSummary.length <= 6000, 'approval material too long; shorten the title/body/summary/comment before approval');
+  atomic(args.out, { schemaVersion: 1, runId: context.runId, mode: context.mode, action: expected, publicationRequired: deliveryPlan.publicationRequired,
+    approvalRequired: deliveryPlan.approvalRequired, directPublish: deliveryPlan.directPublish, approvalSummary, planSha256: digest(args.plan) });
+}
+
 function push(args) {
   const { deliveryPlan, context } = boundPlan(args), output = process.env.BOTMUX_GOAL_OUTPUT_DIR;
   requireThat(output, 'goal output unavailable');
@@ -480,6 +535,7 @@ try {
   else if (mode === 'gate') gate(args);
   else if (mode === 'delivery') delivery(args);
   else if (mode === 'push') push(args);
+  else if (mode === 'route') route(args);
   else if (mode === 'verify-publication') verifyPublication(args);
   else if (mode === 'publish') publish(args);
   else throw new Error('unsupported development-review tool mode');
