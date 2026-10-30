@@ -106,7 +106,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   const prepareMR = goal('prepare-mr', bots.developer, [
     '仅消费loop已通过gate的release-candidate与gate-result，重新核对脚本hash、所有输入文件摘要、实际clean HEAD；不得引用任何旧任务/PR。release-candidate.artifacts中有validation、change-summary及两份评审的路径，按需只读引用。阅读目标仓库MR技能和已安装官方CLI能力，按目标仓库要求准备材料（无语言规定时中文），不泄漏凭证、本机路径或内部协作信息。',
     'mr-draft.json含repository（可公开仓库名）、summary（本轮实际变更、验证结果、未验证项及评审意见含nit的处置结论，不得遗留成立未修复的建议）；会推送时含pushRemote（已配置的Git remote名字）。review/continue模式必须含existingPr:{url,state:OPEN,sourceBranch,targetBranch}，与官方CLI最新只读查询一致；new模式不得附带existingPr。此节点不push、不改PR、不发评论。',
-    'new/continue模式写mr-title.txt和mr-body.md，陈述本次requirement、实际改动/验证和限制。review模式写review-comment.md：给PR作者的开头说明（总体结论与背景）；全部意见、影响、证据和失败检查由工具从gate结果生成并附在其后，开头不得与之矛盾。',
+    'new/continue模式写mr-title.txt和mr-body.md，陈述本次requirement、实际改动/验证和限制。review模式写review-comment.md：给PR作者的补充说明；全部意见、影响、证据、失败检查和结论由工具从gate结果生成并放在评论最前面，补充说明附在其后并转义HTML，不得与之矛盾。',
     '执行固定tools.mjs delivery --context <context> --release <release-candidate> --draft mr-draft.json，new/continue附 --title mr-title.txt --body mr-body.md，review附 --comment review-comment.md，并附固定hash参数。工具校验通过gate及证据、clean HEAD、远端原PR源分支，生成交付计划result.json。禁止模型手填决策字段。new有改动=create；continue与远端同SHA=reuse，有修复=update；review=comment，PR作者是本人时无需审批直接发布，其余发布动作都需人工审批。是否发布、是否审批由下游回归评审机器人的check-delivery重新判定，本计划不直接决定路由。',
     HASH_INSTRUCTION, '使用prepare输入的固定publish工具交付 --entry mr-draft json mr-draft.json --entry delivery-plan json result.json，以及实际写出的mr-title.txt、mr-body.md或review-comment.md。',
   ].join('\n'), { 'mr-draft': output('mr-draft.json'), 'delivery-plan': output('result.json') },
@@ -115,8 +115,9 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   // The engine routes on this independent result: a forged developer plan cannot skip the approval.
   const checkDelivery = goal('check-delivery', bots.regression, [
     '由独立回归评审机器人在任何发布之前核验交付计划，不推送、不评论、不修改PR或代码。delivery-plan来自开发机器人，不能直接信任。',
-    '执行固定tools.mjs route --context <context> --release <release-candidate> --plan <delivery-plan> --out <本输出目录/result.json>，附固定hash参数。工具核对计划与本角色gate产出的release-candidate绑定，按模式、PR作者与当前登录名、实时Git与远端状态重新推导动作及是否需要审批，并由计划字段重建审批材料。工具失败即计划不可信：如实写失败Manifest并说明原因，不得改写计划或自行宣称通过。',
-    HASH_INSTRUCTION, '用固定publish工具交付 --entry route json result.json。',
+    '计划声称在本人PR上直接发评论（directPublish=true）时，本角色先用官方CLI独立查询当前登录名和该PR作者，写observed-identity.json：{login,author}；不得照抄预检或计划中的值。',
+    '执行固定tools.mjs route --context <context> --release <release-candidate> --plan <delivery-plan> [--observed-identity observed-identity.json] --out <本输出目录/result.json>，附固定hash参数。工具核对计划与本角色gate产出的release-candidate绑定，按模式、实时Git与远端状态重新推导动作，并由计划字段重建审批材料；只有本角色查询结果确认登录者就是PR作者且与预检一致时才免审批，否则一律要求人工审批。工具失败即计划不可信：如实写失败Manifest并说明原因，不得改写计划或自行宣称通过。',
+    HASH_INSTRUCTION, '用固定publish工具交付 --entry route json result.json，存在observed-identity.json时一并交付。',
   ].join('\n'), { route: output('result.json') }, ['prepare-mr', 'development-review-loop', 'prepare'],
   [ref('prepare-mr', 'delivery-plan'), ref('development-review-loop', 'release-candidate'), ref('prepare', 'tools'), ref('prepare', 'context'), ref('prepare', 'resources')]);
   checkDelivery.resultSchema = { type: 'object', properties: {
@@ -124,7 +125,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   }, required: ['publicationRequired', 'approvalRequired', 'directPublish', 'approvalSummary'] };
 
   const publishText = (gated: boolean) => [
-    gated ? '仅在本节点humanGate真实批准后，按delivery-plan执行发布；不能拿旧批准发布新候选。' : '仅当check-delivery判定directPublish=true（在本人PR上发布评审评论）时执行，按delivery-plan原样发布。',
+    gated ? '仅在本节点humanGate真实批准后，按delivery-plan执行发布；不能拿旧批准发布新候选。' : '仅当check-delivery确认directPublish=true（在本人PR上发布评审评论）时执行，按delivery-plan原样发布。',
     'action=create/update时只用固定tools.mjs push --context <context> --release <release-candidate> --plan <delivery-plan>推送：工具重新核对计划摘要、gate、clean HEAD与远端分支，用显式提交SHA非强制推送到计划的源分支。禁止自行git push、强推或推送其它分支。update复用原PR URL，不新建重复PR；create推送后用官方CLI创建PR（标题、正文原样取delivery-plan.title与delivery-plan.body），先查询已有同源分支PR再创建，结果不确定先查再重试。',
     'action=comment时只把delivery-plan.commentBody原文作为一条评论发到existingPr.url，不改写、不追加，不改代码、不推送、不提交approve/request-changes等审查状态。',
     'SSO/权限缺失输出可重试AUTH_REQUIRED/WAITING_AUTH，提供官方真实登录入口和临时二维码可用性，恢复同run后重新验证身份和仓库权限；不保存token、不安装CLI。不自动合并或部署。',
