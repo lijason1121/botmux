@@ -59,7 +59,7 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direc
       result.unresolvedFindings = result.passed ? [] : [{ role: 'correctness', blocking: false,
         location: 'fixture.ts:1', impact: 'Redundant line', evidence: 'Duplicate assignment' }];
     }
-    if (req.node.id === 'prepare-mr') {
+    if (req.node.id === 'check-delivery') {
       result.publicationRequired = mode !== 'unchanged';
       result.approvalRequired = mode !== 'unchanged' && mode !== 'direct';
       result.directPublish = mode === 'direct';
@@ -125,9 +125,10 @@ describe('created development-review preset on the production runtime', () => {
     expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
     expect(events.some(event => event.type === 'gateDispatched')).toBe(false);
     expect(calls.filter(call => !call.id.startsWith('development-review-loop.')).map(call => call.id))
-      .toEqual(['preflight', 'prepare', 'prepare-mr', 'publish-direct', 'verify-publication', 'complete']);
+      .toEqual(['preflight', 'prepare', 'prepare-mr', 'check-delivery', 'publish-direct', 'verify-publication', 'complete']);
     const regression = run.resolvedRoles!.regression.bot;
     expect(calls.find(call => call.id === 'verify-publication')!.bot).toBe(regression);
+    expect(calls.find(call => call.id === 'check-delivery')!.bot).toBe(regression);
     expect(calls.filter(call => call.id.endsWith('.verify-review-gate')).every(call => call.bot === regression)).toBe(true);
     expect(events.some(event => event.type === 'nodeCancelled')).toBe(false);
     const complete = calls.find(call => call.id === 'complete')!;
