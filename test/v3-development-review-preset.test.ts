@@ -77,7 +77,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3', 'v4', 'v5'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -301,11 +301,24 @@ describe('fixed development-review executable resources', () => {
     const verified = f.out('verify-publication'), observedPr = join(verified, 'observed-pr.json'), observedComment = join(verified, 'observed-comment.md');
     write(observedPr, { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/review', targetBranch: 'main', headSha });
     const verify = () => f.tool('verify-publication', ['--context', context, '--release', join(gated, 'release-candidate.json'),
-      '--plan', join(output, 'result.json'), '--observed', observedPr, '--observed-comment', observedComment, '--out', join(verified, 'verification.json')], verified);
+      '--plan', join(output, 'result.json'), '--route', routeOut, '--observed', observedPr, '--observed-comment', observedComment, '--out', join(verified, 'verification.json')], verified);
     writeFileSync(observedComment, 'Changes requested.\n- edited after approval\n');
     expect(await verify()).toMatchObject({ code: 2, stderr: 'posted comment differs from the planned text\n' });
     writeFileSync(observedComment, json(join(output, 'result.json')).commentBody.replace(/\n/g, '\r\n') + '\n');
     expect(await verify()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(verified, 'verification.json'))).toMatchObject({ approvalRequired: false, directPublish: true, identityConfirmed: true });
+    // The plan still claims a direct publication, but the independent check fell back to approval: record the approval.
+    write(identity, { login: 'carol', author: 'Alice' });
+    expect(await routeWithIdentity()).toMatchObject({ code: 0, stderr: '' });
+    expect(await verify()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(verified, 'verification.json'))).toMatchObject({ approvalRequired: true, directPublish: false, identityConfirmed: false });
+    const fallback = json(routeOut);
+    for (const forged of [{ ...fallback, approvalRequired: false, directPublish: true }, { ...fallback, planSha256: 'sha256:' + '0'.repeat(64) }]) {
+      write(routeOut, forged);
+      expect(await verify()).toMatchObject({ code: 2, stderr: 'routing result is not bound to this plan\n' });
+    }
+    write(identity, { login: 'ALICE', author: 'alice' });
+    expect(await routeWithIdentity()).toMatchObject({ code: 0, stderr: '' });
     const planned2 = json(join(output, 'result.json'));
     for (const [forgery, message] of [
       [{ action: 'create' }, 'delivery action does not fit the mode'],
@@ -376,7 +389,7 @@ describe('fixed development-review executable resources', () => {
     const published = f.out('create-mr'), verified = f.out('verify-publication');
     const pushArgs = ['--context', context, '--release', release, '--plan', planPath];
     const observed = join(verified, 'observed-pr.json');
-    const verify = () => f.tool('verify-publication', [...pushArgs, '--observed', observed, '--out', join(verified, 'verification.json')], verified);
+    const verify = () => f.tool('verify-publication', [...pushArgs, '--route', join(routed, 'result.json'), '--observed', observed, '--out', join(verified, 'verification.json')], verified);
     write(observed, { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/mine', targetBranch: 'main', headSha });
     expect(await verify()).toMatchObject({ code: 2, stderr: 'remote branch does not hold the reviewed commit\n' });
 
@@ -397,7 +410,7 @@ describe('fixed development-review executable resources', () => {
     expect(await verify()).toMatchObject({ code: 2, stderr: 'PR does not point at the reviewed commit and branches\n' });
     write(observed, { ...json(observed), headSha });
     expect(await verify()).toMatchObject({ code: 0, stderr: '' });
-    expect(json(join(verified, 'verification.json'))).toMatchObject({ verified: true, action: 'update', headSha });
+    expect(json(join(verified, 'verification.json'))).toMatchObject({ verified: true, action: 'update', headSha, approvalRequired: true, directPublish: false });
 
     expect(await f.tool('delivery', planArgs, output)).toMatchObject({ code: 0, stderr: '' });
     expect(json(planPath)).toMatchObject({ action: 'reuse', publicationRequired: false });
