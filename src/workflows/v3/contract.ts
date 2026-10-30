@@ -220,13 +220,18 @@ export interface BotSnapshot {
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /** Frozen Claude config profile dir (`CLAUDE_CONFIG_DIR`).  Without it a
+   *  workflow worker falls back to `~/.claude` and loses the bot's own
+   *  settings/model while still getting the bot's env (gateway mismatch). */
+  cliConfigDir?: string;
   /** Frozen configured launch prefix.  Workflow workers must use
    *  the same gateway/runtime selection as ordinary bot sessions. */
   wrapperCli?: string;
   model?: string;
-  /** Frozen explicit reasoning override. Goal CLI uses this with model and
-   *  the goal-scoped Codex home so the worker cannot fall back to Bot defaults. */
+  /** Frozen per-bot launch tuning. Explicit goal overrides use the same
+   *  reasoning type and cannot fall back to mutable Bot defaults. */
   reasoningEffort?: import('../../services/codex-reasoning-effort.js').CodexReasoningEffort;
+  modelBackendVariant?: 'standard' | 'max';
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. Tri-state:
    *  'oncall' (fs-policy whitelist) or 'scratch' (full-root COW). */
@@ -319,6 +324,8 @@ export interface RunNodeResult {
   /** Precise infrastructure failure. A worker may still leave a valid
    * manifest behind, so this channel takes precedence when status=fail. */
   error?: { code: string; message: string };
+  /** Process failure context used when no valid manifest was written. */
+  failureDetail?: string;
 }
 
 export interface RuntimeAttestation {
