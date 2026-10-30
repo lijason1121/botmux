@@ -87,6 +87,9 @@ describe('authored development-review preset', () => {
     expect(upgradeDevelopmentReviewPreset(bound)).toBeUndefined();
     expect(upgradeDevelopmentReviewPreset(createDevelopmentReviewPreset(selected))).toBeUndefined();
   });
+  it('embeds ASCII-only tools so Bun and Node build identical bytes and digests', () => {
+    expect(/^[\x00-\x7f]*$/.test(DEVELOPMENT_REVIEW_RESOURCES[0]!.content)).toBe(true);
+  });
   it('is a source-free, lint-clean and schema-valid executable definition with explicit dependencies', () => {
     const draft = createDevelopmentReviewPreset(BOTS), warnings: string[] = [];
     collectSavedWorkflowReusableTextWarnings(draft, 'draft', warnings);
@@ -263,8 +266,22 @@ describe('fixed development-review executable resources', () => {
       '--plan', join(output, 'result.json'), '--observed', observedPr, '--observed-comment', observedComment, '--out', join(verified, 'verification.json')], verified);
     writeFileSync(observedComment, 'Changes requested.\n- edited after approval\n');
     expect(await verify()).toMatchObject({ code: 2, stderr: 'posted comment differs from the planned text\n' });
-    writeFileSync(observedComment, readFileSync(comment, 'utf8') + '\n');
+    writeFileSync(observedComment, readFileSync(comment, 'utf8').replace(/\n/g, '\r\n') + '\n');
     expect(await verify()).toMatchObject({ code: 0, stderr: '' });
+    const planned2 = json(join(output, 'result.json'));
+    for (const [forgery, message] of [
+      [{ action: 'create' }, 'delivery action does not fit the mode'],
+      [{ commentBody: 'Looks fine.', commentSha256: 'sha256:' + createHash('sha256').update('Looks fine.').digest('hex') }, 'planned comment does not carry every finding'],
+    ] as const) {
+      write(join(output, 'result.json'), { ...planned2, ...forgery });
+      expect(await verify()).toMatchObject({ code: 2, stderr: message + '\n' });
+    }
+    write(join(output, 'result.json'), planned2);
+    write(context, { ...json(context), login: 'me' }); // Another author's PR now: a direct plan skipped approval.
+    write(join(gated, 'release-candidate.json'), { ...json(join(gated, 'release-candidate.json')),
+      artifacts: { ...json(join(gated, 'release-candidate.json')).artifacts, context: { path: context, sha256: sha(context) } } });
+    write(join(output, 'result.json'), { ...planned2, contextSha256: sha(context), releaseSha256: sha(join(gated, 'release-candidate.json')) });
+    expect(await verify()).toMatchObject({ code: 2, stderr: 'delivery plan skipped a required approval\n' });
     expect(json(join(verified, 'verification.json'))).toMatchObject({ verified: true, action: 'comment', url: reviewTarget.url });
   });
 
@@ -317,6 +334,12 @@ describe('fixed development-review executable resources', () => {
     write(observed, { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/mine', targetBranch: 'main', headSha });
     expect(await verify()).toMatchObject({ code: 2, stderr: 'remote branch does not hold the reviewed commit\n' });
 
+    const skipped = join(output, 'skipped-approval.json'); write(skipped, { ...json(planPath), approvalRequired: false, directPublish: true });
+    expect(await f.tool('push', ['--context', context, '--release', release, '--plan', skipped], published))
+      .toMatchObject({ code: 2, stderr: 'delivery plan skipped a required approval\n' });
+    const elsewhere = join(output, 'elsewhere.json'); write(elsewhere, { ...json(planPath), sourceBranch: 'someone-else' });
+    expect(await f.tool('push', ['--context', context, '--release', release, '--plan', elsewhere], published))
+      .toMatchObject({ code: 2, stderr: 'delivery plan targets another PR or branch\n' });
     const forged = join(output, 'forged.json'); write(forged, { ...json(planPath), headSha: prHead });
     expect(await f.tool('push', ['--context', context, '--release', release, '--plan', forged], published))
       .toMatchObject({ code: 2, stderr: 'delivery plan publishes a commit the reviewers did not approve\n' });

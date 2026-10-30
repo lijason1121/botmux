@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 
-/** Embedded bytes are the executable resource: no checkout-relative file reads. */
+/** Embedded bytes are the executable resource: no checkout-relative file reads.
+ * Keep it ASCII (\u escapes for text): Bun's transpiler rewrites non-ASCII inside
+ * String.raw, which would give Bun and Node different tool bytes and digests. */
 export const DEVELOPMENT_REVIEW_TOOLS_SOURCE = String.raw`import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -71,7 +73,24 @@ function boundPlan(args) {
   requireThat(deliveryPlan.headSha === release.gate.headSha && deliveryPlan.baseSha === context.baseSha && deliveryPlan.mode === context.mode,
     'delivery plan publishes a commit the reviewers did not approve');
   requireThat(deliveryPlan.publicationRequired === true, 'delivery plan has no publication');
+  // Re-derive the routing: the developer must not turn a gated publication into a direct one.
+  const target = context.reviewTarget, action = deliveryPlan.action;
+  requireThat({ new: ['create'], continue: ['update'], review: ['comment'] }[context.mode].includes(action), 'delivery action does not fit the mode');
+  const direct = ownComment(context, action);
+  requireThat(deliveryPlan.approvalRequired === !direct && deliveryPlan.directPublish === direct, 'delivery plan skipped a required approval');
+  requireThat(deliveryPlan.targetBranch === context.targetBranch && deliveryPlan.sourceBranch === (target ? target.sourceBranch : context.branch) &&
+    (target ? object(deliveryPlan.existingPr) && deliveryPlan.existingPr.url === target.url : deliveryPlan.existingPr === null), 'delivery plan targets another PR or branch');
+  if (action === 'comment') {
+    requireThat(typeof deliveryPlan.commentBody === 'string' && deliveryPlan.commentBody && sha(Buffer.from(commentText(deliveryPlan.commentBody))) === deliveryPlan.commentSha256 &&
+      release.gate.unresolvedFindings.every(finding => deliveryPlan.commentBody.includes(finding.location)), 'planned comment does not carry every finding');
+  }
   return { deliveryPlan, context, release };
+}
+// Platforms may normalize line endings and surrounding whitespace of stored comments.
+function commentText(text) { return text.replace(/\r\n?/g, '\n').trim(); }
+// Commenting on the initiator's own PR is the only publication without approval.
+function ownComment(context, action) {
+  return action === 'comment' && context.reviewTarget.author.trim().toLowerCase() === String(context.login).toLowerCase();
 }
 function runtimeRunId() {
   const attempt = process.env.BOTMUX_GOAL_ATTEMPT_DIR;
@@ -339,14 +358,14 @@ function delivery(args) {
     requireThat(existing === undefined || existing === null, 'new development must not attach another PR');
     action = headSha === context.baseSha ? 'none' : 'create';
     const localTarget = git(context.repo, ['rev-parse', '--verify', '--end-of-options', 'refs/heads/' + context.targetBranch + '^{commit}']);
-    if (localTarget !== context.baseSha) notes.push('注意：本地 ' + context.targetBranch + ' 已从基线 ' + context.baseSha + ' 前进到 ' + localTarget + '，PR 合并前请确认无冲突。');
+    if (localTarget !== context.baseSha) notes.push('\u6CE8\u610F\uFF1A\u672C\u5730 ' + context.targetBranch + ' \u5DF2\u4ECE\u57FA\u7EBF ' + context.baseSha + ' \u524D\u8FDB\u5230 ' + localTarget + '\uFF0CPR \u5408\u5E76\u524D\u8BF7\u786E\u8BA4\u65E0\u51B2\u7A81\u3002');
   } else {
     requireThat(object(existing) && existing.state === 'OPEN', 'open existing PR required');
     same(existing, target, ['url', 'sourceBranch', 'targetBranch'], 'existing review PR');
     sourceBranch = existing.sourceBranch;
     if (mode === 'review') {
       requireThat(headSha === context.startSha, 'review mode must not change the PR head');
-      commentBody = fs.readFileSync(args.comment, 'utf8').trim();
+      commentBody = commentText(fs.readFileSync(args.comment, 'utf8'));
       requireThat(commentBody, 'review comment required');
       for (const finding of release.gate.unresolvedFindings) requireThat(commentBody.includes(finding.location), 'review comment omits finding at ' + finding.location);
       action = 'comment';
@@ -365,21 +384,21 @@ function delivery(args) {
   requireThat(!pushes || (title && body), 'delivery title/body required');
   const publicationRequired = pushes || action === 'comment';
   // Commenting on one's own PR needs no approval; pushing and others' PRs always do.
-  const ownPr = action === 'comment' && target.author.trim().toLowerCase() === String(context.login).toLowerCase();
+  const ownPr = ownComment(context, action);
   const approvalRequired = publicationRequired && !ownPr;
-  const actionText = { none: '无新增改动，仅交付结果', reuse: '已有 PR 无需更新，仅交付评审结论', update: '推送修复到原 PR 源分支',
-    create: '推送任务分支并新建 PR/MR', comment: ownPr ? '在本人 PR 上发布评审评论（无需审批）' : '在他人 PR 上发布评审评论' }[action];
+  const actionText = { none: '\u65E0\u65B0\u589E\u6539\u52A8\uFF0C\u4EC5\u4EA4\u4ED8\u7ED3\u679C', reuse: '\u5DF2\u6709 PR \u65E0\u9700\u66F4\u65B0\uFF0C\u4EC5\u4EA4\u4ED8\u8BC4\u5BA1\u7ED3\u8BBA', update: '\u63A8\u9001\u4FEE\u590D\u5230\u539F PR \u6E90\u5206\u652F',
+    create: '\u63A8\u9001\u4EFB\u52A1\u5206\u652F\u5E76\u65B0\u5EFA PR/MR', comment: ownPr ? '\u5728\u672C\u4EBA PR \u4E0A\u53D1\u5E03\u8BC4\u5BA1\u8BC4\u8BBA\uFF08\u65E0\u9700\u5BA1\u6279\uFF09' : '\u5728\u4ED6\u4EBA PR \u4E0A\u53D1\u5E03\u8BC4\u5BA1\u8BC4\u8BBA' }[action];
   const approvalSummary = [
-    '仓库：' + draft.repository, '动作：' + actionText,
-    'PR/MR：' + (existing ? existing.url : '新建'),
-    '分支：' + sourceBranch + ' → ' + context.targetBranch,
-    '推送远端：' + (pushes ? draft.pushRemote : '无需推送'),
-    '提交：' + headSha, '基线：' + context.baseSha,
+    '\u4ED3\u5E93\uFF1A' + draft.repository, '\u52A8\u4F5C\uFF1A' + actionText,
+    'PR/MR\uFF1A' + (existing ? existing.url : '\u65B0\u5EFA'),
+    '\u5206\u652F\uFF1A' + sourceBranch + ' \u2192 ' + context.targetBranch,
+    '\u63A8\u9001\u8FDC\u7AEF\uFF1A' + (pushes ? draft.pushRemote : '\u65E0\u9700\u63A8\u9001'),
+    '\u63D0\u4EA4\uFF1A' + headSha, '\u57FA\u7EBF\uFF1A' + context.baseSha,
     ...notes,
-    '变更与验证：' + draft.summary,
-    ...(pushes ? ['标题：' + title, '正文：\n' + body] : []),
-    ...(commentBody ? ['评论正文：\n' + commentBody] : []),
-    '批准范围：仅上述' + (action === 'comment' ? '评论发布' : '候选的推送及 PR/MR 交付') + '；不含合并、部署。',
+    '\u53D8\u66F4\u4E0E\u9A8C\u8BC1\uFF1A' + draft.summary,
+    ...(pushes ? ['\u6807\u9898\uFF1A' + title, '\u6B63\u6587\uFF1A\n' + body] : []),
+    ...(commentBody ? ['\u8BC4\u8BBA\u6B63\u6587\uFF1A\n' + commentBody] : []),
+    '\u6279\u51C6\u8303\u56F4\uFF1A\u4EC5\u4E0A\u8FF0' + (action === 'comment' ? '\u8BC4\u8BBA\u53D1\u5E03' : '\u5019\u9009\u7684\u63A8\u9001\u53CA PR/MR \u4EA4\u4ED8') + '\uFF1B\u4E0D\u542B\u5408\u5E76\u3001\u90E8\u7F72\u3002',
   ].join('\n');
   requireThat(!approvalRequired || approvalSummary.length <= 6000, 'approval material too long; shorten the title/body/summary/comment before approval');
   atomic(path.join(output, 'result.json'), { schemaVersion: 1, runId: context.runId, mode, action, publicationRequired,
@@ -420,7 +439,7 @@ function verifyPublication(args) {
       observed.targetBranch === deliveryPlan.targetBranch, 'PR does not point at the reviewed commit and branches');
   } else {
     requireThat(deliveryPlan.action === 'comment', 'unsupported publication action');
-    const posted = fs.readFileSync(args['observed-comment'], 'utf8').trim();
+    const posted = commentText(fs.readFileSync(args['observed-comment'], 'utf8'));
     requireThat(sha(Buffer.from(posted)) === deliveryPlan.commentSha256, 'posted comment differs from the planned text');
   }
   atomic(args.out, { schemaVersion: 1, verified: true, runId: context.runId, mode: deliveryPlan.mode, action: deliveryPlan.action,
