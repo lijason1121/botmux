@@ -86,7 +86,8 @@ function checkPlan(args) {
   if (action === 'comment') {
     requireThat(typeof deliveryPlan.commentBody === 'string' && deliveryPlan.commentBody === commentText(deliveryPlan.commentBody) &&
       sha(Buffer.from(deliveryPlan.commentBody)) === deliveryPlan.commentSha256 &&
-      deliveryPlan.commentBody.endsWith(reviewCommentBlock(release.gate)), 'planned comment does not carry every finding');
+      deliveryPlan.commentBody.startsWith(commentPrefix(release.gate)) &&
+      !deliveryPlan.commentBody.slice(commentPrefix(release.gate).length).includes('<'), 'planned comment does not carry every finding');
   }
   return { deliveryPlan, context, release };
 }
@@ -95,16 +96,20 @@ function boundPlan(args) {
   requireThat(bound.deliveryPlan.publicationRequired === true, 'delivery plan has no publication');
   return bound;
 }
-// The findings section is generated from the gate, never authored: a preface cannot drop or soften it.
-function reviewCommentBlock(gate) {
+// Raw HTML (e.g. an unclosed comment) could hide or restyle the following text when rendered.
+function inert(text) { return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+// The findings section is generated from the gate and comes first; the developer's note
+// follows it, so nothing the developer writes can drop, soften or hide the findings.
+function commentPrefix(gate) {
   const findings = gate.unresolvedFindings, failures = gate.validationFailures || [];
-  const lines = ['---', findings.length || failures.length
+  const lines = [findings.length || failures.length
     ? '\u7ED3\u8BBA\uFF1A\u9700\u8981\u4FEE\u6539\uFF08' + findings.length + ' \u6761\u610F\u89C1\uFF0C' + failures.length + ' \u9879\u68C0\u67E5\u5931\u8D25\uFF09' : '\u7ED3\u8BBA\uFF1A\u8BC4\u5BA1\u901A\u8FC7\uFF0C\u65E0\u9057\u7559\u610F\u89C1'];
-  findings.forEach((finding, index) => lines.push((index + 1) + '. [' + (finding.blocking ? '\u963B\u585E' : '\u5EFA\u8BAE') + '] ' + finding.location,
-    '   \u5F71\u54CD\uFF1A' + finding.impact, '   \u8BC1\u636E\uFF1A' + finding.evidence));
-  if (failures.length) lines.push('\u68C0\u67E5\u5931\u8D25\uFF1A' + failures.join('\u3001'));
-  return commentText(lines.join('\n'));
+  findings.forEach((finding, index) => lines.push((index + 1) + '. [' + (finding.blocking ? '\u963B\u585E' : '\u5EFA\u8BAE') + '] ' + inert(finding.location),
+    '   \u5F71\u54CD\uFF1A' + inert(finding.impact), '   \u8BC1\u636E\uFF1A' + inert(finding.evidence)));
+  if (failures.length) lines.push('\u68C0\u67E5\u5931\u8D25\uFF1A' + failures.map(inert).join('\u3001'));
+  return commentText(lines.join('\n')) + '\n\n---\n\u8BC4\u5BA1\u8BF4\u660E\uFF1A\n';
 }
+function composeComment(gate, note) { return commentText(commentPrefix(gate) + inert(commentText(note))); }
 // Approval material is rebuilt from the plan's checked fields, not taken from developer prose.
 function approvalMaterial(deliveryPlan, context) {
   const action = deliveryPlan.action, pushes = action === 'create' || action === 'update', existing = deliveryPlan.existingPr;
@@ -416,7 +421,7 @@ function delivery(args) {
       requireThat(headSha === context.startSha, 'review mode must not change the PR head');
       const preface = commentText(fs.readFileSync(args.comment, 'utf8'));
       requireThat(preface, 'review comment required');
-      commentBody = commentText(preface + '\n\n' + reviewCommentBlock(release.gate));
+      commentBody = composeComment(release.gate, preface);
       action = 'comment';
     } else {
       prHead = remoteHead(context.repo, draft.pushRemote, sourceBranch);
@@ -459,10 +464,19 @@ function route(args) {
     expected = live === deliveryPlan.headSha ? 'reuse' : 'update';
   }
   requireThat(deliveryPlan.action === expected, 'delivery action does not match the live repository');
-  const approvalSummary = approvalMaterial(deliveryPlan, context);
-  requireThat(!deliveryPlan.approvalRequired || approvalSummary.length <= 6000, 'approval material too long; shorten the title/body/summary/comment before approval');
-  atomic(args.out, { schemaVersion: 1, runId: context.runId, mode: context.mode, action: expected, publicationRequired: deliveryPlan.publicationRequired,
-    approvalRequired: deliveryPlan.approvalRequired, directPublish: deliveryPlan.directPublish, approvalSummary, planSha256: digest(args.plan) });
+  // Login and PR author came from the developer's preflight: skip approval only when this bot's
+  // own query confirms both; anything else falls back to human approval.
+  let direct = false;
+  if (deliveryPlan.directPublish && args['observed-identity'] && fs.existsSync(args['observed-identity'])) {
+    const observed = read(args['observed-identity']), lower = value => typeof value === 'string' ? value.trim().toLowerCase() : '';
+    direct = object(observed) && lower(observed.login) !== '' && lower(observed.login) === lower(observed.author) &&
+      lower(observed.author) === lower(context.reviewTarget.author) && lower(observed.login) === lower(context.login);
+  }
+  const routed = { ...deliveryPlan, approvalRequired: deliveryPlan.publicationRequired && !direct, directPublish: direct };
+  const approvalSummary = approvalMaterial(routed, context);
+  requireThat(!routed.approvalRequired || approvalSummary.length <= 6000, 'approval material too long; shorten the title/body/summary/comment before approval');
+  atomic(args.out, { schemaVersion: 1, runId: context.runId, mode: context.mode, action: expected, publicationRequired: routed.publicationRequired,
+    approvalRequired: routed.approvalRequired, directPublish: direct, identityConfirmed: direct, approvalSummary, planSha256: digest(args.plan) });
 }
 
 function push(args) {
@@ -519,7 +533,7 @@ function publish(args) {
   atomic(manifest, { schemaVersion: 1, status: 'ok', summary: args.summary || 'Products delivered; decisions are in the artifacts.', files });
 }
 const args = { entries: [] }, mode = process.argv[2];
-const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment']);
+const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment', 'observed-identity']);
 try {
   for (let index = 3; index < process.argv.length; index++) {
     const flag = process.argv[index];
