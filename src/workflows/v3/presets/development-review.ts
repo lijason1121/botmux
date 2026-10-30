@@ -69,10 +69,11 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
 
   const implement = goal('implement', bots.developer, [
     '在prepare context指定的本run worktree中实现requirement；base与targetBranch以该context为准。先读取当前Loop context得到round，不硬编码轮次。若有previous.verify-review-gate.result只修其真实反馈；检查已满足且HEAD/配置/依赖未变时可以核对复用，同SHA不等于随意跳过必需验证。',
+    '逐项评估previous.verify-review-gate.result.unresolvedFindings，包含blocking=false的nit；成立的问题必须在本轮修复并验证，不能以非阻塞、低优先级或以后再做为由遗留。不成立的建议给出具体代码/行为证据，交由下一轮reviewer独立复核并撤回；不能自行删除意见、代写approve或只改blocking来放行。',
     '从loop外prepare输入读取context/resources/tools，核验固定hash。按仓库规范提交实际改动；候选必须为clean HEAD。先执行固定tools.mjs candidate --context <context输入> --round <运行时当前轮次>自动生成candidate.json；严禁模型手填SHA或hash字段。工具从真实Git与context生成schemaVersion/runId/repo/baseSha/headSha/round和带sha256:前缀的context/resource摘要。不得虚构成功任务、检查或提交；需求无需改动时如实说明，不造改动。',
     HASH_INSTRUCTION,
     '运行固定tools.mjs record --context <context输入> --candidate <本候选> --round <运行时当前轮次>。它以shell=false真实执行context.validationCommands，记录命令/返回码/起止SHA/日志摘要到validation.json；不能手填通过记录、删检查或修改工具。失败记录仍真实交付供审查与gate判定。',
-    '写change-summary.md，说明改动、真实验证和限制。publish至少交付 --entry candidate json candidate.json --entry validation json validation.json --entry change-summary markdown change-summary.md，并将真实验证日志作为其它Manifest文件一并交付。',
+    '写change-summary.md，说明改动、真实验证和限制，并逐项记录评审意见（含nit）的评估、修复位置与验证，或不成立的证据；不得静默遗漏。publish至少交付 --entry candidate json candidate.json --entry validation json validation.json --entry change-summary markdown change-summary.md，并将真实验证日志作为其它Manifest文件一并交付。',
   ].join('\n'), { candidate: output('candidate.json'), validation: output('validation.json'), 'change-summary': output('change-summary.md', 'markdown') });
   // Development plus repository-mandated validation may exceed the ordinary
   // single-turn budget; the bounded loop still caps the number of attempts.
@@ -82,7 +83,8 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
     '独立只读审查当前implement候选；只消费本轮implement产品和prepare context/resources，不读取对方报告、不沿previous gate反馈寻找另一审查者原文，不修改代码/环境或重复无关环境探索。证据不足输出blocked或changes_requested，绝不强迫approve。',
     '本角色=' + role + '；真实reviewerId=${roles.' + role + '.bot}（${roles.' + role + '.label} / ${roles.' + role + '.cliId}），必须与prepare context的本角色身份一致。',
     role === 'correctness' ? '重点核对需求满足、根因、接口/数据兼容与关键失败路径，引用具体文件/行为证据。' : '重点核对修前失败修后通过、旧路径、平台/CLI/会话相关回归面，以及验证命令和报告是否真实且覆盖合理。',
-    'review.json必须包含schemaVersion:1,runId,repo,baseSha,headSha,round,role,reviewerId,decision(approve/changes_requested/blocked),findings(每项blocking布尔及位置/影响/证据),coverage和evidence均为非空字符串数组,candidateSha256,validationSha256,contextSha256；SHA/round取当前候选，三个文件摘要必须由实际输入字节计算且使用sha256:<64位小写hex>格式。写review.md。',
+    '任何未解决的意见都必须放入findings，包括nit/非阻塞建议，不能仅写在review.md或coverage里。有任意finding必须changes_requested，证据不足则blocked；只有本角色对当前候选确认无遗留问题且findings=[]才可approve，禁止approve with nits。独立核对开发者逐项处置；建议成立则确认修复，不成立则依据事实撤回，不能要求盲改或把未修复项标成非阻塞后放行。',
+    'review.json必须包含schemaVersion:1,runId,repo,baseSha,headSha,round,role,reviewerId,decision(approve/changes_requested/blocked),findings(每项含blocking布尔及location/impact/evidence非空字符串),coverage和evidence均为非空字符串数组,candidateSha256,validationSha256,contextSha256；SHA/round取当前候选，三个文件摘要必须由实际输入字节计算且使用sha256:<64位小写hex>格式。写review.md。',
     HASH_INSTRUCTION,
     '用固定publish工具交付 --entry review json review.json --entry report markdown review.md。Manifest ok仅表示交付，不等于decision=approve。',
   ].join('\n'), { review: output('review.json'), report: output('review.md', 'markdown') }, ['implement'], [ref('implement', 'candidate'), ref('implement', 'validation'), ref('implement', 'change-summary')]);
@@ -90,14 +92,14 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   const gate = goal('verify-review-gate', bots.developer, [
     '这是执行固定脚本的goal，不是引擎内置host gate。只校验本轮真实产品，不能代写审查、重做审查或自行解释passed。', HASH_INSTRUCTION,
     '从prepare输入读取context/resources/tools，从显式内部依赖取得candidate/validation及指定correctness/regression JSON。执行固定tools.mjs gate --context <context> --resources <resources> --expected-resources-sha ' + DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256 + ' --candidate <candidate> --validation <validation> --correctness <正确性JSON> --regression <回归JSON> --round <运行时Loop当前轮次> --out <本输出目录/result.json>；并附固定tools hash参数。',
-    'result.passed为唯一退出判据。false是正常返工结果，不能改为true；检查缺失、旧SHA、身份重复、日志摘要/命令来源不符都不能通过。发布脚本生成的result.json、release-candidate.json、feedback.md；feedback只含机器诊断，不带审查全文，避免下轮泄露对方结论。publish --entry gate-result json result.json --entry release-candidate json release-candidate.json --entry feedback markdown feedback.md，不设置内容preview。',
+    'result.passed为唯一退出判据。false是正常返工结果，不能改为true；检查缺失、旧SHA、身份重复、日志摘要/命令来源不符都不能通过。两份报告必须均approve且findings=[]，包括nit在内的任意finding都阻止通过。发布脚本生成的result.json、release-candidate.json、feedback.md；result.unresolvedFindings和feedback包含已核验来源的结构化意见，交给developer逐项评估，不转发审查全文。reviewer不得读取previous反馈来获取对方结论。publish --entry gate-result json result.json --entry release-candidate json release-candidate.json --entry feedback markdown feedback.md，不设置内容preview。',
   ].join('\n'), { 'gate-result': output('result.json'), 'release-candidate': output('release-candidate.json'), feedback: output('feedback.md', 'markdown') },
   ['implement', 'review-correctness', 'review-regression'], [ref('implement', 'candidate'), ref('implement', 'validation'), ref('review-correctness', 'review'), ref('review-regression', 'review')]);
   gate.resultSchema = { type: 'object', properties: { passed: { type: 'boolean' } }, required: ['passed'] };
 
   const prepareMR = goal('prepare-mr', bots.developer, [
     '仅消费loop已通过gate的release-candidate与gate-result，重新核对脚本hash、所有输入文件摘要、实际clean HEAD及目标分支；不得引用任何旧任务/PR。阅读目标仓库MR技能和已安装官方CLI能力，按目标仓库要求准备标题、正文和mr-draft.json（无语言规定时中文）。',
-    '标题/正文陈述本次requirement、实际改动/验证和限制，不泄漏凭证、本机路径或内部协作信息。先只读查询已有PR/MR，保留原URL和源分支，不能因本run隔离分支不同就新建重复PR。mr-draft.json含repository（可公开仓库名）、summary（本轮实际变更、验证结果、未验证项和非阻塞建议）、pushRemote（已配置的Git remote名字）；已有PR时还必须含existingPr:{url,state:OPEN,sourceBranch,targetBranch,headSha,baseSha}，与官方CLI最新查询一致。此节点不push、不改PR。',
+    '标题/正文陈述本次requirement、实际改动/验证和限制，不泄漏凭证、本机路径或内部协作信息。先只读查询已有PR/MR，保留原URL和源分支，不能因本run隔离分支不同就新建重复PR。mr-draft.json含repository（可公开仓库名）、summary（本轮实际变更、验证结果、未验证项及评审意见含nit的处置结论，不得遗留成立未修复的建议）、pushRemote（已配置的Git remote名字）；已有PR时还必须含existingPr:{url,state:OPEN,sourceBranch,targetBranch,headSha,baseSha}，与官方CLI最新查询一致。此节点不push、不改PR。',
     '执行固定tools.mjs delivery --context <context> --release <release-candidate> --draft mr-draft.json --title mr-title.txt --body mr-body.md，附固定hash参数。工具校验通过gate及证据、clean HEAD、远端原PR源分支，生成result.json的publicationRequired/action/approvalSummary。禁止模型手填决策字段。已有PR与候选同SHA时action=reuse，不需要发布审批；有修复则action=update，只向原PR源分支推送；新开发有变更时才create。',
     HASH_INSTRUCTION, '使用prepare输入的固定publish工具交付 --entry title text mr-title.txt --entry body markdown mr-body.md --entry mr-draft json mr-draft.json --entry delivery-plan json result.json。',
   ].join('\n'), { title: output('mr-title.txt', 'text'), body: output('mr-body.md', 'markdown'), 'mr-draft': output('mr-draft.json'), 'delivery-plan': output('result.json') },
@@ -114,7 +116,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   createMR.humanGate = { prompt: '是否批准执行以下发布操作？请核对仓库、原PR或新建目标、分支、提交、改动与验证，以及拟发布的标题和正文。', contextFrom: { nodeId: 'prepare-mr', field: 'approvalSummary' }, options: ['approve', 'reject'], approveOptions: ['approve'] };
   const complete = goal('complete', bots.developer, [
     '交付本次最终task-report.md。action=reuse/none时只读确认原PR状态、URL及SHA，直接交付评审结论，不推送、不创建、不修改PR。发布节点跳过是无发布动作的正常结果，不是失败。',
-    '报告区分原PR已有改动与本轮新增修复，明确PR链接、head/base、是否推送、正确性/回归结论、真实验证、非阻塞建议和未验证环境；不能只写Manifest成功。',
+    '报告区分原PR已有改动与本轮新增修复，明确PR链接、head/base、是否推送、正确性/回归结论、真实验证、评审意见含nit的处置结论和未验证环境；不得将成立未修复的nit留到交付，不能只写Manifest成功。',
     HASH_INSTRUCTION, '使用固定publish工具交付 --entry task-report markdown task-report.md。',
   ].join('\n'), { 'task-report': output('task-report.md', 'markdown') }, ['prepare-mr', 'prepare'],
   [ref('prepare-mr', 'delivery-plan'), ref('prepare', 'tools'), ref('prepare', 'context')]);
@@ -144,7 +146,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
     },
     specTemplate: { schemaVersion: 1, title: '通用开发、独立双审与MR交付',
       requirement: '认证预检后为新开发或已有PR评审准备隔离环境，在最多三轮内通过固定脚本门禁。无发布动作直接交付结论；有修复更新原PR，新需求创建PR，均先展示具体材料并经人工批准。定义可执行不表示已运行真人任务。',
-      acceptance: '本次同repo/base/head/round、真实命令日志及两个独立角色报告一致，固定资源未漂移，人工审批只授权对应候选。',
+      acceptance: '本次同repo/base/head/round、真实命令日志及两个独立角色报告一致，两位reviewer均approve且findings为空；所有意见含nit逐项评估，成立必修复，不成立须提供证据并经复核撤回。固定资源未漂移，人工审批只授权对应候选。',
       nodes: [
         ['preflight', '先验证实际身份、仓库权限与任务隔离位置；缺授权可恢复等待'],
         ['prepare', '核验固定内嵌资源，建立本run worktree与上下文'],

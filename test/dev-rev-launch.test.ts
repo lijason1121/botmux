@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BotConfig } from '../src/bot-registry.js';
@@ -14,6 +14,9 @@ import { stampBotmuxCallbackMarkers, BOTMUX_CALLBACK_MARKER_KEY } from '../src/i
 import { normalizeCardActionData } from '../src/im/lark/card-action-data.js';
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
+import { createSavedWorkflow } from '../src/workflows/v3/library-store.js';
+import { loadVisibleSavedWorkflow } from '../src/workflows/v3/library-service.js';
+import { createDevelopmentReviewPreset } from '../src/workflows/v3/presets/development-review.js';
 
 const context = { actor: { openId: 'ou_owner', larkAppId: 'cli_host' }, chatId: 'oc_here', rootMessageId: 'om_start' };
 const bots = [
@@ -53,6 +56,22 @@ beforeEach(() => {
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe('dev-rev interactive launcher', () => {
+  it('upgrades an owned original definition on the next launch without overwriting the old revision', async () => {
+    const selected = { developer: 'cli_dev', correctness: 'cli_correct', regression: 'cli_regress' };
+    const previous = JSON.parse(readFileSync(new URL('./fixtures/development-review/v2.json', import.meta.url), 'utf8'), (_key, value) =>
+      typeof value === 'string' ? ({ cli_developer: selected.developer, cli_correctness: selected.correctness, cli_regression: selected.regression } as Record<string, string>)[value] ?? value : value);
+    const saved = await createSavedWorkflow(dataDir, { displayName: 'dev-rev', owner: context.actor,
+      scope: { kind: 'chat', chatId: context.chatId }, revision: previous, publish: true });
+    const oldPath = join(dataDir, 'workflow-library', saved.metadata.workflowId, 'revisions', saved.metadata.latestRevision + '.json');
+    const oldBytes = readFileSync(oldPath, 'utf8');
+    const request = await bound(); expect(await click(request)).toMatchObject({ started: true });
+    const updated = await loadVisibleSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId });
+    expect(updated.revision.payload.humanVersion).toBe(2);
+    const { workflowId, humanVersion, createdAt, createdBy, ...draft } = updated.revision.payload;
+    expect(draft).toEqual(createDevelopmentReviewPreset(selected));
+    expect(readFileSync(oldPath, 'utf8')).toBe(oldBytes);
+    expect(deps.driveDetached).toHaveBeenCalledTimes(1);
+  });
   it('parses the short IM invocation and opens one durable form without creating any run', async () => {
     expect(parseV3SavedWorkflowCommand('/workflow run dev-rev')).toMatchObject({ kind: 'run', ref: 'dev-rev', rawParams: {} });
     const [a, b] = await Promise.all([open(), open()]);

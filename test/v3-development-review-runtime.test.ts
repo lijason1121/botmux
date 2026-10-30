@@ -54,7 +54,11 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged') {
     const result = Object.fromEntries(Object.entries(req.node.resultSchema?.properties ?? {}).map(([key, field]) => [key,
       field.enum?.[0] ?? ({ string: 'fixture', number: 1, boolean: true, object: {}, array: [] }[field.type]),
     ]));
-    if (req.node.id.endsWith(`.${loop.exit.node}`)) result.passed = mode === 'unchanged' || (mode === 'repair' && req.node.id.includes('.i002.'));
+    if (req.node.id.endsWith(`.${loop.exit.node}`)) {
+      result.passed = mode === 'unchanged' || (mode === 'repair' && req.node.id.includes('.i002.'));
+      result.unresolvedFindings = result.passed ? [] : [{ role: 'correctness', blocking: false,
+        location: 'fixture.ts:1', impact: 'Redundant line', evidence: 'Duplicate assignment' }];
+    }
     if (req.node.id === 'prepare-mr') {
       result.publicationRequired = mode !== 'unchanged';
       result.approvalSummary = 'Repository: example/project; PR: https://example.invalid/pull/23; action: update; tests passed';
@@ -95,6 +99,10 @@ describe('created development-review preset on the production runtime', () => {
     expect(checkCalls.every(call => call.bot === 'cli_alternate')).toBe(true);
     const second = calls.find(call => call.id.startsWith(`${loop.id}.i002.`))!;
     expect(second.inputs.inputs.some(input => input.from.startsWith('previous.'))).toBe(true);
+    const feedback = second.inputs.inputs.find(input => input.from.startsWith('previous.'))!;
+    expect(JSON.parse(readFileSync(feedback.path, 'utf8')).unresolvedFindings).toEqual([
+      { role: 'correctness', blocking: false, location: 'fixture.ts:1', impact: 'Redundant line', evidence: 'Duplicate assignment' },
+    ]);
     expect(calls.filter(call => call.id.startsWith(`${loop.id}.`)).every(call =>
       call.inputs.inputs.some(input => input.from === 'prepare'))).toBe(true);
   });
