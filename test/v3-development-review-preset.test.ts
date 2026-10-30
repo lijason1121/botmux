@@ -77,7 +77,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -113,6 +113,12 @@ describe('authored development-review preset', () => {
     expect(loop.body!.nodes.find(node => node.id === 'verify-review-gate')!.bot).toBe(BOTS.regression);
     expect(draft.dagTemplate.nodes.find(node => node.id === 'verify-publication')!.bot).toBe(BOTS.regression);
     expect(draft.roles!.developer!.nodes).not.toContain('development-review-loop/verify-review-gate');
+    // Routing to the ungated publisher comes from the independent check, never the developer's plan.
+    expect(draft.dagTemplate.nodes.find(node => node.id === 'check-delivery')!.bot).toBe(BOTS.regression);
+    expect(draft.dagTemplate.nodes.find(node => node.id === 'create-mr')!.humanGate!.contextFrom).toEqual({ nodeId: 'check-delivery', field: 'approvalSummary' });
+    for (const id of ['create-mr', 'publish-direct']) {
+      expect(draft.dagTemplate.nodes.find(node => node.id === id)!.depends.filter(dep => dep.when).map(dep => dep.from)).toEqual(['check-delivery']);
+    }
   });
 
   it('refuses unresolved or non-independent default identities', () => {
@@ -246,19 +252,33 @@ describe('fixed development-review executable resources', () => {
     const output = f.out('prepare-mr'), draft = join(output, 'mr-draft.json'), comment = join(output, 'review-comment.md');
     const plan = () => f.tool('delivery', ['--context', context, '--release', join(gated, 'release-candidate.json'), '--draft', draft, '--comment', comment], output);
     write(draft, { repository: 'example/project', summary: 'Reviewed; one finding', existingPr: { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/review', targetBranch: 'main' } });
-    writeFileSync(comment, 'Changes requested.\n');
-    expect(await plan()).toMatchObject({ code: 2, stderr: 'review comment omits finding at value.txt:1\n' });
-    writeFileSync(comment, 'Changes requested.\n- value.txt:1 Check fails (failing.log exit 3)\n');
+    // A preface that hides the problems cannot drop them: the findings section is generated from the gate.
+    writeFileSync(comment, 'Review passed.\n');
     expect(await plan()).toMatchObject({ code: 0, stderr: '' });
     const planned = json(join(output, 'result.json'));
     expect(planned).toMatchObject({ action: 'comment', publicationRequired: true, approvalRequired: true, directPublish: false, pushRemote: null });
-    expect(planned.approvalSummary).toContain('value.txt:1 Check fails');
-    expect(planned.commentSha256).toBe('sha256:' + createHash('sha256').update(readFileSync(comment, 'utf8').trim()).digest('hex'));
+    expect(planned.commentBody).toBe('Review passed.\n\n---\n结论：需要修改（1 条意见，1 项检查失败）\n1. [阻塞] value.txt:1\n   影响：Check fails\n' +
+      '   证据：failing.log exit 3\n检查失败：failing');
+    expect(planned.approvalSummary).toContain(planned.commentBody);
+    expect(planned.commentSha256).toBe('sha256:' + createHash('sha256').update(planned.commentBody).digest('hex'));
+    const routed = f.out('check-delivery'), routeOut = join(routed, 'result.json');
+    const route = () => f.tool('route', ['--context', context, '--release', join(gated, 'release-candidate.json'), '--plan', join(output, 'result.json'), '--out', routeOut], routed);
+    expect(await route()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(routeOut)).toMatchObject({ action: 'comment', publicationRequired: true, approvalRequired: true, directPublish: false });
+    write(join(output, 'result.json'), { ...planned, approvalRequired: false, directPublish: true }); // The developer forges a direct publication.
+    expect(await route()).toMatchObject({ code: 2, stderr: 'delivery plan skipped a required approval\n' });
+    write(join(output, 'result.json'), { ...planned, commentBody: 'Review passed.', commentSha256: 'sha256:' + createHash('sha256').update('Review passed.').digest('hex') });
+    expect(await route()).toMatchObject({ code: 2, stderr: 'planned comment does not carry every finding\n' });
+    write(join(output, 'result.json'), { ...planned, approvalSummary: 'Harmless' });
+    expect(await route()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(routeOut).approvalSummary).toBe(planned.approvalSummary); // Material is rebuilt, not copied.
     write(context, { ...json(context), login: 'alice' }); // A case-insensitive match: the initiator's own PR.
     write(join(gated, 'release-candidate.json'), { ...json(join(gated, 'release-candidate.json')),
       artifacts: { ...json(join(gated, 'release-candidate.json')).artifacts, context: { path: context, sha256: sha(context) } } });
     expect(await plan()).toMatchObject({ code: 0, stderr: '' });
     expect(json(join(output, 'result.json'))).toMatchObject({ approvalRequired: false, directPublish: true });
+    expect(await route()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(routeOut)).toMatchObject({ approvalRequired: false, directPublish: true });
 
     const verified = f.out('verify-publication'), observedPr = join(verified, 'observed-pr.json'), observedComment = join(verified, 'observed-comment.md');
     write(observedPr, { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/review', targetBranch: 'main', headSha });
@@ -266,7 +286,7 @@ describe('fixed development-review executable resources', () => {
       '--plan', join(output, 'result.json'), '--observed', observedPr, '--observed-comment', observedComment, '--out', join(verified, 'verification.json')], verified);
     writeFileSync(observedComment, 'Changes requested.\n- edited after approval\n');
     expect(await verify()).toMatchObject({ code: 2, stderr: 'posted comment differs from the planned text\n' });
-    writeFileSync(observedComment, readFileSync(comment, 'utf8').replace(/\n/g, '\r\n') + '\n');
+    writeFileSync(observedComment, json(join(output, 'result.json')).commentBody.replace(/\n/g, '\r\n') + '\n');
     expect(await verify()).toMatchObject({ code: 0, stderr: '' });
     const planned2 = json(join(output, 'result.json'));
     for (const [forgery, message] of [
@@ -327,6 +347,14 @@ describe('fixed development-review executable resources', () => {
     expect(json(planPath)).toMatchObject({ action: 'update', publicationRequired: true, approvalRequired: true, directPublish: false,
       sourceBranch: 'feature/mine', prHead, headSha, title: 'Address review' });
 
+    const routed = f.out('check-delivery'), routeArgs = ['--context', context, '--release', release, '--plan', planPath, '--out', join(routed, 'result.json')];
+    expect(await f.tool('route', routeArgs, routed)).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(routed, 'result.json'))).toMatchObject({ action: 'update', approvalRequired: true, directPublish: false });
+    expect(json(join(routed, 'result.json')).approvalSummary).toContain('标题：Address review');
+    const claimed = join(output, 'claimed-reuse.json');
+    write(claimed, { ...json(planPath), action: 'reuse', publicationRequired: false, approvalRequired: false });
+    expect(await f.tool('route', [...routeArgs.slice(0, 5), claimed, ...routeArgs.slice(6)], routed))
+      .toMatchObject({ code: 2, stderr: 'delivery action does not match the live repository\n' });
     const published = f.out('create-mr'), verified = f.out('verify-publication');
     const pushArgs = ['--context', context, '--release', release, '--plan', planPath];
     const observed = join(verified, 'observed-pr.json');
@@ -384,6 +412,30 @@ describe('fixed development-review executable resources', () => {
     expect(await f.tool('delivery', planArgs, output)).toMatchObject({ code: 2, stderr: 'remote task branch already exists\n' });
     writeFileSync(join(f.worktree, 'value.txt'), 'unreviewed edit');
     expect((await f.tool('push', ['--context', f.context, '--release', release, '--plan', planPath], published)).code).toBe(2);
+  });
+  it('re-runs every check in the independent gate and rejects a forged passing validation record', async () => {
+    const f = fixture();
+    write(f.params, { params: { ...json(f.params).params, validation_commands: [{ id: 'failing', argv: [process.execPath, '-e', 'process.exit(3)'], timeoutSec: 10 }] } });
+    expect(await f.prepare()).toMatchObject({ code: 0 });
+    const context = join(f.prepared, 'context.json'), resources = join(f.prepared, 'resources.json');
+    writeFileSync(join(f.worktree, 'value.txt'), 'after\n'); f.git(f.worktree, 'commit', '-qam', 'candidate');
+    const implemented = f.out('development-review-loop.i001.implement'), candidate = join(implemented, 'candidate.json'), validation = join(implemented, 'validation.json');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], implemented)).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', context, '--candidate', candidate, '--round', '1'], implemented)).toMatchObject({ code: 0 });
+    write(validation, { ...json(validation), checks: json(validation).checks.map((check: any) => ({ ...check, exitCode: 0 })) });
+    const summary = join(implemented, 'change-summary.md'); writeFileSync(summary, 'All checks passed.\n');
+    const reviews = (['correctness', 'regression'] as const).map(role => {
+      const filename = join(f.root, role + '.json');
+      write(filename, { ...json(candidate), role, reviewerId: BOTS[role], decision: 'approve', findings: [], coverage: ['diff'], evidence: ['validation.json reports success'],
+        candidateSha256: sha(candidate), validationSha256: sha(validation), contextSha256: sha(context) });
+      return filename;
+    });
+    const gated = f.out('development-review-loop.i001.verify-review-gate'), result = join(gated, 'result.json');
+    expect(await f.tool('gate', ['--context', context, '--resources', resources, '--expected-resources-sha', DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256,
+      '--candidate', candidate, '--validation', validation, '--change-summary', summary, '--correctness', reviews[0]!, '--regression', reviews[1]!,
+      '--round', '1', '--out', result], gated)).toMatchObject({ code: 0 });
+    expect(json(result)).toMatchObject({ passed: false, reasons: ['validation record contradicts the independent re-run: failing'] });
+    expect(json(join(gated, 'independent-validation.json')).checks[0]).toMatchObject({ id: 'failing', exitCode: 3 });
   });
   it('discovers required checks from preflight only when the launch plan is empty', async () => {
     const f = fixture(), input = json(f.params), checked = json(f.preflight);

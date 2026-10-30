@@ -94,27 +94,37 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
 
   // The gate runs on an independent reviewer bot so the developer cannot author its own pass.
   const gate = goal('verify-review-gate', bots.regression, [
-    '这是由独立回归评审机器人执行固定脚本的goal，不是引擎内置host gate。只校验本轮真实产品，不能代写审查、重做审查或自行解释passed；不修改代码或环境。', HASH_INSTRUCTION,
+    '这是由独立回归评审机器人执行固定脚本的goal，不是引擎内置host gate。只校验本轮真实产品，不能代写审查、重做审查或自行解释passed；不修改代码或环境。工具会在本节点重新执行全部验证命令，结果与开发者的validation.json不一致即不通过。', HASH_INSTRUCTION,
     '从prepare输入读取context/resources/tools，从显式内部依赖取得candidate/validation/change-summary及指定correctness/regression JSON。执行固定tools.mjs gate --context <context> --resources <resources> --expected-resources-sha ' + DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256 + ' --candidate <candidate> --validation <validation> --change-summary <change-summary> --correctness <正确性JSON> --regression <回归JSON> --round <运行时Loop当前轮次> --out <本输出目录/result.json>；并附固定tools hash参数。',
-    'result.passed为唯一退出判据。false是正常返工结果，不能改为true；检查缺失、旧SHA、身份重复、日志摘要/命令来源不符都不能通过。new/continue模式两份报告必须均approve且findings=[]，包括nit在内的任意finding都阻止通过；review模式要求两份报告完整且结论与findings一致，findings进入PR评论。发布脚本生成的result.json、release-candidate.json、feedback.md；result.unresolvedFindings和feedback包含已核验来源的结构化意见，不转发审查全文。publish --entry gate-result json result.json --entry release-candidate json release-candidate.json --entry feedback markdown feedback.md，不设置内容preview。',
+    'result.passed为唯一退出判据。false是正常返工结果，不能改为true；检查缺失、旧SHA、身份重复、日志摘要/命令来源不符都不能通过。new/continue模式两份报告必须均approve且findings=[]，包括nit在内的任意finding都阻止通过；review模式要求两份报告完整且结论与findings一致，findings进入PR评论。发布脚本生成的result.json、release-candidate.json、feedback.md；result.unresolvedFindings和feedback包含已核验来源的结构化意见，不转发审查全文。publish --entry gate-result json result.json --entry release-candidate json release-candidate.json --entry feedback markdown feedback.md，并把independent-validation.json及independent-*.log作为其它Manifest文件交付，不设置内容preview。',
   ].join('\n'), { 'gate-result': output('result.json'), 'release-candidate': output('release-candidate.json'), feedback: output('feedback.md', 'markdown') },
   ['implement', 'review-correctness', 'review-regression'], [ref('implement', 'candidate'), ref('implement', 'validation'), ref('implement', 'change-summary'), ref('review-correctness', 'review'), ref('review-regression', 'review')]);
   gate.resultSchema = { type: 'object', properties: { passed: { type: 'boolean' } }, required: ['passed'] };
+  // It re-runs every required check, so it needs the same budget as development.
+  gate.timeoutSec = 14400;
 
   const prepareMR = goal('prepare-mr', bots.developer, [
     '仅消费loop已通过gate的release-candidate与gate-result，重新核对脚本hash、所有输入文件摘要、实际clean HEAD；不得引用任何旧任务/PR。release-candidate.artifacts中有validation、change-summary及两份评审的路径，按需只读引用。阅读目标仓库MR技能和已安装官方CLI能力，按目标仓库要求准备材料（无语言规定时中文），不泄漏凭证、本机路径或内部协作信息。',
     'mr-draft.json含repository（可公开仓库名）、summary（本轮实际变更、验证结果、未验证项及评审意见含nit的处置结论，不得遗留成立未修复的建议）；会推送时含pushRemote（已配置的Git remote名字）。review/continue模式必须含existingPr:{url,state:OPEN,sourceBranch,targetBranch}，与官方CLI最新只读查询一致；new模式不得附带existingPr。此节点不push、不改PR、不发评论。',
-    'new/continue模式写mr-title.txt和mr-body.md，陈述本次requirement、实际改动/验证和限制。review模式写review-comment.md：给PR作者的评审结论，逐条列出gate-result.unresolvedFindings（每条必须原样包含其location，并写影响与证据）及validationFailures；无意见时写明评审通过。',
-    '执行固定tools.mjs delivery --context <context> --release <release-candidate> --draft mr-draft.json，new/continue附 --title mr-title.txt --body mr-body.md，review附 --comment review-comment.md，并附固定hash参数。工具校验通过gate及证据、clean HEAD、远端原PR源分支，生成result.json的action/publicationRequired/approvalRequired/directPublish/approvalSummary。禁止模型手填决策字段。new有改动=create；continue与远端同SHA=reuse，有修复=update；review=comment，PR作者是本人时无需审批直接发布，其余发布动作都需人工审批。',
+    'new/continue模式写mr-title.txt和mr-body.md，陈述本次requirement、实际改动/验证和限制。review模式写review-comment.md：给PR作者的开头说明（总体结论与背景）；全部意见、影响、证据和失败检查由工具从gate结果生成并附在其后，开头不得与之矛盾。',
+    '执行固定tools.mjs delivery --context <context> --release <release-candidate> --draft mr-draft.json，new/continue附 --title mr-title.txt --body mr-body.md，review附 --comment review-comment.md，并附固定hash参数。工具校验通过gate及证据、clean HEAD、远端原PR源分支，生成交付计划result.json。禁止模型手填决策字段。new有改动=create；continue与远端同SHA=reuse，有修复=update；review=comment，PR作者是本人时无需审批直接发布，其余发布动作都需人工审批。是否发布、是否审批由下游回归评审机器人的check-delivery重新判定，本计划不直接决定路由。',
     HASH_INSTRUCTION, '使用prepare输入的固定publish工具交付 --entry mr-draft json mr-draft.json --entry delivery-plan json result.json，以及实际写出的mr-title.txt、mr-body.md或review-comment.md。',
   ].join('\n'), { 'mr-draft': output('mr-draft.json'), 'delivery-plan': output('result.json') },
   ['development-review-loop', 'prepare'], [ref('development-review-loop', 'gate-result'), ref('development-review-loop', 'release-candidate'), ref('prepare', 'tools'), ref('prepare', 'context'), ref('prepare', 'resources')]);
-  prepareMR.resultSchema = { type: 'object', properties: {
+
+  // The engine routes on this independent result: a forged developer plan cannot skip the approval.
+  const checkDelivery = goal('check-delivery', bots.regression, [
+    '由独立回归评审机器人在任何发布之前核验交付计划，不推送、不评论、不修改PR或代码。delivery-plan来自开发机器人，不能直接信任。',
+    '执行固定tools.mjs route --context <context> --release <release-candidate> --plan <delivery-plan> --out <本输出目录/result.json>，附固定hash参数。工具核对计划与本角色gate产出的release-candidate绑定，按模式、PR作者与当前登录名、实时Git与远端状态重新推导动作及是否需要审批，并由计划字段重建审批材料。工具失败即计划不可信：如实写失败Manifest并说明原因，不得改写计划或自行宣称通过。',
+    HASH_INSTRUCTION, '用固定publish工具交付 --entry route json result.json。',
+  ].join('\n'), { route: output('result.json') }, ['prepare-mr', 'development-review-loop', 'prepare'],
+  [ref('prepare-mr', 'delivery-plan'), ref('development-review-loop', 'release-candidate'), ref('prepare', 'tools'), ref('prepare', 'context'), ref('prepare', 'resources')]);
+  checkDelivery.resultSchema = { type: 'object', properties: {
     publicationRequired: { type: 'boolean' }, approvalRequired: { type: 'boolean' }, directPublish: { type: 'boolean' }, approvalSummary: { type: 'string' },
   }, required: ['publicationRequired', 'approvalRequired', 'directPublish', 'approvalSummary'] };
 
   const publishText = (gated: boolean) => [
-    gated ? '仅在本节点humanGate真实批准后，按delivery-plan执行发布；不能拿旧批准发布新候选。' : '仅当delivery-plan.directPublish=true（在本人PR上发布评审评论）时执行，按delivery-plan原样发布。',
+    gated ? '仅在本节点humanGate真实批准后，按delivery-plan执行发布；不能拿旧批准发布新候选。' : '仅当check-delivery判定directPublish=true（在本人PR上发布评审评论）时执行，按delivery-plan原样发布。',
     'action=create/update时只用固定tools.mjs push --context <context> --release <release-candidate> --plan <delivery-plan>推送：工具重新核对计划摘要、gate、clean HEAD与远端分支，用显式提交SHA非强制推送到计划的源分支。禁止自行git push、强推或推送其它分支。update复用原PR URL，不新建重复PR；create推送后用官方CLI创建PR（标题、正文原样取delivery-plan.title与delivery-plan.body），先查询已有同源分支PR再创建，结果不确定先查再重试。',
     'action=comment时只把delivery-plan.commentBody原文作为一条评论发到existingPr.url，不改写、不追加，不改代码、不推送、不提交approve/request-changes等审查状态。',
     'SSO/权限缺失输出可重试AUTH_REQUIRED/WAITING_AUTH，提供官方真实登录入口和临时二维码可用性，恢复同run后重新验证身份和仓库权限；不保存token、不安装CLI。不自动合并或部署。',
@@ -125,14 +135,14 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
     ref('prepare', 'tools'), ref('prepare', 'context'), ref('prepare', 'resources')];
   const createMR = goal('create-mr', bots.developer, publishText(true), { 'mr-result': output('mr-result.json') },
     ['prepare-mr', 'development-review-loop', 'prepare'], publishInputs);
-  createMR.depends = [{ from: 'prepare-mr', when: { path: 'result.approvalRequired', equals: true } }, { from: 'development-review-loop' }, { from: 'prepare' }];
-  createMR.humanGate = { prompt: '是否批准执行以下发布操作？请核对仓库、PR、分支、提交、改动与验证，以及拟发布的标题、正文或评论。', contextFrom: { nodeId: 'prepare-mr', field: 'approvalSummary' }, options: ['approve', 'reject'], approveOptions: ['approve'] };
+  createMR.depends = [{ from: 'check-delivery', when: { path: 'result.approvalRequired', equals: true } }, { from: 'prepare-mr' }, { from: 'development-review-loop' }, { from: 'prepare' }];
+  createMR.humanGate = { prompt: '是否批准执行以下发布操作？请核对仓库、PR、分支、提交、改动与验证，以及拟发布的标题、正文或评论。', contextFrom: { nodeId: 'check-delivery', field: 'approvalSummary' }, options: ['approve', 'reject'], approveOptions: ['approve'] };
   const publishDirect = goal('publish-direct', bots.developer, publishText(false), { 'mr-result': output('mr-result.json') },
     ['prepare-mr', 'development-review-loop', 'prepare'], publishInputs);
-  publishDirect.depends = [{ from: 'prepare-mr', when: { path: 'result.directPublish', equals: true } }, { from: 'development-review-loop' }, { from: 'prepare' }];
+  publishDirect.depends = [{ from: 'check-delivery', when: { path: 'result.directPublish', equals: true } }, { from: 'prepare-mr' }, { from: 'development-review-loop' }, { from: 'prepare' }];
 
   // Exactly one publisher runs when publication is required; both are skipped otherwise.
-  // Quorum 4 is reached only after that publisher succeeds (prepare-mr, loop and prepare make three).
+  // Quorum 5 is reached only after that publisher succeeds (check-delivery, prepare-mr, loop and prepare make four).
   const verifyPublication = goal('verify-publication', bots.regression, [
     '由独立回归评审机器人只读核验发布结果，不推送、不评论、不修改PR或代码。delivery-plan来自开发机器人，必须经固定脚本与本角色gate产出的release-candidate绑定后才可信。',
     '用官方CLI只读查询delivery-plan对应的PR，写observed-pr.json：{url,state,sourceBranch,targetBranch,headSha}；action=comment时再取回实际发布的那条评论正文原文写入observed-comment.md。开发机器人的mr-result.json只用于找到PR和评论链接，不能代替本角色的查询。',
@@ -141,22 +151,22 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   ].join('\n'), { verification: output('verification.json') }, ['create-mr', 'publish-direct', 'prepare-mr', 'development-review-loop', 'prepare'],
   [ref('create-mr', 'mr-result'), ref('publish-direct', 'mr-result'), ref('prepare-mr', 'delivery-plan'), ref('development-review-loop', 'release-candidate'),
     ref('prepare', 'tools'), ref('prepare', 'context'), ref('prepare', 'resources')]);
-  verifyPublication.depends = [{ from: 'create-mr' }, { from: 'publish-direct' }, { from: 'prepare-mr', when: { path: 'result.publicationRequired', equals: true } },
-    { from: 'development-review-loop' }, { from: 'prepare' }];
-  verifyPublication.triggerRule = { quorum: 4 };
+  verifyPublication.depends = [{ from: 'create-mr' }, { from: 'publish-direct' }, { from: 'check-delivery', when: { path: 'result.publicationRequired', equals: true } },
+    { from: 'prepare-mr' }, { from: 'development-review-loop' }, { from: 'prepare' }];
+  verifyPublication.triggerRule = { quorum: 5 };
 
   // Runs once after verification, or straight after planning when nothing is published.
   const complete = goal('complete', bots.developer, [
     '交付本次最终task-report.md。action=none/reuse时只读确认原PR状态、URL及SHA，直接交付结论，不推送、不创建、不修改PR、不发评论。发布与核验节点跳过是无发布动作的正常结果，不是失败。',
-    '有发布时delivery-plan不会注入，以verify-publication的verification.json为准写实际动作、URL、分支与SHA；无发布时以delivery-plan为准。报告写明模式、PR链接、head/base、是否推送或发布评论、是否经人工审批、正确性/回归结论、真实验证、评审意见含nit的处置结论和未验证环境；review模式列出已发给作者的意见。release-candidate.artifacts给出change-summary、validation和两份评审的路径，按需只读引用。区分原PR已有改动与本轮新增修复，不得将成立未修复的nit留到交付，不能只写Manifest成功。',
+    '有发布时以verify-publication的verification.json为准写实际动作、URL、分支与SHA；无发布时以delivery-plan为准。报告写明模式、PR链接、head/base、是否推送或发布评论、是否经人工审批、正确性/回归结论、真实验证、评审意见含nit的处置结论和未验证环境；review模式列出已发给作者的意见。release-candidate.artifacts给出change-summary、validation和两份评审的路径，按需只读引用。区分原PR已有改动与本轮新增修复，不得将成立未修复的nit留到交付，不能只写Manifest成功。',
     HASH_INSTRUCTION, '使用固定publish工具交付 --entry task-report markdown task-report.md。',
   ].join('\n'), { 'task-report': output('task-report.md', 'markdown') }, ['verify-publication', 'prepare-mr', 'development-review-loop', 'prepare'],
   [ref('verify-publication', 'verification'), ref('prepare-mr', 'delivery-plan'), ref('development-review-loop', 'gate-result'),
     ref('development-review-loop', 'release-candidate'), ref('prepare', 'tools'), ref('prepare', 'context')]);
-  // Exactly three edges are active on either path; early release must never cancel a pending verification.
-  complete.depends = [{ from: 'verify-publication' }, { from: 'prepare-mr', when: { path: 'result.publicationRequired', equals: false } },
-    { from: 'development-review-loop' }, { from: 'prepare' }];
-  complete.triggerRule = { quorum: 3 };
+  // Exactly four edges are active on either path; early release must never cancel a pending verification.
+  complete.depends = [{ from: 'verify-publication' }, { from: 'check-delivery', when: { path: 'result.publicationRequired', equals: false } },
+    { from: 'prepare-mr' }, { from: 'development-review-loop' }, { from: 'prepare' }];
+  complete.triggerRule = { quorum: 4 };
 
   const dagTemplate = validateDagTemplate({ schemaVersion: 2, nodes: [preflight, prepare, {
     id: 'development-review-loop', type: 'loop', depends: dependencies('prepare'),
@@ -165,7 +175,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
     body: { nodes: [implement, review('correctness', 'review-correctness'), review('regression', 'review-regression'), gate] },
     exit: { node: 'verify-review-gate', when: { path: 'result.passed', equals: true } },
     output: { from: 'verify-review-gate' }, feedback: ['verify-review-gate.result'],
-  }, prepareMR, createMR, publishDirect, verifyPublication, complete] });
+  }, prepareMR, checkDelivery, createMR, publishDirect, verifyPublication, complete] });
   return validateSavedWorkflowRevisionDraft({
     execution: { workingDirectoryParam: 'repo_path', distinctRoles: ['developer', 'correctness', 'regression'] },
     inputs: {
@@ -179,10 +189,10 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
     roles: {
       developer: { defaultBot: bots.developer, nodes: ['preflight', 'prepare', 'development-review-loop/implement', 'prepare-mr', 'create-mr', 'publish-direct', 'complete'] },
       correctness: { defaultBot: bots.correctness, nodes: ['development-review-loop/review-correctness'] },
-      regression: { defaultBot: bots.regression, nodes: ['development-review-loop/review-regression', 'development-review-loop/verify-review-gate', 'verify-publication'] },
+      regression: { defaultBot: bots.regression, nodes: ['development-review-loop/review-regression', 'development-review-loop/verify-review-gate', 'check-delivery', 'verify-publication'] },
     },
     specTemplate: { schemaVersion: 1, title: '通用开发、独立双审与PR交付',
-      requirement: '认证预检后按模式准备隔离环境：新开发以本地分支为基线，已有PR先fetch再以本地对象为基线。最多五轮通过由独立评审机器人执行的固定脚本门禁。新开发创建PR、续开发更新原PR，均经人工批准后由固定脚本推送；评审他人PR只发布评论，需人工批准，本人PR评论直接发布。发布后由独立评审机器人核验。定义可执行不表示已运行真人任务。',
+      requirement: '认证预检后按模式准备隔离环境：新开发以本地分支为基线，已有PR先fetch再以本地对象为基线。最多五轮通过由独立评审机器人执行、并独立重跑验证命令的固定脚本门禁。新开发创建PR、续开发更新原PR，均经人工批准后由固定脚本推送；评审他人PR只发布评论，需人工批准，本人PR评论直接发布；是否需要审批由独立评审机器人在发布前判定。发布后由独立评审机器人核验。定义可执行不表示已运行真人任务。',
       acceptance: '本次同repo/base/head/round、真实命令日志及两个独立角色报告一致；开发模式两位reviewer均approve且findings为空，所有意见含nit逐项评估，成立必修复，不成立须提供证据并经复核撤回；评审模式意见完整发布给作者。固定资源未漂移，人工审批只授权对应候选，发布结果与gate通过的提交或计划评论一致。',
       nodes: [
         ['preflight', '先验证实际身份、仓库权限与任务隔离位置；PR模式fetch并定位PR；缺授权可恢复等待'],
@@ -192,6 +202,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
         ['review-regression', '独立审查旧路径、行为证据和相关回归面'],
         ['verify-review-gate', '独立评审机器人用固定脚本核对同repo/base/head/round、身份及证据'],
         ['prepare-mr', '准备PR材料或评审评论及交付计划，不推送、不发布'],
+        ['check-delivery', '独立评审机器人在发布前重新判定动作与是否需要审批，并重建审批材料'],
         ['create-mr', '人工批准后用固定脚本推送并创建/更新PR，或发布他人PR评论'],
         ['publish-direct', '本人PR的评审评论无需审批，按计划原文发布'],
         ['verify-publication', '独立评审机器人核验远端提交、PR与评论和gate及计划一致'],
