@@ -77,7 +77,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3', 'v4'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -257,8 +257,8 @@ describe('fixed development-review executable resources', () => {
     expect(await plan()).toMatchObject({ code: 0, stderr: '' });
     const planned = json(join(output, 'result.json'));
     expect(planned).toMatchObject({ action: 'comment', publicationRequired: true, approvalRequired: true, directPublish: false, pushRemote: null });
-    expect(planned.commentBody).toBe('Review passed.\n\n---\n结论：需要修改（1 条意见，1 项检查失败）\n1. [阻塞] value.txt:1\n   影响：Check fails\n' +
-      '   证据：failing.log exit 3\n检查失败：failing');
+    expect(planned.commentBody).toBe('结论：需要修改（1 条意见，1 项检查失败）\n1. [阻塞] value.txt:1\n   影响：Check fails\n' +
+      '   证据：failing.log exit 3\n检查失败：failing\n\n---\n评审说明：\nReview passed.');
     expect(planned.approvalSummary).toContain(planned.commentBody);
     expect(planned.commentSha256).toBe('sha256:' + createHash('sha256').update(planned.commentBody).digest('hex'));
     const routed = f.out('check-delivery'), routeOut = join(routed, 'result.json');
@@ -269,6 +269,13 @@ describe('fixed development-review executable resources', () => {
     expect(await route()).toMatchObject({ code: 2, stderr: 'delivery plan skipped a required approval\n' });
     write(join(output, 'result.json'), { ...planned, commentBody: 'Review passed.', commentSha256: 'sha256:' + createHash('sha256').update('Review passed.').digest('hex') });
     expect(await route()).toMatchObject({ code: 2, stderr: 'planned comment does not carry every finding\n' });
+    // An unclosed HTML comment in the note is escaped, and a plan smuggling raw HTML in is refused.
+    writeFileSync(comment, 'Review passed. <!-- hide the rest\n');
+    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(output, 'result.json')).commentBody.endsWith('评审说明：\nReview passed. &lt;!-- hide the rest')).toBe(true);
+    const hidden = planned.commentBody + ' <!--';
+    write(join(output, 'result.json'), { ...planned, commentBody: hidden, commentSha256: 'sha256:' + createHash('sha256').update(hidden).digest('hex') });
+    expect(await route()).toMatchObject({ code: 2, stderr: 'planned comment does not carry every finding\n' });
     write(join(output, 'result.json'), { ...planned, approvalSummary: 'Harmless' });
     expect(await route()).toMatchObject({ code: 0, stderr: '' });
     expect(json(routeOut).approvalSummary).toBe(planned.approvalSummary); // Material is rebuilt, not copied.
@@ -277,8 +284,19 @@ describe('fixed development-review executable resources', () => {
       artifacts: { ...json(join(gated, 'release-candidate.json')).artifacts, context: { path: context, sha256: sha(context) } } });
     expect(await plan()).toMatchObject({ code: 0, stderr: '' });
     expect(json(join(output, 'result.json'))).toMatchObject({ approvalRequired: false, directPublish: true });
+    // The login/author came from the developer's preflight: without an independent confirmation it needs approval.
     expect(await route()).toMatchObject({ code: 0, stderr: '' });
-    expect(json(routeOut)).toMatchObject({ approvalRequired: false, directPublish: true });
+    expect(json(routeOut)).toMatchObject({ approvalRequired: true, directPublish: false, identityConfirmed: false });
+    const identity = join(routed, 'observed-identity.json');
+    const routeWithIdentity = () => f.tool('route', ['--context', context, '--release', join(gated, 'release-candidate.json'), '--plan', join(output, 'result.json'),
+      '--observed-identity', identity, '--out', routeOut], routed);
+    write(identity, { login: 'carol', author: 'Alice' }); // The real poster is someone else.
+    expect(await routeWithIdentity()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(routeOut)).toMatchObject({ approvalRequired: true, directPublish: false });
+    expect(json(routeOut).approvalSummary).toContain('在他人 PR 上发布评审评论');
+    write(identity, { login: 'ALICE', author: 'alice' });
+    expect(await routeWithIdentity()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(routeOut)).toMatchObject({ approvalRequired: false, directPublish: true, identityConfirmed: true });
 
     const verified = f.out('verify-publication'), observedPr = join(verified, 'observed-pr.json'), observedComment = join(verified, 'observed-comment.md');
     write(observedPr, { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/review', targetBranch: 'main', headSha });
