@@ -36,7 +36,7 @@ function fixture(objectFormat = 'sha1') {
   const prepared = out('prepare'), script = join(prepared, 'tools.mjs'), worktree = join(root, 'task-worktree');
   writeFileSync(script, DEVELOPMENT_REVIEW_RESOURCES[0]!.content);
   const params = join(root, 'params.json'), preflight = join(root, 'preflight.json'), roles = join(root, 'roles.json');
-  write(params, { params: { repo_path: repo, requirement: 'Implement the requested behavior', target_branch: 'main',
+  write(params, { params: { mode: 'new', repo_path: repo, requirement: 'Implement the requested behavior', target_branch: 'main',
     validation_commands: [{ id: 'behavior', argv: [process.execPath, '-e', 'process.stdout.write("verified")'], timeoutSec: 10 }] } });
   write(preflight, { schemaVersion: 1, state: 'READY', repositoryAccess: true, identity: 'fixture-user', runId,
     repoPath: repo, targetBranch: 'main', worktreePath: worktree, worktreeAllowed: true, branch: 'workflow/' + runId });
@@ -62,6 +62,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
   const implemented = f.out('development-review-loop.i' + String(round).padStart(3, '0') + '.implement'), candidate = join(implemented, 'candidate.json'), validation = join(implemented, 'validation.json');
   expect(await f.tool('candidate', ['--context', context, '--round', String(round)], implemented)).toMatchObject({ code: 0, stderr: '' });
   expect(await f.tool('record', ['--context', context, '--candidate', candidate, '--round', String(round)], implemented)).toMatchObject({ code: 0, stderr: '' });
+  const summary = join(implemented, 'change-summary.md'); writeFileSync(summary, 'Changed value.txt; behavior check passed.\n');
   const correctness = join(f.root, 'correctness.json'), regression = join(f.root, 'regression.json');
   for (const [role, filename] of [['correctness', correctness], ['regression', regression]]) {
     write(filename!, { ...json(candidate), role, reviewerId: BOTS[role as keyof typeof BOTS], decision: 'approve', findings: [],
@@ -70,14 +71,14 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
   }
   const gated = f.out('development-review-loop.i' + String(round).padStart(3, '0') + '.verify-review-gate'), result = join(gated, 'result.json');
   const gateArgs = ['--context', context, '--resources', resources, '--expected-resources-sha', DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256,
-    '--candidate', candidate, '--validation', validation, '--correctness', correctness, '--regression', regression, '--round', String(round), '--out', result];
-  return { ...f, context, resources, ctx, candidate, validation, correctness, regression, gated, result, gateArgs,
+    '--candidate', candidate, '--validation', validation, '--change-summary', summary, '--correctness', correctness, '--regression', regression, '--round', String(round), '--out', result];
+  return { ...f, context, resources, ctx, candidate, validation, summary, correctness, regression, gated, result, gateArgs,
     gate: () => f.tool('gate', gateArgs, gated) };
 }
 
 describe('authored development-review preset', () => {
-  it('upgrades the complete previous preset while preserving configured role defaults', () => {
-    const previous = JSON.parse(readFileSync(new URL('./fixtures/development-review/v2.json', import.meta.url), 'utf8'));
+  it.each(['v2', 'v3'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+    const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
       typeof value === 'string' ? Object.entries(BOTS).reduce((v, [role, bot]) => v === bot ? selected[role as keyof typeof selected] : v, value) : value);
@@ -91,12 +92,12 @@ describe('authored development-review preset', () => {
     collectSavedWorkflowReusableTextWarnings(draft, 'draft', warnings);
     expect(warnings).toEqual([]);
     expect(draft.sourceRunId).toBeUndefined();
-    expect(Object.keys(draft.inputs).sort()).toEqual(['repo_path', 'requirement', 'target_branch', 'validation_commands'].sort());
+    expect(Object.keys(draft.inputs).sort()).toEqual(['mode', 'repo_path', 'requirement', 'target_branch', 'validation_commands'].sort());
     for (const input of Object.values(draft.inputs)) { expect(input.required).toBe(true); expect(input.default).toBeUndefined(); }
     expect(validateSavedWorkflowRevisionPayload({ ...draft, workflowId: 'wf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', humanVersion: 1,
       createdAt: '2026-01-01T00:00:00.000Z', createdBy: { openId: 'fixture-owner', larkAppId: 'cli_developer' } }).roles).toEqual(draft.roles);
     const loop = draft.dagTemplate.nodes.find(node => node.type === 'loop')!;
-    expect(loop).toMatchObject({ maxIterations: 3, sessionPolicy: 'fresh', depends: [{ from: 'prepare' }],
+    expect(loop).toMatchObject({ maxIterations: 5, sessionPolicy: 'fresh', depends: [{ from: 'prepare' }],
       exit: { node: 'verify-review-gate', when: { path: 'result.passed', equals: true } }, feedback: ['verify-review-gate.result'] });
     for (const id of ['review-correctness', 'review-regression']) {
       const reviewer = loop.body!.nodes.find(node => node.id === id)!;
@@ -104,6 +105,11 @@ describe('authored development-review preset', () => {
       expect(reviewer.inputs.every(input => input.from === 'implement')).toBe(true);
     }
     expect(draft.dagTemplate.nodes.find(node => node.id === 'create-mr')!.humanGate).toMatchObject({ approveOptions: ['approve'] });
+    expect(draft.dagTemplate.nodes.find(node => node.id === 'publish-direct')!.humanGate).toBeNull();
+    // The developer never runs its own gate or verifies its own publication.
+    expect(loop.body!.nodes.find(node => node.id === 'verify-review-gate')!.bot).toBe(BOTS.regression);
+    expect(draft.dagTemplate.nodes.find(node => node.id === 'verify-publication')!.bot).toBe(BOTS.regression);
+    expect(draft.roles!.developer!.nodes).not.toContain('development-review-loop/verify-review-gate');
   });
 
   it('refuses unresolved or non-independent default identities', () => {
@@ -158,51 +164,203 @@ describe('fixed development-review executable resources', () => {
     expect(readFileSync(f.result, 'utf8')).not.toContain('forged-finding-canary');
   });
 
-  it('prepares an existing PR at its actual head and keeps the target base separate', async () => {
+  it('prepares an existing PR at its fetched head against the merge base, even when the PR lags its target', async () => {
     const f = fixture();
-    const baseSha = f.git(f.repo, 'rev-parse', 'HEAD');
+    const mergeBase = f.git(f.repo, 'rev-parse', 'HEAD');
     f.git(f.repo, 'checkout', '-qb', 'feature/review');
-    writeFileSync(join(f.repo, 'value.txt'), 'existing PR\n');
-    f.git(f.repo, 'add', 'value.txt'); f.git(f.repo, 'commit', '-qm', 'existing PR');
+    writeFileSync(join(f.repo, 'value.txt'), 'existing PR\n'); f.git(f.repo, 'add', 'value.txt'); f.git(f.repo, 'commit', '-qm', 'existing PR');
     const headSha = f.git(f.repo, 'rev-parse', 'HEAD');
-    write(f.preflight, { ...json(f.preflight), reviewTarget: { url: 'https://example.invalid/pull/23',
-      sourceBranch: 'feature/review', targetBranch: 'main', baseSha, headSha } });
+    f.git(f.repo, 'checkout', '-q', 'main');
+    writeFileSync(join(f.repo, 'other.txt'), 'target moved\n'); f.git(f.repo, 'add', 'other.txt'); f.git(f.repo, 'commit', '-qm', 'target moved');
+    f.git(f.repo, 'remote', 'add', 'origin', f.repo);
+    f.git(f.repo, 'update-ref', 'refs/remotes/origin/main', 'main');
+    const reviewTarget = { url: 'https://example.invalid/pull/23', author: 'alice', remote: 'origin',
+      sourceBranch: 'feature/review', targetBranch: 'main', headSha };
+    write(f.params, { params: { ...json(f.params).params, mode: 'review', target_branch: 'ignored-default' } });
+    write(f.preflight, { ...json(f.preflight), reviewTarget });
+    expect(await f.prepare()).toMatchObject({ code: 2, stderr: 'review mode requires the verified CLI login\n' });
+    write(f.preflight, { ...json(f.preflight), login: 'me' });
     expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
     expect(f.git(f.worktree, 'rev-parse', 'HEAD')).toBe(headSha);
-    expect(json(join(f.prepared, 'context.json'))).toMatchObject({ baseSha, startSha: headSha });
+    expect(json(join(f.prepared, 'context.json'))).toMatchObject({ mode: 'review', baseSha: mergeBase, startSha: headSha, targetBranch: 'main', login: 'me' });
     expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+
+    const unfetched = fixture();
+    write(unfetched.params, { params: { ...json(unfetched.params).params, mode: 'continue' } });
+    write(unfetched.preflight, { ...json(unfetched.preflight), reviewTarget: { ...reviewTarget, headSha: unfetched.git(unfetched.repo, 'rev-parse', 'HEAD') } });
+    unfetched.git(unfetched.repo, 'remote', 'add', 'origin', unfetched.repo);
+    expect((await unfetched.prepare()).code).toBe(2); // The target was never fetched into refs/remotes.
+    expect(existsSync(unfetched.worktree)).toBe(false);
+    const stray = fixture();
+    write(stray.preflight, { ...json(stray.preflight), reviewTarget });
+    expect(await stray.prepare()).toMatchObject({ code: 2, stderr: 'new development must not carry a PR target\n' });
   });
 
-  it('plans reuse, update of the original source branch, and creation from live Git evidence', async () => {
-    const f = await evidenceFixture();
+  it('reviews another author PR: no repair commits, failing checks become findings, every finding reaches the comment', async () => {
+    const f = fixture();
+    f.git(f.repo, 'checkout', '-qb', 'feature/review');
+    writeFileSync(join(f.repo, 'value.txt'), 'existing PR\n'); f.git(f.repo, 'add', 'value.txt'); f.git(f.repo, 'commit', '-qm', 'existing PR');
+    const headSha = f.git(f.repo, 'rev-parse', 'HEAD');
+    f.git(f.repo, 'checkout', '-q', 'main');
+    f.git(f.repo, 'remote', 'add', 'origin', f.repo); f.git(f.repo, 'update-ref', 'refs/remotes/origin/main', 'main');
+    const reviewTarget = { url: 'https://example.invalid/pull/23', author: 'Alice', remote: 'origin', sourceBranch: 'feature/review', targetBranch: 'main', headSha };
+    write(f.params, { params: { ...json(f.params).params, mode: 'review',
+      validation_commands: [{ id: 'failing', argv: [process.execPath, '-e', 'process.exit(3)'], timeoutSec: 10 }] } });
+    write(f.preflight, { ...json(f.preflight), reviewTarget, login: 'me' });
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    const context = join(f.prepared, 'context.json'), resources = join(f.prepared, 'resources.json');
+    const implemented = f.out('development-review-loop.i001.implement'), candidate = join(implemented, 'candidate.json'), validation = join(implemented, 'validation.json');
+    writeFileSync(join(f.worktree, 'value.txt'), 'reviewer edit\n'); f.git(f.worktree, 'commit', '-qam', 'unwanted repair');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], implemented)).toMatchObject({ code: 2, stderr: 'review mode must not change the PR head\n' });
+    f.git(f.worktree, 'reset', '-q', '--hard', headSha);
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], implemented)).toMatchObject({ code: 0, stderr: '' });
+    expect(await f.tool('record', ['--context', context, '--candidate', candidate, '--round', '1'], implemented)).toMatchObject({ code: 0, stderr: '' });
+    const summary = join(implemented, 'change-summary.md'); writeFileSync(summary, 'PR changes value.txt; check failing exits 3.\n');
+    const finding = { blocking: true, location: 'value.txt:1', impact: 'Check fails', evidence: 'failing.log exit 3' };
+    const reviews = Object.fromEntries((['correctness', 'regression'] as const).map(role => {
+      const filename = join(f.root, role + '.json');
+      write(filename, { ...json(candidate), role, reviewerId: BOTS[role], decision: role === 'correctness' ? 'changes_requested' : 'approve',
+        findings: role === 'correctness' ? [finding] : [], coverage: ['diff'], evidence: ['read the PR'],
+        candidateSha256: sha(candidate), validationSha256: sha(validation), contextSha256: sha(context) });
+      return [role, filename];
+    }));
+    const gated = f.out('development-review-loop.i001.verify-review-gate'), result = join(gated, 'result.json');
+    const gateArgs = ['--context', context, '--resources', resources, '--expected-resources-sha', DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256,
+      '--candidate', candidate, '--validation', validation, '--change-summary', summary, '--correctness', reviews.correctness!,
+      '--regression', reviews.regression!, '--round', '1', '--out', result];
+    expect(await f.tool('gate', gateArgs, gated)).toMatchObject({ code: 0, stderr: '' });
+    expect(json(result)).toMatchObject({ passed: true, mode: 'review', validationFailures: ['failing'], unresolvedFindings: [{ role: 'correctness', ...finding }] });
+    write(reviews.regression!, { ...json(reviews.regression!), decision: 'approve', findings: [finding] });
+    expect(await f.tool('gate', gateArgs, gated)).toMatchObject({ code: 0 });
+    expect(json(result).passed).toBe(false); // approve with findings is inconsistent
+    write(reviews.regression!, { ...json(reviews.regression!), decision: 'blocked', findings: [] });
+    expect(await f.tool('gate', gateArgs, gated)).toMatchObject({ code: 0 });
+    expect(json(result).passed).toBe(false);
+    write(reviews.regression!, { ...json(reviews.regression!), decision: 'approve', findings: [] });
+    expect(await f.tool('gate', gateArgs, gated)).toMatchObject({ code: 0 });
+    expect(json(join(gated, 'release-candidate.json')).artifacts['change-summary']).toMatchObject({ sha256: sha(summary) });
+
+    const output = f.out('prepare-mr'), draft = join(output, 'mr-draft.json'), comment = join(output, 'review-comment.md');
+    const plan = () => f.tool('delivery', ['--context', context, '--release', join(gated, 'release-candidate.json'), '--draft', draft, '--comment', comment], output);
+    write(draft, { repository: 'example/project', summary: 'Reviewed; one finding', existingPr: { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/review', targetBranch: 'main' } });
+    writeFileSync(comment, 'Changes requested.\n');
+    expect(await plan()).toMatchObject({ code: 2, stderr: 'review comment omits finding at value.txt:1\n' });
+    writeFileSync(comment, 'Changes requested.\n- value.txt:1 Check fails (failing.log exit 3)\n');
+    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
+    const planned = json(join(output, 'result.json'));
+    expect(planned).toMatchObject({ action: 'comment', publicationRequired: true, approvalRequired: true, directPublish: false, pushRemote: null });
+    expect(planned.approvalSummary).toContain('value.txt:1 Check fails');
+    expect(planned.commentSha256).toBe('sha256:' + createHash('sha256').update(readFileSync(comment, 'utf8').trim()).digest('hex'));
+    write(context, { ...json(context), login: 'alice' }); // A case-insensitive match: the initiator's own PR.
+    write(join(gated, 'release-candidate.json'), { ...json(join(gated, 'release-candidate.json')),
+      artifacts: { ...json(join(gated, 'release-candidate.json')).artifacts, context: { path: context, sha256: sha(context) } } });
+    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(output, 'result.json'))).toMatchObject({ approvalRequired: false, directPublish: true });
+
+    const verified = f.out('verify-publication'), observedPr = join(verified, 'observed-pr.json'), observedComment = join(verified, 'observed-comment.md');
+    write(observedPr, { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/review', targetBranch: 'main', headSha });
+    const verify = () => f.tool('verify-publication', ['--context', context, '--release', join(gated, 'release-candidate.json'),
+      '--plan', join(output, 'result.json'), '--observed', observedPr, '--observed-comment', observedComment, '--out', join(verified, 'verification.json')], verified);
+    writeFileSync(observedComment, 'Changes requested.\n- edited after approval\n');
+    expect(await verify()).toMatchObject({ code: 2, stderr: 'posted comment differs from the planned text\n' });
+    writeFileSync(observedComment, readFileSync(comment, 'utf8') + '\n');
+    expect(await verify()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(verified, 'verification.json'))).toMatchObject({ verified: true, action: 'comment', url: reviewTarget.url });
+  });
+
+  it('continues an existing PR: plans an update, pushes only the approved commit without force, and verifies the remote', async () => {
+    const f = fixture(), remote = join(f.root, 'remote.git');
+    f.git(f.root, 'init', '-q', '--bare', remote);
+    f.git(f.repo, 'remote', 'add', 'origin', remote);
+    f.git(f.repo, 'checkout', '-qb', 'feature/mine');
+    writeFileSync(join(f.repo, 'value.txt'), 'my PR\n'); f.git(f.repo, 'commit', '-qam', 'my PR');
+    const prHead = f.git(f.repo, 'rev-parse', 'HEAD');
+    f.git(f.repo, 'push', '-q', 'origin', 'main', 'feature/mine'); f.git(f.repo, 'checkout', '-q', 'main');
+    f.git(f.repo, 'fetch', '-q', 'origin');
+    const reviewTarget = { url: 'https://example.invalid/pull/7', author: 'me', remote: 'origin', sourceBranch: 'feature/mine', targetBranch: 'main', headSha: prHead };
+    write(f.params, { params: { ...json(f.params).params, mode: 'continue' } });
+    write(f.preflight, { ...json(f.preflight), reviewTarget, login: 'me' });
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    const context = join(f.prepared, 'context.json'), resources = join(f.prepared, 'resources.json');
+    writeFileSync(join(f.worktree, 'value.txt'), 'my PR, fixed\n'); f.git(f.worktree, 'commit', '-qam', 'address review');
+    const implemented = f.out('development-review-loop.i001.implement'), candidate = join(implemented, 'candidate.json'), validation = join(implemented, 'validation.json');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], implemented)).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', context, '--candidate', candidate, '--round', '1'], implemented)).toMatchObject({ code: 0 });
+    const summary = join(implemented, 'change-summary.md'); writeFileSync(summary, 'Fixed value.txt\n');
+    const reviews = (['correctness', 'regression'] as const).map(role => {
+      const filename = join(f.root, role + '.json');
+      write(filename, { ...json(candidate), role, reviewerId: BOTS[role], decision: 'approve', findings: [], coverage: ['diff'], evidence: ['ok'],
+        candidateSha256: sha(candidate), validationSha256: sha(validation), contextSha256: sha(context) });
+      return filename;
+    });
+    const gated = f.out('development-review-loop.i001.verify-review-gate'), release = join(gated, 'release-candidate.json');
+    expect(await f.tool('gate', ['--context', context, '--resources', resources, '--expected-resources-sha', DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256,
+      '--candidate', candidate, '--validation', validation, '--change-summary', summary, '--correctness', reviews[0]!, '--regression', reviews[1]!,
+      '--round', '1', '--out', join(gated, 'result.json')], gated)).toMatchObject({ code: 0 });
+    expect(json(release).passed).toBe(true);
+    const headSha = json(candidate).headSha;
+
+    const output = f.out('prepare-mr'), draft = join(output, 'mr-draft.json'), title = join(output, 'mr-title.txt'), body = join(output, 'mr-body.md');
+    writeFileSync(title, 'Address review'); writeFileSync(body, 'Fixed value.txt; checks passed');
+    write(draft, { repository: 'example/project', pushRemote: 'origin', summary: 'Fixed and checked',
+      existingPr: { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/mine', targetBranch: 'main' } });
+    const planArgs = ['--context', context, '--release', release, '--draft', draft, '--title', title, '--body', body];
+    expect(await f.tool('delivery', planArgs, output)).toMatchObject({ code: 0, stderr: '' });
+    const planPath = join(output, 'result.json');
+    expect(json(planPath)).toMatchObject({ action: 'update', publicationRequired: true, approvalRequired: true, directPublish: false,
+      sourceBranch: 'feature/mine', prHead, headSha, title: 'Address review' });
+
+    const published = f.out('create-mr'), verified = f.out('verify-publication');
+    const pushArgs = ['--context', context, '--release', release, '--plan', planPath];
+    const observed = join(verified, 'observed-pr.json');
+    const verify = () => f.tool('verify-publication', [...pushArgs, '--observed', observed, '--out', join(verified, 'verification.json')], verified);
+    write(observed, { url: reviewTarget.url, state: 'OPEN', sourceBranch: 'feature/mine', targetBranch: 'main', headSha });
+    expect(await verify()).toMatchObject({ code: 2, stderr: 'remote branch does not hold the reviewed commit\n' });
+
+    const forged = join(output, 'forged.json'); write(forged, { ...json(planPath), headSha: prHead });
+    expect(await f.tool('push', ['--context', context, '--release', release, '--plan', forged], published))
+      .toMatchObject({ code: 2, stderr: 'delivery plan publishes a commit the reviewers did not approve\n' });
+    expect(await f.tool('push', pushArgs, published)).toMatchObject({ code: 0, stderr: '' });
+    expect(f.git(remote, 'rev-parse', 'refs/heads/feature/mine')).toBe(headSha);
+    expect(json(join(published, 'push.json'))).toMatchObject({ remoteBefore: prHead, remoteAfter: headSha });
+    expect(await f.tool('push', pushArgs, published)).toMatchObject({ code: 0, stderr: '' }); // Idempotent retry.
+    write(observed, { ...json(observed), headSha: prHead });
+    expect(await verify()).toMatchObject({ code: 2, stderr: 'PR does not point at the reviewed commit and branches\n' });
+    write(observed, { ...json(observed), headSha });
+    expect(await verify()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(verified, 'verification.json'))).toMatchObject({ verified: true, action: 'update', headSha });
+
+    expect(await f.tool('delivery', planArgs, output)).toMatchObject({ code: 0, stderr: '' });
+    expect(json(planPath)).toMatchObject({ action: 'reuse', publicationRequired: false });
+    f.git(f.repo, 'push', '-q', '--force', 'origin', prHead + ':refs/heads/feature/mine'); // Someone else rewrote the PR.
+    const other = f.git(f.repo, 'commit-tree', '-p', prHead, '-m', 'concurrent', f.git(f.repo, 'rev-parse', prHead + '^{tree}'));
+    f.git(f.repo, 'push', '-q', 'origin', other + ':refs/heads/feature/mine');
+    expect(await f.tool('delivery', planArgs, output)).toMatchObject({ code: 2, stderr: 'remote PR head changed since it was fetched\n' });
+  });
+
+  it('creates a new PR branch from local development and refuses to attach another PR', async () => {
+    const f = await evidenceFixture(), remote = join(f.root, 'remote.git');
+    f.git(f.root, 'init', '-q', '--bare', remote); f.git(f.repo, 'remote', 'add', 'origin', remote);
     expect(await f.gate()).toMatchObject({ code: 0 });
-    const headSha = json(f.candidate).headSha;
-    f.git(f.repo, 'remote', 'add', 'origin', f.repo);
-    f.git(f.repo, 'branch', 'original-pr', headSha);
-    const output = f.out('prepare-mr'), draft = join(output, 'mr-draft.json');
-    const title = join(output, 'title.txt'), body = join(output, 'body.md');
+    const release = join(f.gated, 'release-candidate.json'), headSha = json(f.candidate).headSha;
+    const output = f.out('prepare-mr'), draft = join(output, 'mr-draft.json'), title = join(output, 'mr-title.txt'), body = join(output, 'mr-body.md');
     writeFileSync(title, 'Fixture change'); writeFileSync(body, 'Behavior and actual checks');
-    const existingPr = { url: 'https://example.invalid/pull/23', state: 'OPEN', sourceBranch: 'original-pr',
-      targetBranch: 'main', headSha, baseSha: f.ctx.baseSha };
-    const args = ['--context', f.context, '--release', join(f.gated, 'release-candidate.json'), '--draft', draft, '--title', title, '--body', body];
-    const plan = () => f.tool('delivery', args, output);
-    write(draft, { repository: 'example/project', pushRemote: 'origin', summary: 'Checks passed; no new edits', existingPr });
-    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
-    expect(json(join(output, 'result.json'))).toMatchObject({ action: 'reuse', publicationRequired: false, sourceBranch: 'original-pr' });
-
-    f.git(f.repo, 'branch', '-f', 'original-pr', f.ctx.baseSha);
-    write(draft, { ...json(draft), existingPr: { ...existingPr, headSha: f.ctx.baseSha } });
-    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
-    expect(json(join(output, 'result.json'))).toMatchObject({ action: 'update', publicationRequired: true, sourceBranch: 'original-pr' });
-    write(draft, { repository: 'example/project', pushRemote: 'origin', summary: 'New development and checks passed' });
-    expect(await plan()).toMatchObject({ code: 0, stderr: '' });
-    expect(json(join(output, 'result.json'))).toMatchObject({ action: 'create', publicationRequired: true, sourceBranch: f.ctx.branch });
-
-    write(draft, { ...json(draft), existingPr });
-    expect((await plan()).code).not.toBe(0); // The remote moved since the PR observation.
-    write(draft, { ...json(draft), existingPr: { ...existingPr, headSha: f.ctx.baseSha } });
+    const planArgs = ['--context', f.context, '--release', release, '--draft', draft, '--title', title, '--body', body];
+    write(draft, { repository: 'example/project', pushRemote: 'origin', summary: 'New development',
+      existingPr: { url: 'https://example.invalid/pull/9', state: 'OPEN', sourceBranch: 'other', targetBranch: 'main' } });
+    expect(await f.tool('delivery', planArgs, output)).toMatchObject({ code: 2, stderr: 'new development must not attach another PR\n' });
+    write(draft, { repository: 'example/project', pushRemote: 'origin', summary: 'New development' });
+    writeFileSync(join(f.repo, 'later.txt'), 'local main moved\n'); f.git(f.repo, 'add', 'later.txt'); f.git(f.repo, 'commit', '-qm', 'local main moved');
+    expect(await f.tool('delivery', planArgs, output)).toMatchObject({ code: 0, stderr: '' });
+    const planPath = join(output, 'result.json');
+    expect(json(planPath)).toMatchObject({ action: 'create', approvalRequired: true, sourceBranch: f.ctx.branch, targetBranch: 'main', prHead: null });
+    expect(json(planPath).approvalSummary).toContain('注意：本地 main 已从基线');
+    const published = f.out('create-mr');
+    expect(await f.tool('push', ['--context', f.context, '--release', release, '--plan', planPath], published)).toMatchObject({ code: 0, stderr: '' });
+    expect(f.git(remote, 'rev-parse', 'refs/heads/' + f.ctx.branch)).toBe(headSha);
+    expect(await f.tool('delivery', planArgs, output)).toMatchObject({ code: 2, stderr: 'remote task branch already exists\n' });
     writeFileSync(join(f.worktree, 'value.txt'), 'unreviewed edit');
-    expect((await plan()).code).not.toBe(0);
+    expect((await f.tool('push', ['--context', f.context, '--release', release, '--plan', planPath], published)).code).toBe(2);
   });
   it('discovers required checks from preflight only when the launch plan is empty', async () => {
     const f = fixture(), input = json(f.params), checked = json(f.preflight);

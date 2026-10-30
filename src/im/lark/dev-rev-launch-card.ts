@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { DevRevAuthorizationError, DevRevLaunchError, readDevRevLaunch, submitDevRevLaunch, type DevRevLaunch, type DevRevLaunchDeps } from '../../workflows/v3/dev-rev-launch.js';
+import { DevRevAuthorizationError, DevRevLaunchError, DEV_REV_MODES, readDevRevLaunch, submitDevRevLaunch, type DevRevLaunch, type DevRevLaunchDeps } from '../../workflows/v3/dev-rev-launch.js';
 import { isV3SupportedCli } from '../../workflows/v3/contract.js';
 import type { BotConfig } from '../../bot-registry.js';
 import type { ChatBotMember } from './client.js';
@@ -14,6 +14,12 @@ const valueSchema = z.object({ action: z.enum([DEV_REV_SUBMIT, DEV_REV_CANCEL]),
 }).strict().transform(({ [BOTMUX_CALLBACK_MARKER_KEY]: _marker, ...value }) => value);
 export function isDevRevLaunchAction(action: unknown): boolean { return action === DEV_REV_SUBMIT || action === DEV_REV_CANCEL; }
 const text = (content: string) => ({ tag: 'plain_text', content });
+const MODE_LABELS: Record<typeof DEV_REV_MODES[number], string> = {
+  new: '新开发（基于本地默认分支，完成后新建 PR）',
+  review: '评审他人 PR（只评审，意见发为 PR 评论）',
+  continue: '续开发已有 PR（修改后推送更新原 PR）',
+};
+const MODE_CHOICES = DEV_REV_MODES.map(value => ({ value, label: MODE_LABELS[value] }));
 
 export function selectDevRevChatBots(bots: BotConfig[], roster: ChatBotMember[]) {
   const supported = new Set(bots.filter(bot => isV3SupportedCli(bot.cliId) && !bot.codexProfile && bot.disableCliBypass !== true).map(bot => bot.larkAppId));
@@ -25,7 +31,7 @@ export function buildDevRevLaunchCard(request: DevRevLaunch, feedback?: { messag
   if (request.started || request.cancelled) return buildDevRevLaunchResult(request);
   const submitted = request.submitted;
   const defaults: Record<string, unknown> = submitted ? {
-    repo: submitted.repo, requirement: submitted.requirement,
+    repo: submitted.repo, mode: submitted.mode, requirement: submitted.requirement,
     ...Object.fromEntries(['developer', 'correctness', 'regression'].map(role =>
       [role, request.bots.find(bot => bot.appId === submitted[role as 'developer'])?.value])),
   } : feedback?.form && typeof feedback.form === 'object' ? feedback.form as Record<string, unknown> : {};
@@ -39,10 +45,12 @@ export function buildDevRevLaunchCard(request: DevRevLaunch, feedback?: { messag
     body: { elements: [
       ...(feedback ? [{ tag: 'markdown', content: feedback.message }] : []),
       ...(submitted ? [{ tag: 'markdown', content: `请求已提交，重试将恢复同一任务：\`${request.runId}\`。` }] : []),
-      { tag: 'markdown', content: '选择仓库与三个不同的机器人，填写需求后启动。基线自动使用仓库默认分支，任务在独立 worktree 中开发。' },
+      { tag: 'markdown', content: '选择仓库、模式与三个不同的机器人，填写需求后启动。新开发以本地默认分支为基线；已有 PR 先 fetch 再以本地为基线。任务在独立 worktree 中进行。' },
       { tag: 'form', name: 'dev_rev_launch', elements: [
         { tag: 'markdown', content: '**仓库**' },
         select('repo', '选择仓库', request.repos),
+        { tag: 'markdown', content: '**模式**' },
+        select('mode', '选择模式', MODE_CHOICES),
         { tag: 'markdown', content: '**开发**' },
         select('developer', '开发机器人', request.bots),
         { tag: 'markdown', content: '**正确性评审**' },
@@ -52,13 +60,13 @@ export function buildDevRevLaunchCard(request: DevRevLaunch, feedback?: { messag
         { tag: 'markdown', content: '**需求**' },
         { tag: 'input', name: 'requirement', input_type: 'multiline_text', required: true,
           ...(typeof defaults.requirement === 'string' ? { default_value: defaults.requirement.slice(0, 12000) } : {}),
-          placeholder: text('填写需求和验收标准，或粘贴需求文档链接') },
+          placeholder: text('新开发：填写需求和验收标准或文档链接；PR 模式：粘贴 PR 链接并说明要求') },
         { tag: 'button', name: 'start', text: text(submitted ? '恢复启动' : '开始开发评审'), type: 'primary', action_type: 'form_submit',
           value: { action: DEV_REV_SUBMIT, id: request.id, nonce: request.nonce } },
       ] },
       ...(!submitted ? [{ tag: 'button', text: text('取消'), type: 'default',
         value: { action: DEV_REV_CANCEL, id: request.id, nonce: request.nonce } }] : []),
-      { tag: 'markdown', content: '仅发起人可提交；文档无权限时会等待授权。创建 PR/MR 前仍需人工确认。' },
+      { tag: 'markdown', content: '仅发起人可提交；文档无权限时会等待授权。推送代码和在他人 PR 发评论前需人工确认。' },
     ] },
   });
 }
@@ -66,7 +74,7 @@ export function buildDevRevLaunchResult(result: { runId: string; cancelled: bool
   return JSON.stringify({ schema: '2.0', header: {
     template: result.cancelled ? 'grey' : 'green', title: text(result.cancelled ? '已取消启动' : '开发评审已启动'),
   }, body: { elements: [{ tag: 'markdown', content: result.cancelled ? '本次未启动开发任务。' :
-    `工作流：\`${result.runId}\`\n认证与需求预检 → 准备 worktree → 开发与评审 → PR/MR 审批。` }] } });
+    `工作流：\`${result.runId}\`\n认证与需求预检 → 准备 worktree → 开发与评审 → 发布审批 → 发布核验。` }] } });
 }
 export async function handleDevRevLaunchAction(
   raw: unknown, form: unknown, operator: string | undefined, appId: string | undefined,

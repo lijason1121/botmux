@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BotConfig } from '../src/bot-registry.js';
-import { bindDevRevLaunchCard, createDevRevLaunch, readDevRevLaunch, resolveDevRevDefaultBranch,
+import { bindDevRevLaunchCard, createDevRevLaunch, readDevRevLaunch, resolveDevRevDefaultBranch, resolveDevRevLocalDefaultBranch,
   submitDevRevLaunch, type DevRevLaunch, type DevRevLaunchDeps } from '../src/workflows/v3/dev-rev-launch.js';
 import { loadAuthorizedV3Run } from '../src/workflows/v3/run-envelope.js';
 import { buildDevRevLaunchCard, DEV_REV_CANCEL, DEV_REV_SUBMIT, handleDevRevLaunchAction, selectDevRevChatBots } from '../src/im/lark/dev-rev-launch-card.js';
@@ -35,7 +35,7 @@ function git(...args: string[]) {
 const open = (extra: Partial<Parameters<typeof createDevRevLaunch>[0]> = {}) => createDevRevLaunch({ dataDir, context,
   requestKey: 'message-one', repos: [{ path: repo, label: 'Example' }],
   bots: bots.map(bot => ({ appId: bot.larkAppId, label: bot.name! })), ...extra });
-const form = { repo: 'repo-1', developer: 'bot-0', correctness: 'bot-1', regression: 'bot-2', requirement: 'Implement new behavior' };
+const form = { repo: 'repo-1', mode: 'new', developer: 'bot-0', correctness: 'bot-1', regression: 'bot-2', requirement: 'Implement new behavior' };
 const click = (request: DevRevLaunch, extra: Partial<Parameters<typeof submitDevRevLaunch>[0]> = {}) => submitDevRevLaunch({
   id: request.id, nonce: request.nonce, operator: context.actor.openId, appId: context.actor.larkAppId,
   cardMessageId: 'om_card', form, ...extra,
@@ -81,7 +81,8 @@ describe('dev-rev interactive launcher', () => {
     const card = JSON.parse(buildDevRevLaunchCard(a));
     const fields = card.body.elements.find((x: any) => x.tag === 'form').elements;
     expect(fields.filter((x: any) => x.tag === 'select_static').map((x: any) => x.name))
-      .toEqual(['repo', 'developer', 'correctness', 'regression']);
+      .toEqual(['repo', 'mode', 'developer', 'correctness', 'regression']);
+    expect(fields.find((x: any) => x.name === 'mode').options.map((x: any) => x.value)).toEqual(['new', 'review', 'continue']);
     expect(fields.find((x: any) => x.name === 'requirement').input_type).toBe('multiline_text');
     expect(JSON.stringify(card).includes(repo)).toBe(false);
   });
@@ -107,7 +108,7 @@ describe('dev-rev interactive launcher', () => {
     const request = await bound(); const result = await click(request);
     expect(result).toMatchObject({ started: true, runId: request.runId });
     const loaded = loadAuthorizedV3Run(join(baseDir, request.runId));
-    expect(loaded.resolvedParams).toMatchObject({ params: { repo_path: repo, target_branch: 'main',
+    expect(loaded.resolvedParams).toMatchObject({ params: { mode: 'new', repo_path: repo, target_branch: 'main',
       requirement: form.requirement, validation_commands: [] } });
     expect(loaded.resolvedRoles).toMatchObject({ developer: { bot: 'cli_dev' }, correctness: { bot: 'cli_correct' }, regression: { bot: 'cli_regress' } });
     expect(loaded.envelope.chatBinding).toMatchObject({ ownerOpenId: 'ou_owner', rootMessageId: 'om_start', chatId: 'oc_here', larkAppId: 'cli_host' });
@@ -233,6 +234,14 @@ describe('automatic repository base', () => {
     git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/release');
     git('checkout', '-qb', 'some-feature');
     expect(resolveDevRevDefaultBranch(repo)).toBe('origin/release');
+    expect(resolveDevRevLocalDefaultBranch(repo, 'new')).toBe('release');
+  });
+  it('bases new development on the local default branch and leaves PR modes to the fetched target', () => {
+    git('update-ref', 'refs/remotes/origin/release', 'HEAD');
+    git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/release');
+    expect(() => resolveDevRevLocalDefaultBranch(repo, 'new')).toThrow(/本地没有默认分支 release/);
+    expect(resolveDevRevLocalDefaultBranch(repo, 'review')).toBe('release');
+    expect(resolveDevRevLocalDefaultBranch(repo, 'continue')).toBe('release');
   });
   it('fails closed on an ambiguous default instead of guessing current HEAD', () => {
     git('branch', 'master'); expect(() => resolveDevRevDefaultBranch(repo)).toThrow(/无法唯一确定/);
