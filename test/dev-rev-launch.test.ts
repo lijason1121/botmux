@@ -245,6 +245,8 @@ describe('automatic repository base', () => {
   });
   it('fails closed on an ambiguous default instead of guessing current HEAD', () => {
     git('branch', 'master'); expect(() => resolveDevRevDefaultBranch(repo)).toThrow(/无法唯一确定/);
+    expect(() => resolveDevRevLocalDefaultBranch(repo, 'new')).toThrow(/无法唯一确定/);
+    expect(resolveDevRevLocalDefaultBranch(repo, 'review')).toBe('pr-target'); // PR modes use the fetched PR target.
   });
   it('does not fall back to main when the declared remote default has not been fetched', () => {
     git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/release');
