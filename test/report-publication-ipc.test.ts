@@ -251,7 +251,7 @@ describe('relay fallback publication (#2262)', () => {
   it('keeps an implicit dispatch root miss as a plain 404 for the CLI to place itself', async () => {
     writeFileSync(join(root, 'orchestrate-dispatch.json'), '{}');
     expect(await relayReport({ explicitDispatchRoot: undefined })).toEqual({
-      status: 404, body: { ok: false, error: 'dispatch_target_unavailable' },
+      status: 404, body: { ok: false, error: 'dispatch_target_unavailable', resultArchive: expect.objectContaining({ id: expect.stringMatching(/^[a-f0-9]{64}$/), contentPath: expect.any(String), receiptPath: expect.any(String), receivedAt: expect.any(String) }) },
     });
     expect(mocks.reply).not.toHaveBeenCalled(); expect(journals()).toEqual([]);
   });
@@ -269,7 +269,7 @@ describe('relay fallback publication (#2262)', () => {
   it('leaves relay failures unchanged for callers that did not opt in', async () => {
     mocks.online.mockReturnValue(undefined);
     expect(await report({ delivery: 'relay' })).toEqual({
-      status: 503, body: { ok: false, error: 'orchestrator_daemon_offline' },
+      status: 503, body: { ok: false, error: 'orchestrator_daemon_offline', resultArchive: expect.objectContaining({ id: expect.stringMatching(/^[a-f0-9]{64}$/), contentPath: expect.any(String), receiptPath: expect.any(String), receivedAt: expect.any(String) }) },
     });
     mocks.online.mockReturnValue({ ipcPort: 19999 });
     targetAnswers(500, { ok: false, errorCode: 'session_not_runnable', error: 'not runnable' });
@@ -303,6 +303,7 @@ describe('relay fallback publication (#2262)', () => {
     mocks.online.mockReturnValue(undefined);
     expect(await relayReport()).toEqual({ status: 503, body: {
       ok: false, error: 'orchestrator_daemon_offline',
+      resultArchive: expect.objectContaining({ id: expect.stringMatching(/^[a-f0-9]{64}$/), contentPath: expect.any(String), receiptPath: expect.any(String), receivedAt: expect.any(String) }),
       relayFallback: {
         reason: 'orchestrator_offline', reasonText: UNDELIVERED_REPORT_RELAY_REASON_TEXT.orchestrator_offline,
         relayStatus: 503, relayError: 'orchestrator_daemon_offline',

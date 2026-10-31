@@ -147,7 +147,7 @@ describe('botmux report relay fallback, CLI to daemon (#2262)', () => {
     const file = join(sandbox, 'review.md'); writeFileSync(file, content);
     const result = await runReport(['--dispatch-root', ROOT, '--content-file', file]);
     expect(result.status, result.stderr).toBe(0);
-    const archive = JSON.parse(result.stderr.split('\n').find(line => line.startsWith('{"resultArchived":true'))!).resultArchive;
+    const archive = result.output.resultArchive;
     sessions.clear();
     expect(readFileSync(archive.contentPath, 'utf8')).toBe(content);
     expect(JSON.parse(readFileSync(archive.receiptPath, 'utf8'))).toMatchObject({
@@ -162,7 +162,7 @@ describe('botmux report relay fallback, CLI to daemon (#2262)', () => {
     const first = await runReport(['--dispatch-root', ROOT, 'review remains available']);
     const second = await runReport(['--dispatch-root', ROOT, 'review remains available']);
     expect(first.status).toBe(1); expect(second.status).toBe(1);
-    const archive = JSON.parse(first.stderr.split('\n').find(line => line.startsWith('{"resultArchived":true'))!).resultArchive;
+    const archive = first.failure.resultArchive;
     expect(readFileSync(archive.contentPath, 'utf8')).toBe('review remains available');
     expect(JSON.parse(readFileSync(archive.receiptPath, 'utf8')).delivery).toMatchObject({ publication: 'unconfirmed', relay: 'not_delivered' });
     expect(mocks.reply).toHaveBeenCalledTimes(1);

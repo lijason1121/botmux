@@ -2817,10 +2817,11 @@ export async function runWorkflow(
         }
         const failure = classifyGoalFailure(result.failureDetail ?? message, result.failureReason);
         if (failure) {
-          errorCode = failure.code;
+          if (!selfReportedFail || !errorCode) errorCode = failure.code;
           if (failure.kind === 'timeout') errorClass = 'timeout';
         }
-        const kind = failure ? (failure.recoverable ? 'blocked' : 'failed')
+        const kind = selfReportedFail && retryable === false ? 'failed'
+          : failure ? (failure.recoverable ? 'blocked' : 'failed')
           : classifyTerminal(errorClass, { selfReportedFail, retryable });
         if (kind === 'blocked') {
           // Runtime human-ask: a self-reported block carrying ASK_HUMAN_ERROR_CODE

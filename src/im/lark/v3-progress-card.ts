@@ -122,6 +122,7 @@ export function buildV3ProgressCard(
     if (view.issue.errorCode) parts.push(`\`${escapeMd(view.issue.errorCode)}\``);
     appendSection(elements, '⚠️ 错误码', parts.length > 0 ? parts.join(' · ') : 'UNKNOWN');
     const recovery: Record<string, string> = {
+      AUTH_REQUIRED: '完成对应 CLI 的登录或授权后重试当前节点。',
       PROVIDER_QUOTA_EXHAUSTED: '额度恢复后重试当前节点；已完成节点与旧 attempt 保留。',
       PROVIDER_AUTH_REQUIRED: '完成对应 CLI 的登录或授权后重试当前节点。',
       WORKER_CONFIGURATION_INVALID: '先修正 CLI、模型或产物配置；不会自动重复执行。',
