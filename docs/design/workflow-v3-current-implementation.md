@@ -497,6 +497,8 @@ Host 输入先解析并冻结，再展示给审批者。批准记录包含输入
 
 宿主把已识别的故障原因写成稳定 `errorCode`；没有 Manifest 时也保留进程根因。只有确认任务尚未发到 Worker 的瞬时启动错误自动退避重试，最多两次；额度、认证、已开始执行的任务和不确定的外部效果不自动重放。每次重试保留旧 attempt，并等待旧 Worker 退出。
 
+结构有效且由正常退出节点提交的自报错误码保留原值，显式 `retryable:false` 仍然失败；宿主分类不会覆盖原有错误协议。内置开发流程预检同时要求按各角色冻结配置核对实际 CLI 路径、版本、profile 与模型，保存脱敏证据。
+
 `nodeSucceeded` 表示执行及产物契约成立。声明必需 `decision` 枚举的结构化结果会另记 `approve`、`changes_requested` 或 `blocked`；状态卡只展示当前 attempt/循环轮次的明确结论，不从成功状态推断批准。
 
 ### 6.3 Attempt 与 Instance
