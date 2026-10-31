@@ -47,6 +47,12 @@ function allText(card: unknown): string {
 }
 
 describe('buildV3ProgressCard', () => {
+  it('does not render completed execution as green approval when a structured review requires changes', () => {
+    const rejected = parse(baseView({ status: 'succeeded', reviews: [{ nodeId: 'review', decision: 'changes_requested' }] }));
+    const approved = parse(baseView({ status: 'succeeded', reviews: [{ nodeId: 'review', decision: 'approve' }] }));
+    expect(rejected.header.template).toBe('orange');
+    expect(approved.header.template).toBe('green');
+  });
   it('运行态展示状态、进度、当前节点、等待、循环、回访、来源、runId、更新时间和详情入口', () => {
     const card = parse(baseView());
     const text = allText(card);
