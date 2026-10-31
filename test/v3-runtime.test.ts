@@ -428,6 +428,9 @@ describe('runWorkflow — model override reaches the worker snapshot', () => {
 
       const runNode: RunNode = async (req) => {
         expect(req.botSnapshot.workingDir).toBe('/frozen');
+        expect(req.frozenBotSnapshots).toEqual({ '': {
+          larkAppId: 'cli_test', cliId: 'claude-code', workingDir: '/frozen',
+        } });
         const file = product(req.outputDir, 'out.md', 'done');
         return {
           status: 'ok',
