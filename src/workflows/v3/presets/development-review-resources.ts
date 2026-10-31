@@ -237,6 +237,16 @@ function prepare(args) {
   const login = typeof checked.login === 'string' && checked.login.trim() ? checked.login.trim() : null;
   const recovery = params.recovery_source;
   if (object(recovery) && Object.keys(recovery).length) {
+    const runDir = path.dirname(path.dirname(path.dirname(process.env.BOTMUX_GOAL_ATTEMPT_DIR)));
+    const journalPath = path.join(runDir, 'journal.ndjson');
+    // The public parameter is data, not recovery authority. Only the host's
+    // durable fork record can authorize using another run's candidate.
+    const records = fs.existsSync(journalPath) ? fs.readFileSync(journalPath, 'utf8').split('\n').slice(0, -1).filter(line => line.trim()).map(line => JSON.parse(line)) : [];
+    const authorization = records.find(event => event.type === 'runRecovered');
+    requireThat(authorization && authorization.sourceRunId === recovery.sourceRunId &&
+      authorization.sourceAttemptId === recovery.sourceAttemptId && authorization.sourceJournalSha256 === recovery.journalSha256 &&
+      ['developer', 'correctness', 'regression'].every(role => authorization.roles[role] === selected[role].bot),
+      'authorized recovery record missing or mismatched');
     requireThat(recovery.sourceRunId !== checked.runId && typeof recovery.sourceRunId === 'string', 'invalid recovery source');
     for (const [file, expected] of [['contextPath', 'contextSha256'], ['candidatePath', 'candidateSha256'], ['journalPath', 'journalSha256']]) {
       requireThat(typeof recovery[file] === 'string' && digest(recovery[file]) === recovery[expected], 'recovery source changed: ' + file);
