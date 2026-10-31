@@ -132,6 +132,8 @@ Configure in `~/.botmux/bots.json`:
 
 Environment variable overrides (useful for testing; applies to every bot on the machine): `BOTMUX_SANDBOX=1` (allowlist isolation) or `BOTMUX_SANDBOX=scratch`.
 
+Precedence: when `BOTMUX_SANDBOX` is `1` / `oncall` / `scratch`, every bot is forced into that mode. Unset, empty, `0` or `false` means no force: each bot follows its own `sandbox` setting (the legacy `readIsolation: true` counts as allowlist isolation), and **a sandbox the bot enables itself is never turned off**. Any other value is rejected at startup. The variable can only force the sandbox on, never turn it off globally.
+
 ---
 
 ## 4. Network Sandbox
@@ -171,6 +173,16 @@ For selective access to internal APIs or proxy endpoints (allowlist isolation + 
 - **Trusted Proxy Egress (`proxyMode: "trusted-egress"`)**: Limits client egress strictly to authorized proxy endpoints.
 - **Host requirements**: `slirp4netns` (with `--disable-host-loopback` and `--disable-dns`), `nft`, `ip`, and `unshare` (with `--kill-child` and `--mount-proc`) must be on `PATH`, and bwrap must support `--add-seccomp-fd` and `--disable-userns`. Nothing is installed automatically; if any piece is missing, the session refuses to start.
 
+Check two prerequisites first, otherwise sessions either start without working network access or do not start at all:
+
+1. **Set `dnsServers` explicitly.** With a policy, the sandbox's `/etc/resolv.conf` contains only the `dnsServers` addresses and slirp4netns' built-in DNS forwarder is disabled. Without them there is no DNS and every lookup fails (`getaddrinfo EAI_AGAIN`) — an allow-all policy included. Use the nameservers from the host's `/etc/resolv.conf` (with systemd-resolved that file says `127.0.0.53`, which the sandbox cannot reach; use the upstream servers in `/run/systemd/resolve/resolv.conf`). Only port 53 is opened to them, even inside a blocked `private` zone. The Dashboard's starting template fills in the host's current nameservers.
+2. **Set `proxyMode` when the host or bot env has proxy variables.** If the daemon or the bot's `env` sets `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (any case), a policy that is not allow-all refuses to start sessions: the proxy resolves and forwards destinations, so the kernel rules only see the proxy. Once the proxy exit is trusted, add `"proxyMode": "trusted-egress"` (kernel rules still only allow the proxy's own IP), or remove the proxy variables.
+
+Other limits:
+
+- Linux, the **pty backend** and the oncall sandbox only. A bot without its own backend setting uses the daemon default (tmux) for new sessions; set it to pty under "Session backend" in the Dashboard. With a policy configured, changing the sandbox mode or backend is rejected until you "Clear network policy".
+- The policy is frozen into each topic when it is created. After clearing or changing it, existing topics (including ones restored after a daemon restart) still start with their original policy; start a new topic.
+
 ---
 
 ## 5. Security Architecture & Boundaries
@@ -201,9 +213,13 @@ These apply to both allowlist isolation and scratch:
 
 ---
 
-## 7. Prerequisites in Containers / Restricted Hosts
+## 7. Prerequisites in Containers / Restricted Hosts {#linux-namespace}
 
 The Linux sandbox relies on kernel namespaces, which Docker-style containers and hardened hosts often block by default. Check per mode:
+
+- **Which bwrap**: the distro binary at `/usr/bin/bwrap` or `/bin/bwrap` is always preferred. Only when neither exists is a bwrap from PATH used, with a one-time warning in the daemon log. Codex installs its own build at `~/.local/bin/bwrap`; when that comes first on PATH, sandboxed sessions exit right after launch, and the warning names it. Install the distro `bubblewrap` package to fix it.
+- **Symlinked system directories**: when a baseline directory such as `/opt` is itself a symlink, the sandbox recreates the same symlink inside and binds the real path read-only.
+- **No PID-namespace downgrade in normal deployments**: even when procfs cannot be mounted in a new PID namespace, a normal deployment refuses to start (only the core-only deployment `BOTMUX_CORE_ONLY=1` may drop `--unshare-pid`) — sibling bot workers on the same host hold plaintext credentials in their environment, which a sandbox without PID isolation could read through /proc.
 
 | Required capability | Allowlist isolation | Scratch | Network policy |
 |---|---|---|---|
