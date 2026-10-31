@@ -14,6 +14,7 @@ import { instantiatePublishedSavedWorkflow } from '../src/workflows/v3/library-s
 import { runWorkflow } from '../src/workflows/v3/runtime.js';
 import { readJournal } from '../src/workflows/v3/journal.js';
 import { compileSavedWorkflowFromRun } from '../src/workflows/v3/library-materialize.js';
+import { projectV3Progress } from '../src/workflows/v3/progress-projection.js';
 
 let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dev-review-runtime-')); });
@@ -54,6 +55,9 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direc
     const result = Object.fromEntries(Object.entries(req.node.resultSchema?.properties ?? {}).map(([key, field]) => [key,
       field.enum?.[0] ?? ({ string: 'fixture', number: 1, boolean: true, object: {}, array: [] }[field.type]),
     ]));
+    if (req.node.id.includes('.review-')) {
+      result.decision = mode === 'reject' || (mode === 'repair' && req.node.id.includes('.i001.')) ? 'changes_requested' : 'approve';
+    }
     if (req.node.id.endsWith(`.${loop.exit.node}`)) {
       result.passed = mode === 'unchanged' || mode === 'direct' || (mode === 'repair' && req.node.id.includes('.i002.'));
       result.unresolvedFindings = result.passed ? [] : [{ role: 'correctness', blocking: false,
@@ -95,6 +99,12 @@ describe('created development-review preset on the production runtime', () => {
       expect(outcome.pendingWaits[0]!.prompt).toContain('https://example.invalid/pull/23');
     }
     expect(events.filter(event => event.type === 'loopIterationStarted')).toHaveLength(2);
+    const view = projectV3Progress({ envelope: run.envelope, dag: run.dag, events });
+    expect(view.reviews).toEqual([
+      { nodeId: `${loop.id}/review-correctness`, decision: 'approve' },
+      { nodeId: `${loop.id}/review-regression`, decision: 'approve' },
+    ]);
+    expect(events.some(event => event.type === 'nodeSucceeded' && event.decision === 'changes_requested')).toBe(true);
     const correctness = run.resolvedRoles!.correctness.nodes.find(path => path.startsWith(`${loop.id}/`))!.split('/')[1]!;
     const checkCalls = calls.filter(call => call.id.endsWith(`.${correctness}`));
     expect(checkCalls).toHaveLength(2);

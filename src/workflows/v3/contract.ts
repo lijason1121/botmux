@@ -320,6 +320,10 @@ export interface RunNodeResult {
   /** Why a `status:'fail'` process ended (CLI-reported abort, timeout, …).
    *  Lets the runtime name the root cause when no manifest was written. */
   failureDetail?: string;
+  /** True only when the pool proves no goal was sent. A failed IPC send is
+   * ambiguous and must set false. Never inferred from error wording. */
+  goalNotStarted?: boolean;
+  failureReason?: 'timeout';
 }
 
 /**

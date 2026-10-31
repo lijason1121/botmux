@@ -132,7 +132,7 @@ interface VerifiedReportRelaySource {
 /** Everything except the registry: request shape, live turn capability and the
  * dispatch root bound to that turn. A visible relay fallback needs exactly this
  * proof, because it only writes into the caller's own dispatch thread. */
-function verifyReportRelaySource(
+export function verifyReportRelaySource(
   input: ReportSessionRelayAuthorizationInput,
 ): VerifiedReportRelaySource | { ok: false; status: number; error: string } {
   const body = input.raw && typeof input.raw === 'object' && !Array.isArray(input.raw)

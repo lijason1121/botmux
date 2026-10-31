@@ -302,6 +302,20 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
   const baseDir = runsBaseDir(args);
   const json = hasFlag(args, '--json');
 
+  if (sub === 'recover') {
+    assertDaemonManagedRunBaseDir(baseDir);
+    const { roleSelections } = collectSavedWorkflowRoleArgs(args, 'run');
+    const [sourceRunId] = positionals(args, ['--library-dir', '--base-dir', '--run-id', '--role']);
+    if (!sourceRunId) throw new Error('用法: botmux workflow recover <失败或已取消的开发runId> [--role developer=Bot]');
+    const { recoverDevelopmentReviewRun } = await import('../workflows/v3/development-review-recovery.js');
+    const run = await recoverDevelopmentReviewRun({ dataDir, baseDir, sourceRunId, context, bots: loadBotConfigs(),
+      roleSelections, runId: argValue(args, '--run-id') });
+    await startMaterializedRun(run.runId, context.actor.larkAppId);
+    console.log(JSON.stringify({ runId: run.runId, sourceRunId, resolvedRoles: run.resolvedRoles,
+      notice: '恢复run的启动请求已提交；旧记录保留，审查与发布授权重新绑定。' }, null, 2));
+    return;
+  }
+
   if (sub === 'create') {
     const { roleSelections, remaining } = collectSavedWorkflowRoleArgs(args, 'run');
     for (let i = 0; i < remaining.length; i++) {

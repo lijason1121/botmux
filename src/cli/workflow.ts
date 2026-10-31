@@ -21,7 +21,7 @@ const V3_HOST_SUBCOMMANDS = new Set([
   'approve-dag',
 ]);
 
-const V3_SAVED_SUBCOMMANDS = new Set(['create', 'save', 'run', 'list', 'show']);
+const V3_SAVED_SUBCOMMANDS = new Set(['create', 'save', 'run', 'recover', 'list', 'show']);
 const RETIRED_TEMPLATE_SUBCOMMANDS = new Set([
   'run',
   'resume',
@@ -41,7 +41,7 @@ export async function cmdWorkflow(sub: string, rest: string[]): Promise<void> {
   // is handled by cli.ts before reaching here and is intentionally NOT gated.
   const workflowEnabled = isWorkflowFeatureEnabled();
   const isAuthoringOrLaunch =
-    V3_HOST_SUBCOMMANDS.has(sub) || sub === 'run' || sub === 'save' || sub === 'create';
+    V3_HOST_SUBCOMMANDS.has(sub) || sub === 'run' || sub === 'recover' || sub === 'save' || sub === 'create';
   if (!workflowEnabled && isAuthoringOrLaunch) {
     console.error(WORKFLOW_DISABLED_CLI_MESSAGE);
     process.exit(2);
@@ -119,6 +119,7 @@ Saved Workflow:
   create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot
   save [last|runId] [名称] [--workflow-id <chat-scope-id>]
   run <名称|workflowId> [--param key=value ...] [--param-json key=<json> ...]
+  recover <失败或已取消的开发runId> [--role developer=Bot ...] [--run-id <新runId>]
   list [--json]
   show <名称|workflowId>
 

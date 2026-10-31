@@ -17,6 +17,7 @@ import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
+import { archiveReportResult, recordReportResultDelivery, type ReportResultReceipt } from './core/report-result-store.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -498,6 +499,7 @@ import {
 } from './core/daemon-ipc-session-auth.js';
 import {
   authorizeReportSessionRelayRequest,
+  verifyReportRelaySource,
   authorizeReportRelayFallbackPublication,
   buildRelayFallbackReportMarkdown,
   classifyUndeliveredReportRelay,
@@ -8964,14 +8966,24 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
 });
 
 ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
+  let resultArchive: ReportResultReceipt | undefined;
+  const respond = (status: number, body: Record<string, unknown>): void => {
+    if (resultArchive) {
+      // Saving the result precedes transport; a delivery-ledger failure must
+      // not turn a confirmed external write into a request to repeat it.
+      try { recordReportResultDelivery(resultArchive, status, body); }
+      catch { body = { ...body, resultDeliveryReceiptError: 'receipt_write_failed' }; }
+    }
+    jsonRes(res, status, { ...body, ...(resultArchive ? { resultArchive } : {}) });
+  };
   let raw: unknown;
   try {
     raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);
   } catch (error) {
     if (error instanceof JsonBodyTooLargeError) {
-      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+      return respond(413, { ok: false, error: 'body_too_large' });
     }
-    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    return respond(400, { ok: false, error: 'bad_json' });
   }
   const claimedSessionId = raw && typeof raw === 'object' && !Array.isArray(raw)
     ? (raw as Record<string, unknown>).sessionId
@@ -9015,6 +9027,20 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     bindingSecret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
   });
   const authorize = () => authorizeReportSessionRelayRequest(authorizeInput());
+  const source = verifyReportRelaySource(authorizeInput());
+  if (source.ok) {
+    try {
+      resultArchive = archiveReportResult(config.session.dataDir, {
+        larkAppId: source.current.larkAppId, sessionId: source.current.sessionId,
+        chatId: source.current.chatId, dispatchRoot: source.dispatchRoot, turnId: source.liveTurnId,
+        dispatchAttempt: source.current.liveOrigin?.dispatchAttempt,
+        report: { delivery: source.delivery, publishTo: source.publishTo, status: source.projectStatus,
+          progress: source.progress, remaining: source.remaining, milestone: source.milestone },
+      }, source.content);
+    } catch {
+      return respond(500, { ok: false, error: 'report_result_archive_failed' });
+    }
+  }
   const decision = authorize();
 
   // #2262: a relay the orchestrator provably never received is published in the
@@ -9032,7 +9058,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       relayStatus: relayed.status,
       ...(typeof relayed.body.error === 'string' ? { relayError: relayed.body.error } : {}),
     };
-    const unpublished = (failure: Record<string, unknown>) => jsonRes(res, relayed.status, {
+    const unpublished = (failure: Record<string, unknown>) => respond(relayed.status, {
       ...relayed.body, ok: false, relayFallback: { ...relayFailure, published: false, ...failure },
     });
     const authorizeFallback = () => authorizeReportRelayFallbackPublication(authorizeInput());
@@ -9082,7 +9108,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
         ...(published.body.deliveryKey ? { deliveryKey: published.body.deliveryKey } : {}),
       });
     }
-    return jsonRes(res, 200, {
+    return respond(200, {
       ...published.body,
       relayFallback: { ...relayFailure, published: true },
       publicationTarget: { mode: 'thread', rootMessageId: fallback.dispatchRoot, chatId: fallback.chatId },
@@ -9095,14 +9121,15 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
         { status: decision.status, body: { ok: false, error: decision.error } },
         async () => ({ projectSynced: false }));
     }
-    return jsonRes(res, decision.status, { ok: false, error: decision.error });
+    return respond(decision.status, { ok: false, error: decision.error });
   }
 
   const sourceWriteOptions = sessionTopicWriteOptions(ds!, ds!.managedTurnOrigin?.turnId, decision.dispatchRoot);
   const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
   const triggerMeta = {
-    requestId: `report:${decision.source.sessionId}:${Date.now()}`,
-    receivedAt: new Date().toISOString(),
+    requestId: `report:${resultArchive!.id}`,
+    receivedAt: resultArchive!.receivedAt,
+    turnIdempotencyKey: `report:${resultArchive!.id}`,
   };
   const postProjectUpdate = async (
     target: { larkAppId: string; sessionId: string },
@@ -9145,7 +9172,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     if (decision.relayFallback) {
       return publishRelayFallback('orchestrator_offline', offline, () => postProjectUpdate(decision.target));
     }
-    return jsonRes(res, offline.status, offline.body);
+    return respond(offline.status, offline.body);
   }
   try {
     const relay = (meta = triggerMeta) => deliverReportSessionRelay({
@@ -9171,11 +9198,11 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       if (undelivered) {
         return await publishRelayFallback(undelivered, relayed, () => postProjectUpdate(decision.target));
       }
-      return jsonRes(res, relayed.status, relayed.body);
+      return respond(relayed.status, relayed.body);
     }
     if (publication && (!ds || getBot(ds.larkAppId).config.privateCard
       || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly }))) {
-      return jsonRes(res, 403, { ok: false, error: 'report_publication_unavailable' });
+      return respond(403, { ok: false, error: 'report_publication_unavailable' });
     }
     const publicationCard = publication ? buildMarkdownCard(decision.content, undefined, '') : '';
     const delivered = publication ? await deliverPublishedReport({
@@ -9198,14 +9225,14 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       relay,
       syncProject: () => postProjectUpdate(decision.target),
     }) : await relay();
-    return jsonRes(res, delivered.status, {
+    return respond(delivered.status, {
       ...delivered.body,
       ...(publication ? { publicationTarget: decision.publishTo === 'chat'
         ? { mode: 'top-level', chatId: ds!.chatId }
         : { mode: 'thread', rootMessageId: decision.dispatchRoot, chatId: ds!.chatId } } : {}),
     });
   } catch (error) {
-    return jsonRes(res, 502, {
+    return respond(502, {
       ok: false,
       error: error instanceof TopicSendError ? error.code : 'orchestrator_daemon_unreachable',
       detail: error instanceof Error ? error.message : String(error),

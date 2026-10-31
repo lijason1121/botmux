@@ -26,7 +26,7 @@ import { createHash } from 'node:crypto';
 import { validateDag } from '../src/workflows/v3/dag.js';
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { runWorkflow, revisitBudgetStatus, type V3RuntimeDeps } from '../src/workflows/v3/runtime.js';
-import { requestRevisitGrant } from '../src/workflows/v3/daemon-run.js';
+import { requestRevisitGrant, requestV3Retry } from '../src/workflows/v3/daemon-run.js';
 import { materialize } from '../src/workflows/v3/state.js';
 import { readAndValidateManifest, ManifestValidationError } from '../src/workflows/v3/manifest.js';
 import {
@@ -191,6 +191,112 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+
+  it.each([
+    ['2067 Token Plan usage exhausted', 'PROVIDER_QUOTA_EXHAUSTED', 'blocked', false, 1],
+    ['403 Forbidden authentication failed', 'PROVIDER_AUTH_REQUIRED', 'blocked', false, 1],
+    ['node timed out after 1800s', 'WORKER_TIMEOUT', 'blocked', false, 1],
+    ['mcode_acp_content_limit', 'WORKER_OUTPUT_BUDGET', 'blocked', false, 1],
+    ['model unavailable', 'WORKER_CONFIGURATION_INVALID', 'failed', true, 1],
+    ['ECONNRESET', 'PROVIDER_TRANSIENT_FAILURE', 'blocked', false, 1],
+    ['ECONNRESET', 'PROVIDER_TRANSIENT_FAILURE', 'blocked', true, 3],
+  ] as const)('classifies %s and bounds retries before goal start=%s', async (detail, code, status, goalNotStarted, attempts) => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-failure-policy-'));
+    let calls = 0;
+    try {
+      const runNode: RunNode = async req => {
+        calls++;
+        return { status: 'fail', manifestPath: join(req.attemptDir, 'manifest.json'), failureDetail: detail, goalNotStarted };
+      };
+      const outcome = await runWorkflow(validateDag(TWO_NODE), { runNode, validateManifest, resolveBotSnapshot }, { baseDir: base });
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: status });
+      expect(calls).toBe(attempts);
+      const events = readJournal(join(base, TWO_NODE.runId, 'journal.ndjson'));
+      const failures = events.filter(e => e.type === 'nodeBlocked' || e.type === 'nodeFailed');
+      expect(failures).toHaveLength(attempts);
+      expect(failures.every(e => e.errorCode === code)).toBe(true);
+      expect(new Set(failures.map(e => e.attemptId)).size).toBe(attempts);
+      expect(events.some(e => e.type === 'nodeDispatched' && e.nodeId === 'summarize')).toBe(false);
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('retries only the blocked goal and preserves successful upstream artifacts and failure history', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-failure-retry-'));
+    const calls: string[] = [];
+    try {
+      const runNode: RunNode = async req => {
+        calls.push(req.node.id);
+        if (req.node.id === 'summarize' && calls.length === 2) {
+          return { status: 'fail', failureDetail: '2067 Token Plan usage exhausted', manifestPath: join(req.attemptDir, 'manifest.json') };
+        }
+        return { status: 'ok', manifestPath: writeManifest(req, {
+          schemaVersion: 1, status: 'ok', summary: 'done', files: [product(req.outputDir, 'report.md', 'verified')],
+        }) };
+      };
+      const deps = { runNode, validateManifest, resolveBotSnapshot };
+      const dag = validateDag(TWO_NODE);
+      expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'blocked' });
+      const journal = join(base, dag.runId, 'journal.ndjson');
+      const before = readFileSync(journal, 'utf8');
+      expect(requestV3Retry(base, dag.runId)).toMatchObject({ kind: 'requested' });
+      expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'succeeded' });
+      expect(calls).toEqual(['research', 'summarize', 'summarize']);
+      expect(readFileSync(journal, 'utf8').startsWith(before)).toBe(true);
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it.each(['intact', 'tampered', 'input-changed', 'false-approval'] as const)(
+    'restores only incomplete checkpoints with matching inputs and artifact hashes: %s', async mode => {
+      const base = mkdtempSync(join(tmpdir(), 'v3-checkpoint-'));
+      let attempt = 0;
+      let checkpointDir = '';
+      let upstream = '';
+      let recovered: GoalInputs['inputs'] = [];
+      try {
+        const runNode: RunNode = async req => {
+          if (req.node.id === 'research') {
+            upstream = join(req.outputDir, 'candidate.json');
+            return { status: 'ok', manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'candidate',
+              files: [product(req.outputDir, 'candidate.json', 'candidate-head-1')] }) };
+          }
+          if (++attempt === 1) {
+            checkpointDir = req.outputDir;
+            const { inputHash } = JSON.parse(readFileSync(join(req.attemptDir, 'checkpoint-context.json'), 'utf8'));
+            writeFileSync(join(req.outputDir, 'checkpoint.json'), JSON.stringify({ schemaVersion: 1,
+              status: mode === 'false-approval' ? 'ok' : 'fail', summary: 'partial coverage', inputHash,
+              error: { code: 'CHECKPOINT_INCOMPLETE', message: 'remaining checks', retryable: true },
+              files: [product(req.outputDir, 'progress.md', 'checked API; remaining WAL probe')] }));
+            return { status: 'fail', failureDetail: 'node timed out after 1800s', manifestPath: join(req.attemptDir, 'manifest.json') };
+          }
+          recovered = (JSON.parse(readFileSync(req.inputsPath, 'utf8')) as GoalInputs).inputs.filter(i => i.from === 'checkpoint');
+          return { status: 'ok', manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'done',
+            files: [product(req.outputDir, 'result.md', 'completed')] }) };
+        };
+        const dag = validateDag(TWO_NODE), deps = { runNode, validateManifest, resolveBotSnapshot };
+        expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'blocked' });
+        if (mode === 'tampered') writeFileSync(join(checkpointDir, 'progress.md'), 'forged');
+        if (mode === 'input-changed') writeFileSync(upstream, 'candidate-head-2');
+        expect(requestV3Retry(base, dag.runId)).toMatchObject({ kind: 'requested' });
+        expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'succeeded' });
+        expect(recovered).toHaveLength(mode === 'intact' ? 1 : 0);
+        if (mode === 'intact') expect(readFileSync(recovered[0]!.path, 'utf8')).toBe('checked API; remaining WAL probe');
+        const events = readJournal(join(base, dag.runId, 'journal.ndjson'));
+        expect(events.filter(e => e.type === 'nodeCheckpointRestored')).toHaveLength(mode === 'intact' ? 1 : 0);
+        expect(events.some(e => e.type === 'nodeSucceeded' && e.decision === 'approve')).toBe(false);
+      } finally { rmSync(base, { recursive: true, force: true }); }
+    });
+
+  it.each(['approve', 'changes_requested', 'blocked'] as const)('records explicit review decision %s independently of execution success', async decision => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-review-decision-'));
+    try {
+      const dag = validateDag({ runId: 'review-decisions', nodes: [{ id: 'review', type: 'goal', goal: 'review', depends: [], inputs: [],
+        resultSchema: { type: 'object', properties: { decision: { type: 'string', enum: ['approve', 'changes_requested', 'blocked'] } }, required: ['decision'] } }] });
+      const runNode: RunNode = async req => ({ status: 'ok', manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'delivered',
+        files: [jsonProduct(req.outputDir, 'result.json', { decision })] }) });
+      expect(await runWorkflow(dag, { runNode, validateManifest, resolveBotSnapshot }, { baseDir: base })).toMatchObject({ runStatus: 'succeeded' });
+      expect(readJournal(join(base, dag.runId, 'journal.ndjson')).find(e => e.type === 'nodeSucceeded')).toMatchObject({ decision });
+    } finally { rmSync(base, { recursive: true, force: true }); }
   });
 
   it('进程失败且无 manifest → nodeFailed 消息以 failureDetail 根因开头', async () => {

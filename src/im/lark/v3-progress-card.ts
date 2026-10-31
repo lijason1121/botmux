@@ -37,6 +37,9 @@ export function buildV3ProgressCard(
   options: V3ProgressCardOptions = {},
 ): string {
   const chrome = statusChrome(view.status);
+  if (view.status === 'succeeded' && view.reviews?.some(review => review.decision !== 'approve')) {
+    chrome.emoji = '📋'; chrome.template = 'orange'; chrome.label = '执行完成 · 审查未通过';
+  }
   const completed = view.counts.done + view.counts.skipped + view.counts.cancelled;
   const webDetailUrl = options.webDetailUrl ?? v3ProgressRunDetailUrl(view.runId);
   const terminalUrl = view.terminal
@@ -86,6 +89,11 @@ export function buildV3ProgressCard(
     appendSection(elements, '⏸ 等待', formatIdList(view.waitingNodeIds));
   }
 
+  if (view.reviews?.length) {
+    const labels = { approve: '审查通过', changes_requested: '要求修改', blocked: '证据不足，审查阻塞' };
+    appendSection(elements, '审查结论', view.reviews.map(review => `${escapeMd(review.nodeId)}：${labels[review.decision]}`).join('\n'));
+  }
+
   if (view.loops.length > 0) {
     appendSection(
       elements,
@@ -113,6 +121,17 @@ export function buildV3ProgressCard(
     if (view.issue.errorClass) parts.push(escapeMd(view.issue.errorClass));
     if (view.issue.errorCode) parts.push(`\`${escapeMd(view.issue.errorCode)}\``);
     appendSection(elements, '⚠️ 错误码', parts.length > 0 ? parts.join(' · ') : 'UNKNOWN');
+    const recovery: Record<string, string> = {
+      PROVIDER_QUOTA_EXHAUSTED: '额度恢复后重试当前节点；已完成节点与旧 attempt 保留。',
+      PROVIDER_AUTH_REQUIRED: '完成对应 CLI 的登录或授权后重试当前节点。',
+      WORKER_CONFIGURATION_INVALID: '先修正 CLI、模型或产物配置；不会自动重复执行。',
+      WORKER_TIMEOUT: '本次执行已达到时限；核对阶段检查点和未完成项后恢复。',
+      WORKER_OUTPUT_BUDGET: '输出或日志达到预算；精简输出后从已保存的阶段产物恢复。',
+      PROVIDER_TRANSIENT_FAILURE: '网络暂时失败；已执行的操作先核对结果，再重试。',
+    };
+    if (view.issue.errorCode && Object.hasOwn(recovery, view.issue.errorCode)) {
+      appendSection(elements, '恢复条件', recovery[view.issue.errorCode]!);
+    }
   }
 
   if (view.feishuHostFailed) {

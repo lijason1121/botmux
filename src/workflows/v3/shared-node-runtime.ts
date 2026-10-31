@@ -12,15 +12,17 @@
  * `ephemeral-pool.ts` / `manifest.ts` provide them, but the runtime compiles
  * against the contract types alone so the two halves build independently.
  *
- * MVP scope: static DAG, fail-fast, no retry (always `attempts/001`).  Retry
- * (`attempts/NNN`) and richer cancel semantics are deferred — see
- * `docs/design/2026-06-01-v3-mvp-engine-split.md`.
+ * Recovery uses new attempts/instances and immutable journal history; resource
+ * close proofs precede retry, cancellation and terminal publication.
  */
 
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join, dirname, relative, isAbsolute, resolve, sep } from 'node:path';
 import { computeInputHash } from '../../utils/canonical-input-hash.js';
+import { classifyGoalFailure } from './goal-failure.js';
+import { fingerprintGoalInputs, restoreGoalCheckpoint } from './goal-checkpoint.js';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import {
   DEFAULT_NODE_TIMEOUT_SEC,
@@ -230,6 +232,11 @@ export function renderGoalFile(
     ...resultSection,
     `You are DONE only after the manifest at $${E.MANIFEST_PATH} exists and every file it references exists.`,
     'If you cannot complete the goal, write a failure manifest and stop.',
+    '',
+    '## Durable progress and recovery',
+    `Read $${E.ATTEMPT_DIR}/checkpoint-context.json. After each substantive stage, atomically replace $${E.OUTPUT_DIR}/checkpoint.json using the manifest shape above with status "fail", error {"code":"CHECKPOINT_INCOMPLETE","message":"work remains","retryable":true}, and an additional inputHash copied from that context. List only completed progress/evidence files with their real hashes. If inputHash is absent, save progress but it cannot be automatically reused.`,
+    'Progress should list checked scope, confirmed findings, evidence, remaining checks and candidate/base HEAD where relevant. Save it before lengthy verification. It is never an approval or a replacement for required validation.',
+    'Inputs from "checkpoint" are verified partial artifacts from your own prior attempt with matching task/input bytes and frozen identity. Read them first, recheck current repository HEAD/configuration/dependencies and resume remaining work. Do not repeat external operations without reconciling their actual outcome; do not reuse prior approvals or infer success from a checkpoint.',
     'If you hit an authentication / authorization / interactive-confirmation wall (a login prompt, an expired token, a permission you cannot grant yourself): do NOT wait for a human and do NOT keep retrying. Immediately write a failure manifest with an \`error.code\` like "AUTH_REQUIRED" and \`error.retryable: true\`, then stop — a human will unblock and retry this node.',
     '',
     '## Asking a human (only when a DECISION truly needs a person)',
@@ -730,7 +737,7 @@ export async function runWorkflow(
   }
 
   // First run only: stamp runStarted (idempotent on resume).
-  if (readJournal(journalPath).length === 0) {
+  if (readJournal(journalPath).every(event => event.type === 'runRecovered')) {
     appendEvent(journalPath, { type: 'runStarted', runId: dag.runId });
   }
 
@@ -2472,10 +2479,8 @@ export async function runWorkflow(
     const effSnap = mergeNodeCapability(botSnap, node.override);
 
     const inputsPath = join(attemptDir, 'inputs.json');
-    writeFileSync(
-      inputsPath,
-      JSON.stringify(buildInputs(node, events, attemptId, loopRef, omitted, workflowDataPath), null, 2),
-    );
+    const goalInputs = buildInputs(node, events, attemptId, loopRef, omitted, workflowDataPath);
+    writeFileSync(inputsPath, JSON.stringify(goalInputs, null, 2));
 
     const manifestPath = join(attemptDir, 'manifest.json');
     const env: Record<string, string> = {
@@ -2630,7 +2635,32 @@ export async function runWorkflow(
     };
 
     const p = Promise.resolve()
-      .then(() => deps.runNode(req))
+      .then(async () => {
+        try {
+          const inputHash = await fingerprintGoalInputs(node, effSnap, goalInputs);
+          writeFileSync(join(attemptDir, 'checkpoint-context.json'), JSON.stringify({ schemaVersion: 1, inputHash }));
+          if (inputHash) {
+            appendEventDurable(journalPath, { type: 'nodeInputsBound', nodeId: node.id, attemptId, inputHash });
+            const retry = [...events].reverse().find(e => e.type === 'nodeRetryRequested' && e.nextAttemptId === attemptId);
+            if (retry?.type === 'nodeRetryRequested') {
+              const previous = events.find(e => e.type === 'nodeInputsBound' && e.attemptId === retry.previousAttemptId);
+              if (previous?.type === 'nodeInputsBound') {
+                const restored = await restoreGoalCheckpoint({ previousOutputDir: join(runDir, retry.previousAttemptId, 'work'),
+                  previousInputHash: previous.inputHash, inputHash, validateManifest: deps.validateManifest });
+                if (restored) {
+                  writeFileSync(inputsPath, JSON.stringify({ ...goalInputs, inputs: [...goalInputs.inputs, ...restored] }, null, 2));
+                  appendEventDurable(journalPath, { type: 'nodeCheckpointRestored', nodeId: node.id, attemptId,
+                    previousAttemptId: retry.previousAttemptId, inputHash, fileCount: restored.length });
+                }
+              }
+            }
+          }
+        } catch (error) {
+          deps.attemptLeaseProvider.closeBeforeExecution(leaseBinding, leaseAcquisition, 'setup_failed');
+          throw error;
+        }
+        return deps.runNode(req);
+      })
       .then(async (result) => {
         const drainReason = controllerDrainReason(controller);
         if (drainReason) {
@@ -2708,6 +2738,7 @@ export async function runWorkflow(
           // path/hash checks like every other product), and the file must
           // match the node's schema.  A violation BLOCKS (retryable), it does
           // not fail.
+          let decision: 'approve' | 'changes_requested' | 'blocked' | undefined;
           if (node.resultSchema) {
             const entry = verdict.manifest!.files.find((f) => f.path === 'result.json');
             if (!entry) {
@@ -2727,6 +2758,10 @@ export async function runWorkflow(
               });
               return;
             }
+            if (node.resultSchema.required?.includes('decision') && node.resultSchema.properties.decision?.enum) {
+              const value = JSON.parse(readFileSync(join(outputDir, entry.path), 'utf8')).decision;
+              if (value === 'approve' || value === 'changes_requested' || value === 'blocked') decision = value;
+            }
           }
           const artifactContract = validateManifestArtifactContract(node.outputs, verdict.manifest!);
           if (!artifactContract.ok) {
@@ -2741,6 +2776,7 @@ export async function runWorkflow(
           }
           appendWorkerOutcome({
             type: 'nodeSucceeded', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, manifestPath: result.manifestPath,
+            ...(decision ? { decision } : {}),
           });
           return;
         }
@@ -2779,7 +2815,13 @@ export async function runWorkflow(
             message = 'runNode reported process failure';
           }
         }
-        const kind = classifyTerminal(errorClass, { selfReportedFail, retryable });
+        const failure = classifyGoalFailure(result.failureDetail ?? message, result.failureReason);
+        if (failure) {
+          errorCode = failure.code;
+          if (failure.kind === 'timeout') errorClass = 'timeout';
+        }
+        const kind = failure ? (failure.recoverable ? 'blocked' : 'failed')
+          : classifyTerminal(errorClass, { selfReportedFail, retryable });
         if (kind === 'blocked') {
           // Runtime human-ask: a self-reported block carrying ASK_HUMAN_ERROR_CODE
           // means the agent wrote a question to ask.json and stopped.  Surface
@@ -2789,11 +2831,30 @@ export async function runWorkflow(
             errorCode === ASK_HUMAN_ERROR_CODE
               ? readGoalAsk(join(attemptDir, GOAL_ASK_FILE))
               : undefined;
-          appendWorkerOutcome({
+          const blocked: Extract<V3Event, { type: 'nodeBlocked' }> = {
             type: 'nodeBlocked',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
             ...(ask ? { ask } : {}),
-          });
+          };
+          // Automatic replay is safe only before a goal crossed IPC, after
+          // runNode proved worker close. Executed goals and host side effects
+          // always require explicit recovery. Bound startup retries per instance.
+          const retries = readJournal(journalPath).filter(e => e.type === 'nodeRetryRequested'
+            && (e.instanceId ?? e.nodeId) === dispatchKey && e.reason === 'transientStartupRetry').length;
+          if (failure?.kind === 'transient' && result.goalNotStarted === true && retries < 2) {
+            await delay(500 * 2 ** retries, undefined, { signal: controller.signal });
+            withJournalMutationSync(journalPath, ({ events: latest, append }) => {
+              const current = materialize([...latest]);
+              if (controller.signal.aborted || current.runStatus !== 'running') throw new Error('startup retry interrupted');
+              // Publish failure and retry in one lock so another driver cannot
+              // terminate the run in the gap. Crash after failure stays blocked.
+              append(blocked, { durable: true });
+              closeProofPersisted = true;
+              append({ type: 'nodeRetryRequested', nodeId: node.id, ...(instanceId ? { instanceId } : {}),
+                previousAttemptId: attemptId, nextAttemptId: nextAttemptIdFor([...latest], dispatchKey),
+                reason: 'transientStartupRetry', previousErrorClass: errorClass, previousErrorCode: errorCode }, { durable: true });
+            });
+          } else appendWorkerOutcome(blocked);
         } else {
           appendWorkerOutcome({
             type: 'nodeFailed',

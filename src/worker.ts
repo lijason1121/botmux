@@ -8,6 +8,7 @@ import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
+import { BoundedLogFile } from './utils/bounded-log-file.js';
 import { CODEX_CONFIG_FILE, hostCodexConfigPath } from './services/codex-isolated-config.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
@@ -28,7 +29,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, constants as fsConstants, type FSWatcher } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -13687,7 +13688,7 @@ function isWorkflowWorker(): boolean {
  *  don't leave empty `pty.log` files behind.  Closed at worker exit by the
  *  process-shutdown hook below.
  */
-let workflowPtyLogStream: WriteStream | undefined;
+let workflowPtyLogStream: BoundedLogFile | undefined;
 let workflowPtyLogOpenFailed = false;
 function appendWorkflowPtyLog(data: string): void {
   if (!isWorkflowWorker() || workflowPtyLogOpenFailed) return;
@@ -13696,9 +13697,9 @@ function appendWorkflowPtyLog(data: string): void {
   if (!workflowPtyLogStream) {
     try {
       mkdirSync(dirname(path), { recursive: true });
-      workflowPtyLogStream = createWriteStream(path, { flags: 'a' });
-      workflowPtyLogStream.on('error', (err) => {
-        log(`workflow pty log write error: ${err.message}`);
+      workflowPtyLogStream = new BoundedLogFile(path, {
+        onLimit: kind => send({ type: 'error', message: `workflow output budget exceeded (${kind})` }),
+        onError: err => log(`workflow pty log write error: ${err.message}`),
       });
     } catch (err: any) {
       workflowPtyLogOpenFailed = true;

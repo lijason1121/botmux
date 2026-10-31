@@ -489,11 +489,15 @@ Host 输入先解析并冻结，再展示给审批者。批准记录包含输入
 | `done` | 成功且产物通过校验 |
 | `skipped` | 条件/汇合规则不满足 |
 | `cancelled` | 被早释放或 Run 取消中止 |
-| `blocked` | 可恢复的语义或契约失败 |
+| `blocked` | 可恢复的语义/契约失败，或已识别的额度、认证、超时、输出预算及瞬时网络故障 |
 | `superseded` | Revisit 后被新实例替代 |
-| `failed` | 基础设施失败、Gate 拒绝或超时 |
+| `failed` | 未识别的基础设施失败、配置错误或 Gate 拒绝 |
 
 `failed` 采用 fail-fast；`blocked` 是“暂时终态”，可由 retry/grant/revisit grant 恢复。
+
+宿主把已识别的故障原因写成稳定 `errorCode`；没有 Manifest 时也保留进程根因。只有确认任务尚未发到 Worker 的瞬时启动错误自动退避重试，最多两次；额度、认证、已开始执行的任务和不确定的外部效果不自动重放。每次重试保留旧 attempt，并等待旧 Worker 退出。
+
+`nodeSucceeded` 表示执行及产物契约成立。声明必需 `decision` 枚举的结构化结果会另记 `approve`、`changes_requested` 或 `blocked`；状态卡只展示当前 attempt/循环轮次的明确结论，不从成功状态推断批准。
 
 ### 6.3 Attempt 与 Instance
 
@@ -503,6 +507,10 @@ Host 输入先解析并冻结，再展示给审批者。批准记录包含输入
 - Attempt 表示同一 Instance 内的执行尝试，如 `attempts/001`、重试后的 `attempts/002`。
 
 普通 blocked retry 保持 Instance 不变并增加 Attempt；Revisit 创建新 Instance。事件同时携带这些身份，避免旧 Worker 的迟到结果覆盖新实例。
+
+Goal 文件要求阶段性保存 `work/checkpoint.json`：使用 failure Manifest 形状，错误码为 `CHECKPOINT_INCOMPLETE`，并带宿主 `checkpoint-context.json` 给出的 `inputHash`。检查点引用的进度/证据文件必须有真实大小和摘要。新 attempt 仅在任务、冻结身份、输入字节一致且文件重新校验通过时注入这些部分产物；目录、超大或不可读输入不启用自动复用。检查点不是批准，恢复时仍须核对实际 HEAD、依赖与配置。
+
+MiniMax ACP 按 NDJSON 单帧流式处理；已消费的协议流量、历史和 stderr 不累计占用正文预算。单帧与当前正文各限 8 MB；Workflow 每个诊断日志限 64 MB、待写队列限 16 MB。超预算停止保留更多日志，记录原因并关闭 Worker，已有阶段产物保留。
 
 ## 7. Goal Worker 与产物契约
 
@@ -1067,6 +1075,7 @@ Host 的聊天身份继续使用 `${context.*}`/`$ref` Context Binding，不会�
 botmux workflow start <runId>
 botmux workflow cancel <runId> --reason "目标已变化"
 botmux workflow retry <runId> --node <nodeId>
+botmux workflow recover <failed-or-cancelled-development-runId> --role developer=<bot>
 botmux workflow grant <runId> --loop <loopId>
 botmux workflow revise-spec <runId>
 botmux workflow revise-dag <runId>
@@ -1077,8 +1086,11 @@ botmux workflow revise-dag <runId>
 - 需求变化：`revise-spec`。
 - 需求不变但流程需重编：`revise-dag`。
 - 普通 blocked 节点：`retry`。
+- 内置开发流程更换角色或从终止 run 接续候选：`recover`。来源须由同应用、同群的原 owner 操作，旧 run 必须 failed/cancelled 且 Worker/effect 已退出；blocked run 可先 retry，换角色前先取消。恢复创建新的冻结身份、独立 worktree 和审查/发布 Gate，不继承旧批准。候选、上下文、来源 journal、仓库和干净 HEAD 都会复核；已经开始发布的 run 拒绝恢复，须先核对外部结果。相同恢复请求复用同一新 run，`--run-id` 可指定不同的新 run。
 - Loop 轮数耗尽：`grant`。
 - Revisit 预算耗尽：使用飞书授权卡。
+
+派单 `botmux report` 在来源会话/turn 鉴权后，先将正文和来源保存到私有 `report-results/<id>/`，再投递。CLI 返回 `resultArchive`，其中 `contentPath` 可供获授权的接手者读取或按当前权限重新发送；`receipt.json` 分别记录公开消息和协调会话送达状态。保存成功不代表通知成功，不确定的发送结果不会自动重发。
 
 ## 13. 开发与调试
 

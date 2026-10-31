@@ -7686,6 +7686,7 @@ ${SEND_HELP_BODY}
                                        把成功 run 固化为 chat scope Saved Workflow；
                                        发布当前 Bot 全局版本 / 确认 unsafe lint 请由用户在飞书显式发送 /workflow save ...
   workflow run <名称|workflowId> [--param key=value ...] [--role developer=BotName ...]
+  workflow recover <失败或取消的开发runId> [--role developer=BotName ...]
   workflow list [--json] | show <名称|workflowId>
                                        运行 / 查看 Saved Workflow
   workflow new|spec-finalize|approve-spec|revise-spec|architect|revise-dag [...]
@@ -15725,6 +15726,10 @@ async function cmdReport(rest: string[]): Promise<void> {
       process.exit(1);
     }
     const triggerBody: any = await response.json().catch(() => ({}));
+    if (triggerBody?.resultArchive) {
+      console.error(JSON.stringify({ resultArchived: true, resultArchive: triggerBody.resultArchive,
+        notice: '回报正文已独立落盘；投递失败不影响保存。后续重新投递仍须使用当前会话授权。' }));
+    }
     const relayFallback = reportDelivery === 'relay'
       && triggerBody?.relayFallback && typeof triggerBody.relayFallback === 'object'
       ? triggerBody.relayFallback : undefined;

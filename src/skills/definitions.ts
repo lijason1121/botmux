@@ -1702,6 +1702,9 @@ description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排
 - 用户要求角色可配置时，保存命令显式声明稳定 goal 路径：\`botmux workflow save last 开发审查 --role developer=review/develop --role correctness=review/check --role regression=review/regression\`（IM 同参数）。顶层 goal 只写 id；同一角色可绑定多个默认 bot 一致的 goal，不能绑定 loop/host 或重复绑定节点。运行用 \`botmux workflow run 开发审查 --role developer=Codex --role correctness=Claude --role regression=MMX\`，也可省略选择沿用保存的默认 bot。必须按真实节点 id/已配置 bot 填写，不猜路径或名称。
 - 显式 \`--role\` 选择仅允许 Saved Workflow owner（同 app + openId）；其它可见群成员仍可不传该参数运行作者默认绑定。\`--role\` 改变实际 node.bot 和冻结快照；实际映射封存在摘要保护的 \`roles.resolved.json\` 并出现在启动响应/goal 上下文中。身份叙述只允许 \`\${roles.developer.label}\`、\`\${roles.developer.bot}\`、\`\${roles.developer.cliId}\`，仅用于 goal、systemPromptAppend 和 Spec 叙述；不能插入审批提示或结构字段。原文字面量中的固定名称/appId、SHA、私有资产路径不会自动替换；先审查任务复用范围，不能宣称角色选择已经同步旧门禁身份。\`--role\` 声明与 IM \`--distill\` 组合会拒绝。本文是源码中的 skill 定义，发布或同步前不能假定全局已安装 CLI/skill/daemon 已支持这些参数。
 - “取消刚才正在跑的流程” → \`botmux workflow cancel <runId>\`（IM 等价：\`/workflow cancel <runId>\`）。只使用真实 v3 runId；CLI 会校验当前 turn 与 run 的 owner/chat/app 绑定，IM 中本群可操作成员也可取消。v2 run 已不可变，只能查静态归档。
+- 额度、认证或超时导致 blocked：先解决故障，再用 \`botmux workflow retry <runId> --node <nodeId>\`。旧 attempt 保留；输入/身份/文件摘要匹配时自动带入阶段检查点，检查点不代表批准。
+- 用户明确要求接替已失败的内置开发流程：\`botmux workflow recover <runId> --role developer=Bot\`（也可指定 correctness/regression）。只由原 owner 在同应用、同群操作；旧 run 必须 failed/cancelled 且没有未退出 Worker 或已开始的发布。blocked 换角色前先取消旧 run。新 run 从核验过的干净候选建立独立 worktree，重新冻结不同的开发/评审身份，不继承旧审查或发布批准。重复请求复用同一恢复 run，来源摘要变化则拒绝。
+- 展示审查时读取结构化 decision；\`nodeSucceeded\` 只证明执行和产物校验完成。报告已保存、公开消息已发布、主编排已收到分别陈述；\`botmux report\` 返回 resultArchive 后，协调会话消失也不会删除正文。
 - “我有哪些流程” → \`botmux workflow list\`（IM：\`/workflow list\`）。
 - “看看周报流程” → \`botmux workflow show 周报\`（IM：\`/workflow show 周报\`）。
 

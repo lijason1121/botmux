@@ -2,7 +2,7 @@
  * talks to the real daemon IPC route (authorization, journal, sessionReply).
  * Only the Lark provider and the orchestrator daemon transport are replaced. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -141,6 +141,52 @@ async function runReport(args: string[]) {
 }
 
 describe('botmux report relay fallback, CLI to daemon (#2262)', () => {
+  it('keeps the full result and distinct delivery receipt after the orchestrator and source sessions disappear', async () => {
+    writeFileSync(join(data, 'orchestrate-dispatch.json'), '{}');
+    const content = 'decision: changes_requested\nChecked API; WAL regression remains.';
+    const file = join(sandbox, 'review.md'); writeFileSync(file, content);
+    const result = await runReport(['--dispatch-root', ROOT, '--content-file', file]);
+    expect(result.status, result.stderr).toBe(0);
+    const archive = JSON.parse(result.stderr.split('\n').find(line => line.startsWith('{"resultArchived":true'))!).resultArchive;
+    sessions.clear();
+    expect(readFileSync(archive.contentPath, 'utf8')).toBe(content);
+    expect(JSON.parse(readFileSync(archive.receiptPath, 'utf8'))).toMatchObject({
+      source: { larkAppId: APP, chatId: CHAT, dispatchRoot: ROOT },
+      delivery: { publication: 'published', relay: 'not_delivered', publishedMessageId: 'om_fallback' },
+    });
+  });
+
+  it('archives before an ambiguous provider failure without claiming delivery or automatically posting twice', async () => {
+    mocks.online.mockReturnValue(undefined);
+    mocks.reply.mockRejectedValue(new Error('response lost'));
+    const first = await runReport(['--dispatch-root', ROOT, 'review remains available']);
+    const second = await runReport(['--dispatch-root', ROOT, 'review remains available']);
+    expect(first.status).toBe(1); expect(second.status).toBe(1);
+    const archive = JSON.parse(first.stderr.split('\n').find(line => line.startsWith('{"resultArchived":true'))!).resultArchive;
+    expect(readFileSync(archive.contentPath, 'utf8')).toBe('review remains available');
+    expect(JSON.parse(readFileSync(archive.receiptPath, 'utf8')).delivery).toMatchObject({ publication: 'unconfirmed', relay: 'not_delivered' });
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not archive a result from a stale or mismatched turn route', async () => {
+    ds.session.rootMessageId = 'om_different';
+    const result = await runReport(['--dispatch-root', ROOT, 'untrusted result']);
+    expect(result.status).toBe(1);
+    expect(existsSync(join(data, 'report-results'))).toBe(false);
+    expect(mocks.reply).not.toHaveBeenCalled(); expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it('reuses the durable trigger idempotency key when a relay response is lost', async () => {
+    mocks.fetch.mockRejectedValueOnce(new Error('response lost'));
+    expect((await runReport(['--dispatch-root', ROOT, 'same result'])).status).toBe(1);
+    expect((await runReport(['--dispatch-root', ROOT, 'same result'])).status).toBe(0);
+    const requests = mocks.fetch.mock.calls.filter(call => call[1] === '/api/trigger').map(call => JSON.parse(call[2].body));
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toEqual(requests[1]);
+    expect(requests[0].options.turnIdempotencyKey).toMatch(/^report:/);
+    expect(mocks.reply).not.toHaveBeenCalled();
+  });
+
   it('keeps a healthy relay exactly as before: orchestrator session, nothing visible', async () => {
     const result = await runReport(['--dispatch-root', ROOT, 'Done']);
     expect(result.status, result.stderr).toBe(0);

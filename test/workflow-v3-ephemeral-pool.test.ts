@@ -346,7 +346,22 @@ describe('v3 ephemeral pool', () => {
     await expect(promise).resolves.toMatchObject({
       status: 'fail',
       failureDetail: 'Goal cleared after an unrecoverable error (model unavailable)',
+      goalNotStarted: true,
     });
+  });
+
+  it('never marks an already-sent goal as safe for automatic replay after a transient error', async () => {
+    const worker = new ScriptedWorker(), req = request();
+    const pool = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret' });
+    const running = pool.runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    expect(worker.rawInputs).toHaveLength(1);
+    worker.emitMessage({ type: 'error', message: 'ECONNRESET' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(1);
+    await expect(running).resolves.toMatchObject({ status: 'fail', goalNotStarted: false, failureDetail: 'ECONNRESET' });
   });
 
   it('passes the frozen reasoningEffort / modelBackendVariant to worker init', async () => {

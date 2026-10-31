@@ -15,7 +15,7 @@
  *   part of the output type at all.
  */
 
-import { isHostNode, isLoopNode, type V3Dag, type V3Node } from './dag.js';
+import { isHostNode, isLoopNode, loopInstanceId, type V3Dag, type V3Node } from './dag.js';
 import type { Spec } from './contract.js';
 import type { StoredEvent, V3ErrorClass } from './journal.js';
 import type { V3NodeStatus } from './orchestrator.js';
@@ -89,6 +89,9 @@ export interface V3ProgressView {
     refreshedNodeIds: string[];
   };
   issue?: V3ProgressIssue;
+  /** Only explicit validated verdicts from current attempts; never inferred
+   * from a successful process, an old loop iteration, or free-form prose. */
+  reviews?: Array<{ nodeId: string; decision: 'approve' | 'changes_requested' | 'blocked' }>;
   feishuHostFailed?: boolean;
   upstreamNonHostFinished?: boolean;
   /** Number only: external payloads and provider errors never enter the card. */
@@ -248,6 +251,26 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
   const { envelope, dag, spec, events } = input;
   const snapshot = materialize([...events]);
   const outerIds = new Set(dag.nodes.map((node) => node.id));
+  const reviewNodes = new Map<string, string>();
+  for (const node of dag.nodes) {
+    if (isLoopNode(node)) {
+      const iteration = snapshot.loops.get(node.id)?.iteration;
+      if (iteration) for (const body of node.body.nodes) {
+        reviewNodes.set(loopInstanceId(node.id, iteration, body.id), `${node.id}/${body.id}`);
+      }
+    } else reviewNodes.set(node.id, node.id);
+  }
+  const reviews: NonNullable<V3ProgressView['reviews']> = [];
+  for (const [id, label] of reviewNodes) {
+    const state = snapshot.nodes.get(id);
+    const key = state?.effectiveInstanceId ?? id;
+    const attempt = snapshot.attempts.get(key);
+    const event = [...events].reverse().find(e => e.type === 'nodeSucceeded' && e.nodeId === id && e.attemptId === attempt);
+    if (state?.status === 'done' && event?.type === 'nodeSucceeded'
+      && ['approve', 'changes_requested', 'blocked'].includes(event.decision ?? '')) {
+      reviews.push({ nodeId: label, decision: event.decision! });
+    }
+  }
   const counts: V3ProgressCounts = {
     total: dag.nodes.length,
     done: 0,
@@ -349,6 +372,7 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
     loops,
     revisit: { count: revisitCount, refreshedNodeIds },
     ...(issue ? { issue } : {}),
+    ...(reviews.length ? { reviews } : {}),
     ...(feishuHostFailed ? { feishuHostFailed: true } : {}),
     ...(feishuHostFailed && nonHostWorkFinished(dag, snapshot) ? { upstreamNonHostFinished: true } : {}),
     ...(snapshot.uncertainHostEffects && snapshot.uncertainHostEffects.length > 0
