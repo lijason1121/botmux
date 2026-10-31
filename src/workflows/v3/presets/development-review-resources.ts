@@ -235,6 +235,24 @@ function prepare(args) {
     baseSha = git(repository, ['merge-base', targetTip, startSha]);
   }
   const login = typeof checked.login === 'string' && checked.login.trim() ? checked.login.trim() : null;
+  const recovery = params.recovery_source;
+  if (object(recovery) && Object.keys(recovery).length) {
+    requireThat(recovery.sourceRunId !== checked.runId && typeof recovery.sourceRunId === 'string', 'invalid recovery source');
+    for (const [file, expected] of [['contextPath', 'contextSha256'], ['candidatePath', 'candidateSha256'], ['journalPath', 'journalSha256']]) {
+      requireThat(typeof recovery[file] === 'string' && digest(recovery[file]) === recovery[expected], 'recovery source changed: ' + file);
+    }
+    const previous = read(recovery.contextPath), checkpoint = read(recovery.candidatePath);
+    requireThat(previous.runId === recovery.sourceRunId && checkpoint.runId === recovery.sourceRunId &&
+      checkpoint.contextSha256 === recovery.contextSha256 && previous.repo === repository && checkpoint.repo === repository &&
+      previous.mode === mode && previous.baseSha === baseSha && checkpoint.baseSha === baseSha && COMMIT.test(checkpoint.headSha),
+      'recovery candidate does not match the repository, mode and baseline');
+    requireThat(mode === 'new' || (previous.startSha === startSha && previous.reviewTarget.url === reviewTarget.url),
+      'PR changed since recovery candidate; start a fresh review');
+    commonRepository(previous);
+    cleanHead(previous, checkpoint.headSha, 'recovery source');
+    git(repository, ['merge-base', '--is-ancestor', baseSha, checkpoint.headSha]);
+    startSha = checkpoint.headSha;
+  }
   requireThat(mode !== 'review' || login, 'review mode requires the verified CLI login');
   roles(selected);
   // An empty launch-form plan delegates discovery to the authenticated preflight.
@@ -265,6 +283,8 @@ function prepare(args) {
   const manifest = { preset: 'development-review', version: 1, files: [{ path: 'tools.mjs', sha256: digest(self) }] };
   atomic(path.join(output, 'resources.json'), manifest);
   const context = { schemaVersion: 1, runId: checked.runId, mode, repo: repository, worktree, branch, targetBranch,
+    ...(object(recovery) && recovery.sourceRunId ? { recoveredFrom: { runId: recovery.sourceRunId, attemptId: recovery.sourceAttemptId,
+      candidateSha256: recovery.candidateSha256, journalSha256: recovery.journalSha256 } } : {}),
     baseSha, startSha, ...(reviewTarget ? { reviewTarget } : {}), login, requirement, requirementSha256: sha(Buffer.from(requirement)), roles: selected,
     validationCommands: commands, preflightSha256: digest(args.preflight), resourcesSha256: digest(path.join(output, 'resources.json')) };
   atomic(path.join(output, 'context.json'), context);

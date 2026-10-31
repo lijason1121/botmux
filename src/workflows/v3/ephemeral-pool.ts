@@ -17,7 +17,8 @@ import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
 import { getBot } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
-import { appendFile, mkdir } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
+import { BoundedLogFile } from '../../utils/bounded-log-file.js';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -227,6 +228,20 @@ async function runNodeImpl(
   let resolveOuterClose: (() => void) | undefined;
   let deferredWorkerError: Error | undefined;
   let forwardWorkerError: ((error: Error) => void) | undefined;
+  const logs = new Map<string, BoundedLogFile>();
+  const appendRaw = (path: string, text: string): void => {
+    let log = logs.get(path);
+    if (!log) {
+      log = new BoundedLogFile(path, { onLimit: kind => {
+        const error = new Error(`workflow output budget exceeded (${kind})`);
+        if (forwardWorkerError) forwardWorkerError(error);
+        else deferredWorkerError ??= error;
+      } });
+      logs.set(path, log);
+    }
+    log.write(text);
+  };
+  const appendLine = (path: string, line: string): void => appendRaw(path, line.endsWith('\n') ? line : `${line}\n`);
   const outerClose = new Promise<void>((resolve) => {
     resolveOuterClose = resolve;
     worker.on('close', () => {
@@ -237,6 +252,8 @@ async function runNodeImpl(
       // (and with it the CLI that read them) has actually exited — on every
       // outcome (ok / fail / timeout / cancelled / bind failure).
       try { removeSessionSkillRuntime(sessionId, workerDataDir); } catch { /* best effort */ }
+      // Close after all synchronous exit listeners append their final receipt.
+      queueMicrotask(() => { for (const log of logs.values()) log.end(); });
       resolve();
     });
   });
@@ -289,7 +306,7 @@ async function runNodeImpl(
     void resolveOuterClose;
   }
 
-  drainWorkerDiagnostics(worker, req);
+  drainWorkerDiagnostics(worker, req, appendRaw);
 
   // Real chat binding (when the run was born in chat) over synthetic ids: the
   // worker forwards chatId/chatType/rootMessageId/ownerOpenId into the CLI
@@ -522,9 +539,10 @@ async function runNodeImpl(
     function sendGoalIfReady(): void {
       if (!initSent || webPort === undefined || goalSent) return;
       if (controller && !controller.ds.cliReady) return;
+      // Claim before IPC: a throw cannot prove the child did not receive it.
+      goalSent = true;
       worker.send({ type: 'raw_input', content: buildGoalCommand(req), turnId: req.attemptId,
         ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), execution } } : {}) });
-      goalSent = true;
       startManifestWatch();
     }
 
@@ -622,7 +640,7 @@ async function runNodeImpl(
 
     forwardWorkerError = (err) => {
       if (cancelRequested) return;
-      finish('fail', 'worker-process-error');
+      finish('fail', 'worker-process-error', err.message);
     };
     if (deferredWorkerError) {
       const err = deferredWorkerError;
@@ -673,7 +691,10 @@ async function runNodeImpl(
         status,
         manifestPath,
         sessionInfo: sessionInfo(),
-        ...(failureDetail ? { failureDetail } : {}),
+        ...(failureDetail ? {
+          failureDetail, goalNotStarted: !goalSent,
+          ...(reason === 'timeout' ? { failureReason: 'timeout' as const } : {}),
+        } : {}),
         ...(runtime ? { runtime } : {}),
         ...(runtimeError ? { error: runtimeError } : {}),
       });
@@ -686,6 +707,10 @@ async function runNodeImpl(
       // ready-branch retry for scripted or partially-started workers, but never
       // send /goal until the CLI reports `prompt_ready`.
     }
+  }).then(async result => {
+    for (const log of logs.values()) log.end();
+    await Promise.all([...logs.values()].map(log => log.closed));
+    return result;
   });
 }
 
@@ -824,25 +849,11 @@ function manifestIsStable(
   };
 }
 
-function drainWorkerDiagnostics(worker: WorkerHandle, req: RunNodeRequest): void {
+function drainWorkerDiagnostics(worker: WorkerHandle, req: RunNodeRequest, appendRaw: (path: string, text: string) => void): void {
   worker.stdout?.on?.('data', (chunk: Buffer | string) => {
     void appendRaw(stdoutPath(req), String(chunk));
   });
   worker.stderr?.on?.('data', (chunk: Buffer | string) => {
     void appendRaw(stderrPath(req), String(chunk));
   });
-}
-
-async function appendLine(path: string, line: string): Promise<void> {
-  await appendRaw(path, line.endsWith('\n') ? line : `${line}\n`);
-}
-
-async function appendRaw(path: string, text: string): Promise<void> {
-  try {
-    await mkdir(dirname(path), { recursive: true });
-    await appendFile(path, text, 'utf-8');
-  } catch {
-    // Logging is best-effort; runtime state is driven by the returned status
-    // and manifest validation, not by diagnostic log writes.
-  }
 }

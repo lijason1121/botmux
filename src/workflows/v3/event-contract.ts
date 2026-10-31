@@ -146,6 +146,10 @@ export type V3Event =
       /** Stamped by a runtime executing goal nodes through bot sessions. */
       nodeExecutor?: 'bot';
     }
+  | { type: 'runRecovered'; sourceRunId: string; sourceAttemptId: string; sourceJournalSha256: string;
+      previousRoles: Record<string, string>; roles: Record<string, string> }
+  | { type: 'nodeInputsBound'; nodeId: string; attemptId: string; inputHash: string }
+  | { type: 'nodeCheckpointRestored'; nodeId: string; attemptId: string; previousAttemptId: string; inputHash: string; fileCount: number }
   | {
       type: 'nodeDispatched';
       nodeId: string;
@@ -367,6 +371,9 @@ export type V3Event =
       attemptId: string;
       manifestPath: string;
       runtime?: V3RuntimeAttestation;
+      /** Explicit schema-validated business verdict; process success alone is
+       * never a review approval. Historical events intentionally omit it. */
+      decision?: 'approve' | 'changes_requested' | 'blocked';
     }
   | {
       type: 'nodeFailed';
@@ -397,7 +404,7 @@ export type V3Event =
       instanceId?: string;
       previousAttemptId: string;
       nextAttemptId: string;
-      reason: 'blockedRetry';
+      reason: 'blockedRetry' | 'transientStartupRetry';
       previousErrorClass?: V3ErrorClass;
       previousErrorCode?: string;
       resetGate?: boolean;
