@@ -119,6 +119,8 @@ function assertBundleInputsAllowed(metafile) {
     'src/workflows/v3/gate-policy.ts',
     'src/workflows/v3/gate-context.ts',
     'src/workflows/v3/gate-wait-store.ts',
+    'src/workflows/v3/goal-failure.ts',    // pure failure classification
+    'src/workflows/v3/goal-checkpoint.ts', // Node fs/crypto + injected manifest validator
     'src/workflows/v3/host-bindings.ts',
     'src/workflows/v3/host-effect-ledger.ts',
     'src/workflows/v3/host-execution.ts',
