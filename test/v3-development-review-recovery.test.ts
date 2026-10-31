@@ -98,6 +98,14 @@ describe('authorized development role recovery', () => {
     });
   });
 
+  it('does not treat a recovery_source parameter as authority without the host fork record', async () => {
+    const f = await fixture(), run = await recoverDevelopmentReviewRun(f.input);
+    writeFileSync(join(run.runDir, 'journal.ndjson'), '');
+    const prepared = prepareRecovered(f, run);
+    expect(prepared.result.status).not.toBe(0);
+    expect(String(prepared.result.stderr)).toContain('authorized recovery record missing');
+  });
+
   it('rejects changed source history at actual preparation before creating a worktree', async () => {
     const f = await fixture(), run = await recoverDevelopmentReviewRun(f.input);
     appendEvent(f.journal, { type: 'runFailed', detail: 'source history changed' });
