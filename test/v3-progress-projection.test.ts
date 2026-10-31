@@ -121,6 +121,20 @@ function envelope(
 }
 
 describe('projectV3Progress', () => {
+  it('projects only explicit current-attempt decisions, never inferring approve from nodeSucceeded', () => {
+    const events: StoredEvent[] = [
+      at(1, { type: 'runStarted', runId: 'progress-run' }),
+      at(2, { type: 'nodeDispatched', nodeId: 'research', instanceId: 'research#001', attemptId: 'research#001/attempts/001' }),
+      at(3, { type: 'nodeSucceeded', nodeId: 'research', instanceId: 'research#001', attemptId: 'research#001/attempts/001', manifestPath: '/private/report', decision: 'changes_requested' }),
+      at(4, { type: 'nodeDispatched', nodeId: 'publish', instanceId: 'publish#001', attemptId: 'publish#001/attempts/001' }),
+      at(5, { type: 'nodeSucceeded', nodeId: 'publish', instanceId: 'publish#001', attemptId: 'publish#001/attempts/001', manifestPath: '/private/report' }),
+    ];
+    expect(projectV3Progress({ envelope: envelope(), dag: dag(), events }).reviews)
+      .toEqual([{ nodeId: 'research', decision: 'changes_requested' }]);
+    events.push(at(6, { type: 'nodeDispatched', nodeId: 'research', instanceId: 'research#002', attemptId: 'research#002/attempts/001' }));
+    expect(projectV3Progress({ envelope: envelope(), dag: dag(), events }).reviews).toBeUndefined();
+  });
+
   it('projects an authorized but not-yet-dispatched run as starting with a fixed outer total', () => {
     const view = projectV3Progress({
       envelope: envelope(),

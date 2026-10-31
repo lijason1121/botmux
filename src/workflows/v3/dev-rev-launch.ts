@@ -127,7 +127,7 @@ export async function bindDevRevLaunchCard(dataDir: string, id: string, cardMess
     request.cardMessageId = cardMessageId; save(dataDir, request);
   });
 }
-async function ensurePreset(dataDir: string, context: SavedWorkflowActorContext, selected: Record<string, string>) {
+export async function ensureDevelopmentReviewPreset(dataDir: string, context: SavedWorkflowActorContext, selected: Record<string, string>) {
   const lock = join(dataDir, '.dev-rev-author-' + createHash('sha256').update(canonicalJsonStringify([context.actor, context.chatId])).digest('hex'));
   return withFileLock(lock, async () => {
     const listed = await listVisibleSavedWorkflows({ dataDir, context });
@@ -198,7 +198,7 @@ export async function submitDevRevLaunch(input: {
       // Validate live membership before authoring a definition or publishing a run.
       const members = new Set((await deps.listChatBots(input.appId, ctx.chatId)).map(x => x.appId));
       if (Object.values(selected).some(appId => !members.has(appId!))) fail('所选机器人已离群或无法确认成员身份，请重新打开卡片。');
-      const saved = await ensurePreset(deps.dataDir, ctx, selected as Record<string, string>);
+      const saved = await ensureDevelopmentReviewPreset(deps.dataDir, ctx, selected as Record<string, string>);
       r.submitted = { repo: repo.value, mode: f.mode, requirement: f.requirement, targetBranch,
         developer: selected.developer!, correctness: selected.correctness!, regression: selected.regression!,
         workflowId: saved.metadata.workflowId, revisionId: saved.revision.revisionId };

@@ -62,7 +62,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
     resolvedRequirement: { type: 'string' }, validationCommands: { type: 'array' } }, required: ['state', 'repositoryAccess'] };
 
   const prepare = goal('prepare', bots.developer, [
-    '只在preflight READY后准备本次资源与隔离worktree。读取本轮preflight、参数数据：${params.mode}、${params.repo_path}、${params.requirement}、${params.target_branch}、${params.validation_commands}；不得复用历史任务的候选、SHA或审查。',
+    '只在preflight READY后准备本次资源与隔离worktree。读取本轮preflight、参数数据：${params.mode}、${params.repo_path}、${params.requirement}、${params.target_branch}、${params.validation_commands}、${params.recovery_source}。recovery_source为空时不复用历史候选；非空时仅由固定工具核验授权接替的候选，再建本run独立worktree。历史审查或发布批准不得沿用。',
     BOOTSTRAP, HASH_INSTRUCTION,
     '将以下宿主物化角色值用JSON.stringify正确编码到roles-input.json（显示名称中的引号也必须转义）：' + ROLE_CONTEXT,
     '从BOTMUX_GOAL_INPUTS_PATH找from=workflow,name=params的参数JSON路径；从显式preflight输入取得其路径。执行已安装Node/Bun tools.mjs prepare --preflight <该输入> --params <参数JSON> --roles <roles-input.json>，附固定hash参数。工具按模式真实解析基线（new为本地分支，review/continue为已fetch目标分支与PR head的merge-base）、检查命令argv、创建/恢复本run的干净专属worktree，并写context.json/resources.json/result.json。不得自行改写这些结果。',
@@ -82,16 +82,19 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   // single-turn budget; the bounded loop still caps the number of attempts.
   implement.timeoutSec = 14400;
 
-  const review = (role: 'correctness' | 'regression', id: string): V3Node => goal(id, bots[role], [
+  const review = (role: 'correctness' | 'regression', id: string): V3Node => ({ ...goal(id, bots[role], [
     '独立只读审查当前implement候选；只消费本轮implement产品和prepare context/resources，不读取对方报告、不沿previous gate反馈寻找另一审查者原文，不修改代码/环境或重复无关环境探索。证据不足输出blocked或changes_requested，绝不强迫approve。',
     '本角色=' + role + '；真实reviewerId=${roles.' + role + '.bot}（${roles.' + role + '.label} / ${roles.' + role + '.cliId}），必须与prepare context的本角色身份一致。',
     role === 'correctness' ? '重点核对需求满足、根因、接口/数据兼容与关键失败路径，引用具体文件/行为证据。' : '重点核对修前失败修后通过、旧路径、平台/CLI/会话相关回归面，以及验证命令和报告是否真实且覆盖合理。',
+    '阶段性发现和未验项按运行时检查点协议持续落盘。先核对同一repo/base/head、命令、依赖配置和日志摘要的统一validation记录，独立执行关键失败路径探针；仓库没有要求重复全量检查时不重复跑相同门禁。代码变化后检查增量并重新绑定当前候选，最终固定gate和仓库强制门禁保留。',
     'context.mode=review时审查baseSha..headSha即他人PR的全部改动，开发者不会修改代码，意见经gate后发为PR评论；验证失败也须作为finding。new/continue模式审查本run候选。',
     '任何未解决的意见都必须放入findings，包括nit/非阻塞建议，不能仅写在review.md或coverage里。有任意finding必须changes_requested，证据不足则blocked；只有本角色对当前候选确认无遗留问题且findings=[]才可approve，禁止approve with nits。独立核对change-summary中开发者对既有意见的逐项处置；建议成立则确认修复，不成立则依据事实撤回，不能要求盲改或把未修复项标成非阻塞后放行。',
-    'review.json必须包含schemaVersion:1,runId,repo,baseSha,headSha,round,role,reviewerId,decision(approve/changes_requested/blocked),findings(每项含blocking布尔及location/impact/evidence非空字符串),coverage和evidence均为非空字符串数组,candidateSha256,validationSha256,contextSha256；SHA/round取当前候选，三个文件摘要必须由实际输入字节计算且使用sha256:<64位小写hex>格式。写review.md。',
+    '审查结果result.json必须包含schemaVersion:1,runId,repo,baseSha,headSha,round,role,reviewerId,decision(approve/changes_requested/blocked),findings(每项含blocking布尔及location/impact/evidence非空字符串),coverage和evidence均为非空字符串数组,candidateSha256,validationSha256,contextSha256；SHA/round取当前候选，三个文件摘要必须由实际输入字节计算且使用sha256:<64位小写hex>格式。写review.md。',
     HASH_INSTRUCTION,
-    '用固定publish工具交付 --entry review json review.json --entry report markdown review.md。Manifest ok仅表示交付，不等于decision=approve。',
-  ].join('\n'), { review: output('review.json'), report: output('review.md', 'markdown') }, ['implement'], [ref('implement', 'candidate'), ref('implement', 'validation'), ref('implement', 'change-summary')]);
+    '用固定publish工具交付 --entry review json result.json --entry report markdown review.md。Manifest ok仅表示交付，不等于decision=approve。',
+  ].join('\n'), { review: output('result.json'), report: output('review.md', 'markdown') }, ['implement'], [ref('implement', 'candidate'), ref('implement', 'validation'), ref('implement', 'change-summary')]),
+    resultSchema: { type: 'object', properties: { decision: { type: 'string', enum: ['approve', 'changes_requested', 'blocked'] } }, required: ['decision'] },
+  });
 
   // The gate runs on an independent reviewer bot so the developer cannot author its own pass.
   const gate = goal('verify-review-gate', bots.regression, [
@@ -186,6 +189,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
       requirement: { type: 'string', required: true, description: 'The development requirement, or the PR link and review/continuation request.' },
       target_branch: { type: 'string', required: true, description: 'Local default branch used as the new-development base; PR modes use the fetched PR target instead.' },
       validation_commands: { type: 'array', required: true, description: 'Required checks: [{id,argv:[executable,...args],timeoutSec?}], executed without a shell. An empty array delegates discovery to preflight.' },
+      recovery_source: { type: 'object', default: {}, description: 'Owner-authorized candidate checkpoint from workflow recover; no approval or execution identity is inherited.' },
     },
     contextRefs: ['chatId', 'larkAppId', 'initiatorOpenId'],
     roles: {

@@ -326,6 +326,10 @@ export interface RunNodeResult {
   error?: { code: string; message: string };
   /** Process failure context used when no valid manifest was written. */
   failureDetail?: string;
+  /** True only when the pool proves no goal was sent. A failed IPC send is
+   * ambiguous and must set false. Never inferred from error wording. */
+  goalNotStarted?: boolean;
+  failureReason?: 'timeout';
 }
 
 export interface RuntimeAttestation {

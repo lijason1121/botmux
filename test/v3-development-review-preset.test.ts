@@ -78,7 +78,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -112,8 +112,11 @@ describe('authored development-review preset', () => {
     collectSavedWorkflowReusableTextWarnings(draft, 'draft', warnings);
     expect(warnings).toEqual([]);
     expect(draft.sourceRunId).toBeUndefined();
-    expect(Object.keys(draft.inputs).sort()).toEqual(['mode', 'repo_path', 'requirement', 'target_branch', 'validation_commands'].sort());
-    for (const input of Object.values(draft.inputs)) { expect(input.required).toBe(true); expect(input.default).toBeUndefined(); }
+    expect(Object.keys(draft.inputs).sort()).toEqual(['mode', 'recovery_source', 'repo_path', 'requirement', 'target_branch', 'validation_commands'].sort());
+    for (const [name, input] of Object.entries(draft.inputs)) {
+      if (name === 'recovery_source') expect(input.default).toEqual({});
+      else { expect(input.required).toBe(true); expect(input.default).toBeUndefined(); }
+    }
     expect(validateSavedWorkflowRevisionPayload({ ...draft, workflowId: 'wf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', humanVersion: 1,
       createdAt: '2026-01-01T00:00:00.000Z', createdBy: { openId: 'fixture-owner', larkAppId: 'cli_developer' } }).roles).toEqual(draft.roles);
     const loop = draft.dagTemplate.nodes.find(node => node.type === 'loop')!;
