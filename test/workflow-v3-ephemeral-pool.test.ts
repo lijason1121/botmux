@@ -183,6 +183,32 @@ describe('v3WorkerBackendType', () => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it('provides frozen role launch information before init without querying ordinary sessions', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    const reviewer = { ...req.botSnapshot, larkAppId: 'cli_reviewer', cliPathOverride: '/tools/reviewer',
+      cliConfigDir: '/profiles/reviewer', model: 'review-model', reasoningEffort: 'high' as const };
+    const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret-not-in-context' });
+    const running = pool.runNode({ ...req, frozenBotSnapshots: { developer: req.botSnapshot, reviewer } });
+    await worker.waitForInit();
+    try {
+      const path = join(req.attemptDir, 'runtime-context.json');
+      expect(existsSync(path)).toBe(true);
+      const context = JSON.parse(readFileSync(path, 'utf8'));
+      expect(context).toMatchObject({ schemaVersion: 1, runId: req.runId, attemptId: req.attemptId,
+        backendType: worker.init.backendType,
+        current: { larkAppId: worker.init.larkAppId, cliId: worker.init.cliId, model: null },
+        bots: { reviewer: { larkAppId: 'cli_reviewer', executable: '/tools/reviewer',
+          cliConfigDir: '/profiles/reviewer', model: 'review-model', reasoningEffort: 'high' } } });
+      expect(JSON.stringify(context)).not.toContain('secret-not-in-context');
+    } finally {
+      worker.emitExit(0);
+      await running;
+    }
+  });
+
   it('freezes only strict names, filters worker inheritance and resolves this bot env without persisting credentials', async () => {
     vi.stubEnv('UNLISTED_CLOUD_CREDENTIAL', 'host-sentinel');
     vi.stubEnv('HTTPS_PROXY', 'proxy-sentinel');

@@ -275,6 +275,9 @@ export interface RunNodeRequest {
   node: V3GoalNode;
   /** Frozen at run start; do NOT re-resolve the bot here. */
   botSnapshot: BotSnapshot;
+  /** Authorized role profiles, for local host introspection before peers start.
+   * Never re-resolve these from mutable bot configuration on retry. */
+  frozenBotSnapshots?: Readonly<Record<string, BotSnapshot>>;
   runDir: string;
   attemptDir: string;
   inputsPath: string;

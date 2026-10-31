@@ -10,7 +10,7 @@
 import { buildBotWorkerEnv } from '../../core/env-policy.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
 import { getBot } from '../../bot-registry.js';
-import { statSync } from 'node:fs';
+import { statSync, writeFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { BoundedLogFile } from '../../utils/bounded-log-file.js';
 import { dirname, join } from 'node:path';
@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import type { WorkerToDaemon } from '../../types.js';
 import type { BackendType } from '../../adapters/backend/types.js';
 import { config } from '../../config.js';
+import { rawCliExecutable } from '../../adapters/cli/registry.js';
 import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
@@ -35,6 +36,7 @@ import {
   type RunNodeRequest,
   type RunNodeResult,
   type WorkerSessionInfo,
+  type BotSnapshot,
 } from './contract.js';
 import { workflowSandboxInitFields } from '../shared/sandbox-policy.js';
 import { stripPm2GracefulExitMarker } from '../../pm2-graceful-exit.js';
@@ -182,6 +184,33 @@ async function runNodeImpl(
   }
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
+  const backendType = v3WorkerBackendType();
+  try {
+    // Ephemeral sessions have no daemon session row. Publish only launch facts
+    // already authorized for this run, instead of asking an agent to discover
+    // peers through ordinary-session IPC or to inspect the live bots config.
+    const describe = (snapshot: BotSnapshot) => ({
+      larkAppId: snapshot.larkAppId,
+      cliId: snapshot.cliId,
+      executable: rawCliExecutable(snapshot.cliId, snapshot.cliPathOverride) ?? null,
+      cliConfigDir: expandWorkflowWorkingDir(snapshot.cliConfigDir) ?? null,
+      codexHome: snapshot.cliInstanceBinding?.codexHome ?? null,
+      model: snapshot.model ?? null,
+      reasoningEffort: snapshot.reasoningEffort ?? null,
+      modelBackendVariant: snapshot.modelBackendVariant ?? null,
+      wrapperConfigured: !!snapshot.wrapperCli,
+      workingDir: expandWorkflowWorkingDir(snapshot.workingDir) ?? cwd,
+    });
+    writeFileSync(join(req.attemptDir, 'runtime-context.json'), `${JSON.stringify({
+      schemaVersion: 1, runId: req.runId, attemptId: req.attemptId, backendType,
+      current: describe(req.botSnapshot),
+      bots: Object.fromEntries(Object.entries(req.frozenBotSnapshots ?? { [req.botSnapshot.larkAppId]: req.botSnapshot })
+        .map(([selector, snapshot]) => [selector, describe(snapshot)])),
+    }, null, 2)}\n`, { mode: 0o600 });
+  } catch (error) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
+    throw error;
+  }
   const sessionId = syntheticSessionUuid(`v3-${req.runId}-${req.attemptId}`);
   const workerEnv: Record<string, string | undefined> = {
     // v3 ephemeral workers fork straight from the daemon here (not via
@@ -340,7 +369,7 @@ async function runNodeImpl(
     ...workflowSandboxInitFields(req.botSnapshot),
     // Local terminal backend only: tmux when the daemon runs tmux, otherwise
     // PTY (see v3WorkerBackendType for why it is never the daemon backend as-is).
-    backendType: v3WorkerBackendType(),
+    backendType,
     prompt: '',
     resume: false,
     larkAppId: req.botSnapshot.larkAppId,
