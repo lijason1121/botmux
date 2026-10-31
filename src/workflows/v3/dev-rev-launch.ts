@@ -9,7 +9,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { createDevelopmentReviewPreset } from './presets/development-review.js';
 import { upgradeDevelopmentReviewPreset } from './presets/development-review-upgrade.js';
-import { canonicalJsonStringify, type SavedWorkflowRevisionPayload } from './library-schema.js';
+import { canonicalJsonStringify, type SavedWorkflowRevisionDraft } from './library-schema.js';
 import { coerceWorkflowParams } from '../shared/params.js';
 import { appendSavedWorkflowRevision, createSavedWorkflow } from './library-store.js';
 import { instantiatePublishedSavedWorkflow, listVisibleSavedWorkflows, loadVisibleSavedWorkflow,
@@ -225,7 +225,7 @@ export async function submitDevRevLaunch(input: {
     }
     // Recover the publish -> journal-intent crash window using exactly this run.
     const loaded = loadAuthorizedV3Run(runDir);
-    const definition = (loaded.definitionSnapshot as { definition: SavedWorkflowRevisionPayload }).definition;
+    const definition = (loaded.definitionSnapshot as { definition: Pick<SavedWorkflowRevisionDraft, 'inputs'> }).definition;
     const expectedParams = coerceWorkflowParams({ params: definition.inputs }, rawParams);
     if (loaded.envelope.source.kind !== 'saved_definition' || loaded.envelope.source.workflowId !== s.workflowId ||
       loaded.envelope.source.revisionId !== s.revisionId ||
