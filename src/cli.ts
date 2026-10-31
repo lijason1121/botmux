@@ -17248,10 +17248,7 @@ async function cmdReport(rest: string[]): Promise<void> {
       });
       return;
     }
-    if (triggerBody?.resultArchive) {
-      console.error(JSON.stringify({ resultArchived: true, resultArchive: triggerBody.resultArchive,
-        notice: '回报正文已独立落盘；投递失败不影响保存。后续重新投递仍须使用当前会话授权。' }));
-    }
+    const archiveFields = triggerBody?.resultArchive ? { resultArchive: triggerBody.resultArchive } : {};
     const relayFallback = reportDelivery === 'relay'
       && triggerBody?.relayFallback && typeof triggerBody.relayFallback === 'object'
       ? triggerBody.relayFallback : undefined;
@@ -17273,7 +17270,7 @@ async function cmdReport(rest: string[]): Promise<void> {
           ? { ...relayFallback, published: false, publicationError: 'report_publication_unknown' }
           : relayFallback);
         console.error(JSON.stringify({ success: false, error: triggerBody.error ?? `HTTP ${response.status}`,
-          notice, relayFailure,
+          notice, relayFailure, ...archiveFields,
           ...(relayFallback.publicationError ? { publicationError: relayFallback.publicationError } : {}),
           ...(relayFallback.blockedBy ? { publicationBlockedBy: relayFallback.blockedBy } : {}),
           ...(relayFallback.publishedMessageId ? { publishedMessageId: relayFallback.publishedMessageId } : {}),
@@ -17291,7 +17288,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         dispatchRootId: dispatchRootCandidate,
       });
       console.log(JSON.stringify({
-        success: true,
+        success: true, ...archiveFields,
         delivery: 'lark-message',
         reportedTo: triggerBody.publishedMessageId,
         viaRegistry: relayFallback.reason !== 'dispatch_target_gone',
@@ -17308,7 +17305,7 @@ async function cmdReport(rest: string[]): Promise<void> {
       }));
       return;
     } else if (!response.ok || triggerBody?.ok !== true) {
-      console.error(JSON.stringify({ success: false, error: triggerBody?.error ?? `HTTP ${response.status}`,
+      console.error(JSON.stringify({ success: false, error: triggerBody?.error ?? `HTTP ${response.status}`, ...archiveFields,
         ...(triggerBody?.publishedMessageId ? { publishedMessageId: triggerBody.publishedMessageId } : {}),
         ...(triggerBody?.deliveryKey ? { deliveryKey: triggerBody.deliveryKey } : {}),
       }));
@@ -17346,7 +17343,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         dispatchRootId: dispatchRootCandidate,
       });
       console.log(JSON.stringify({
-        success: true,
+        success: true, ...archiveFields,
         delivery: reportDelivery === 'publish' ? 'lark-message' : 'orchestrator-session',
         reportedTo: reportDelivery === 'publish' ? triggerBody.publishedMessageId : target?.sessionId,
         viaRegistry: true,

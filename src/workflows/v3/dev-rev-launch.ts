@@ -9,7 +9,8 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { createDevelopmentReviewPreset } from './presets/development-review.js';
 import { upgradeDevelopmentReviewPreset } from './presets/development-review-upgrade.js';
-import { canonicalJsonStringify } from './library-schema.js';
+import { canonicalJsonStringify, type SavedWorkflowRevisionPayload } from './library-schema.js';
+import { coerceWorkflowParams } from '../shared/params.js';
 import { appendSavedWorkflowRevision, createSavedWorkflow } from './library-store.js';
 import { instantiatePublishedSavedWorkflow, listVisibleSavedWorkflows, loadVisibleSavedWorkflow,
   requireActorContext, type SavedWorkflowActorContext } from './library-service.js';
@@ -224,14 +225,15 @@ export async function submitDevRevLaunch(input: {
     }
     // Recover the publish -> journal-intent crash window using exactly this run.
     const loaded = loadAuthorizedV3Run(runDir);
+    const definition = (loaded.definitionSnapshot as { definition: SavedWorkflowRevisionPayload }).definition;
+    const expectedParams = coerceWorkflowParams({ params: definition.inputs }, rawParams);
     if (loaded.envelope.source.kind !== 'saved_definition' || loaded.envelope.source.workflowId !== s.workflowId ||
       loaded.envelope.source.revisionId !== s.revisionId ||
       loaded.envelope.chatBinding?.ownerOpenId !== ctx.actor.openId ||
       loaded.envelope.chatBinding?.larkAppId !== ctx.actor.larkAppId ||
       loaded.envelope.chatBinding?.chatId !== ctx.chatId ||
       loaded.envelope.chatBinding?.rootMessageId !== ctx.rootMessageId ||
-      canonicalJsonStringify((loaded.resolvedParams as { params?: unknown })?.params) !== canonicalJsonStringify(
-        Object.fromEntries(Object.entries(rawParams).map(([key, val]) => [key, val.value]))) ||
+      canonicalJsonStringify((loaded.resolvedParams as { params?: unknown })?.params) !== canonicalJsonStringify(expectedParams) ||
       DEV_REV_ROLES.some(role => (loaded.resolvedRoles as Record<string, { bot: string }>)?.[role]?.bot !== s[role])) {
       fail('启动记录与已物化流程不一致，已停止启动。');
     }
