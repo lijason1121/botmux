@@ -57,7 +57,8 @@ export async function recoverDevelopmentReviewRun(input: {
   requireThat(Object.keys(input.roleSelections ?? {}).every(role => DEV_REV_ROLES.some(expected => role === expected)), 'unknown recovery role');
   const selected = Object.fromEntries(DEV_REV_ROLES.map(role => [role,
     resolveBotConfig(input.roleSelections?.[role] ?? roles[role]!.bot, input.bots).larkAppId]));
-  requireThat(new Set(Object.values(selected)).size === 3, 'developer and reviewers must remain independent');
+  requireThat(selected.developer !== selected.correctness && selected.developer !== selected.regression,
+    'developer and reviewers must remain independent');
 
   const success = (node: string | RegExp) => [...events].reverse().find(e => e.type === 'nodeSucceeded'
     && (typeof node === 'string' ? e.nodeId === node : node.test(e.nodeId)));
