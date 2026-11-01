@@ -824,8 +824,10 @@ export function materializeSavedWorkflowRun(
   const roles = validateSavedWorkflowRoles(input.revision.payload.roles, input.revision.payload.dagTemplate.nodes);
   const resolvedRoles = resolveSavedWorkflowRoles(roles, input.roleSelections, input.bots);
   const execution = input.revision.payload.execution;
-  if (execution?.distinctRoles) {
-    const selected = execution.distinctRoles.map(name => resolvedRoles[name]?.bot);
+  // Keep legacy all-distinct policies intact; each additional group is also
+  // enforced, so sharing unconstrained roles cannot bypass another constraint.
+  for (const group of [...(execution?.distinctRoles ? [execution.distinctRoles] : []), ...(execution?.distinctRoleGroups ?? [])]) {
+    const selected = group.map(name => resolvedRoles[name]?.bot);
     if (selected.some(bot => !bot) || new Set(selected).size !== selected.length) {
       throw new Error('Workflow execution requires distinct bots for independent roles');
     }

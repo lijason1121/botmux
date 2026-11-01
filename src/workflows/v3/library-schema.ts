@@ -179,7 +179,7 @@ export interface SavedWorkflowRevisionPayloadV1 {
   inputs: Record<string, SavedWorkflowParamDef>;
   roles?: SavedWorkflowRoles;
   /** Optional per-run workspace and independent-role constraints. */
-  execution?: { workingDirectoryParam?: string; distinctRoles?: string[] };
+  execution?: { workingDirectoryParam?: string; distinctRoles?: string[]; distinctRoleGroups?: string[][] };
   contextRefs: SavedWorkflowBuiltinContextRef[];
   specTemplate: V3SpecTemplate;
   /** DAG is execution truth; this flag makes documentation drift explicit. */
@@ -1030,8 +1030,8 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
   let execution: SavedWorkflowRevisionPayloadV1['execution'];
   if (raw.execution !== undefined) {
     if (!isRecord(raw.execution) || Object.keys(raw.execution).length === 0 ||
-        Object.keys(raw.execution).some(key => !['workingDirectoryParam', 'distinctRoles'].includes(key))) {
-      problems.push('execution must contain only workingDirectoryParam and/or distinctRoles');
+        Object.keys(raw.execution).some(key => !['workingDirectoryParam', 'distinctRoles', 'distinctRoleGroups'].includes(key))) {
+      problems.push('execution must contain only workingDirectoryParam, distinctRoles and/or distinctRoleGroups');
     } else {
       execution = {};
       const param = raw.execution.workingDirectoryParam;
@@ -1048,6 +1048,14 @@ export function validateSavedWorkflowRevisionPayload(raw: unknown): SavedWorkflo
               typeof name !== 'string' || !roles || !Object.hasOwn(roles, name))) {
           problems.push('execution.distinctRoles must name at least two distinct declared roles');
         } else execution.distinctRoles = [...distinct] as string[];
+      }
+      const groups = raw.execution.distinctRoleGroups;
+      if (groups !== undefined) {
+        if (!Array.isArray(groups) || groups.length < 1 || groups.length > 64 || groups.some(group =>
+          !Array.isArray(group) || group.length < 2 || group.length > 64 || new Set(group).size !== group.length ||
+          group.some(name => typeof name !== 'string' || !roles || !Object.hasOwn(roles, name)))) {
+          problems.push('execution.distinctRoleGroups must contain nonempty groups of at least two distinct declared roles');
+        } else execution.distinctRoleGroups = groups.map(group => [...group]) as string[][];
       }
     }
   }

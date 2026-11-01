@@ -16,7 +16,7 @@ import { spawnSyncTsScript } from './helpers/ts-runner.js';
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const sha = (path: string) => 'sha256:' + createHash('sha256').update(readFileSync(path)).digest('hex');
-async function fixture() {
+async function fixture(sharedReviewer = false) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'dev-review-recovery-'))); dirs.push(root);
   const repo = join(root, 'repo'), worktree = join(root, 'task'), baseDir = join(root, 'runs'); mkdirSync(repo);
   const env = { ...process.env, GIT_CONFIG_GLOBAL: join(root, 'empty.gitconfig'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '0',
@@ -29,8 +29,8 @@ async function fixture() {
   writeFileSync(join(worktree, 'value'), 'after'); git(worktree, 'add', 'value'); git(worktree, 'commit', '-qm', 'candidate');
   const headSha = git(worktree, 'rev-parse', 'HEAD');
   const context = { actor: { larkAppId: 'cli_dev', openId: 'ou_owner' }, chatId: 'oc_task', rootMessageId: 'om_task' };
-  const selected = { developer: 'cli_dev', correctness: 'cli_check', regression: 'cli_regress' };
-  const bots = [...Object.values(selected), 'cli_replacement'].map(larkAppId => ({ larkAppId, cliId: 'codex', workingDir: repo })) as BotConfig[];
+  const selected = { developer: 'cli_dev', correctness: 'cli_check', regression: sharedReviewer ? 'cli_check' : 'cli_regress' };
+  const bots = [...new Set([...Object.values(selected), 'cli_replacement'])].map(larkAppId => ({ larkAppId, cliId: 'codex', workingDir: repo })) as BotConfig[];
   const saved = await createPresetSavedWorkflow({ dataDir: root, context, presetId: 'development-review', bots, roleSelections: selected });
   const run = await instantiatePublishedSavedWorkflow({ dataDir: root, context, ref: saved.metadata.workflowId, bots, baseDir, runId: 'parent',
     rawParams: { mode: { kind: 'string', value: 'new' }, repo_path: { kind: 'string', value: repo }, requirement: { kind: 'string', value: 'Task' },
@@ -73,6 +73,17 @@ function prepareRecovered(f: Awaited<ReturnType<typeof fixture>>, run: Awaited<R
 }
 
 describe('authorized development role recovery', () => {
+  it.each([false, true])('recovers with one bot in both review roles without changing the source history; already shared: %s', async shared => {
+    const f = await fixture(shared), before = readFileSync(f.journal, 'utf8');
+    const recovered = await recoverDevelopmentReviewRun({ ...f.input,
+      roleSelections: { ...f.input.roleSelections, regression: 'cli_check' } });
+    expect(recovered.resolvedRoles?.correctness.bot).toBe('cli_check');
+    expect(recovered.resolvedRoles?.regression.bot).toBe('cli_check');
+    expect(readFileSync(f.journal, 'utf8')).toBe(before);
+    const prepared = prepareRecovered(f, recovered);
+    expect(prepared.result.status, String(prepared.result.stderr)).toBe(0);
+  });
+
   it('creates a new run with a digest-bound candidate and new independent roles, without changing old failure or approval history', async () => {
     const f = await fixture(), before = readFileSync(f.journal, 'utf8'), envelope = readFileSync(join(f.run.runDir, 'run.json'));
     const recovered = await recoverDevelopmentReviewRun(f.input);

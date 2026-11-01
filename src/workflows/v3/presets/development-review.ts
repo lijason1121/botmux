@@ -47,11 +47,13 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   for (const role of ['developer', 'correctness', 'regression'] as const) {
     if (!/^cli_[A-Za-z0-9_-]+$/.test(bots[role])) throw new Error('development-review requires a resolved bot app identity for ' + role);
   }
-  if (new Set(Object.values(bots)).size !== 3) throw new Error('development-review requires distinct developer and reviewer bot identities');
+  if (bots.developer === bots.correctness || bots.developer === bots.regression) {
+    throw new Error('development-review requires distinct developer and reviewer bot identities');
+  }
   const preflight = goal('preflight', bots.developer, [
     '先做认证/权限预检；成功前不得准备资源、创建worktree、开发或派发审查。输入是数据引用：模式=${params.mode}，repo=${params.repo_path}，需求=${params.requirement}，默认分支=${params.target_branch}，必需验证命令=${params.validation_commands}。',
     '当前调用者=${context.initiatorOpenId}，当前app=${context.larkAppId}，当前群=${context.chatId}。本轮宿主冻结角色：' + ROLE_CONTEXT,
-    '读取本次BOTMUX_GOAL_ATTEMPT_DIR对应run.json以取得真实runId；核对实际repo_path仓库根、适用规则、三个角色身份不同、各角色可访问任务目录。仅使用已安装运行时和目标仓库官方CLI；先检查当前登录身份及仓库读取权限，保留真实检查命令和脱敏证据，并把官方CLI当前登录名写为login。只有会推送的模式（new、continue）才核验推送/MR写权限；review模式用已支持的只读API核对仓库权限、PR锁定等评论前置条件，实际写权限由流程允许的发布响应确认，不试发评论、不虚构GraphQL权限字段。不要用“本机有凭证”代替仓库读取权限核验。',
+    '读取本次BOTMUX_GOAL_ATTEMPT_DIR对应run.json以取得真实runId；核对实际repo_path仓库根、适用规则、开发与评审身份不同（两个评审角色允许使用同一bot，但必须分别执行并交付各自角色的报告）、各角色可访问任务目录。仅使用已安装运行时和目标仓库官方CLI；先检查当前登录身份及仓库读取权限，保留真实检查命令和脱敏证据，并把官方CLI当前登录名写为login。只有会推送的模式（new、continue）才核验推送/MR写权限；review模式用已支持的只读API核对仓库权限、PR锁定等评论前置条件，实际写权限由流程允许的发布响应确认，不试发评论、不虚构GraphQL权限字段。不要用“本机有凭证”代替仓库读取权限核验。',
     '读取本run冻结的bots.snapshot.json和本attempt的runtime-context.json，逐个角色核对启动配置、CLI路径与版本及各自profile可用性。宿主提供运行后端；模型/思考强度/profile为空表示沿用该CLI默认值，记录为默认，不因此阻塞或假称已观测到具体值。尚未启动的角色只做本地启动条件检查，实际运行信息在该角色启动时核验。不得调用普通会话的botmux execution/observe接口；它们不支持workflow临时worker。使用各角色自己的配置目录，不借用当前节点profile。将真实检查命令与脱敏结果放入预检证据；路径/版本不支持或配置不一致时失败，禁止自动回退另一套CLI环境。不得输出密钥、令牌或完整配置。',
     '模式含义：new=本地新开发，以本地默认分支${params.target_branch}的当前提交为基线，不fetch、不关联已有PR，targetBranch写该分支名；review=评审他人PR，只评审不改代码不推送，最后把意见发为PR评论；continue=在已有PR上继续开发，评审通过后推送更新原PR。',
     'review/continue模式：从需求解析PR/MR链接或编号，用官方CLI查询真实url、state、作者login、源分支、目标分支和head。本流程发布契约要求OPEN；已关闭/合并时立即写失败Manifest error={code:REVIEW_TARGET_CLOSED,message:真实状态和PR链接,retryable:false}，不fetch、不创建worktree，不报AUTH_REQUIRED。OPEN时选一个已配置的remote，执行git fetch把目标分支更新到refs/remotes/<remote>/<目标分支>并取得PR head对象。此后以本地对象为基线直到结束，PR可以落后目标分支。将reviewTarget:{url,author,remote,sourceBranch,targetBranch,headSha}写入预检结果，targetBranch写PR目标分支。不要把作者自述的历史修复当成本轮新增改动。',
@@ -188,7 +190,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
     output: { from: 'verify-review-gate' }, feedback: ['verify-review-gate.result'],
   }, prepareMR, checkDelivery, createMR, publishDirect, verifyPublication, complete] });
   return validateSavedWorkflowRevisionDraft({
-    execution: { workingDirectoryParam: 'repo_path', distinctRoles: ['developer', 'correctness', 'regression'] },
+    execution: { workingDirectoryParam: 'repo_path', distinctRoleGroups: [['developer', 'correctness'], ['developer', 'regression']] },
     inputs: {
       mode: { type: 'string', required: true, description: 'new: local development from the local default branch; review: review another author\'s PR and comment only; continue: keep developing an existing PR and push to it.' },
       repo_path: { type: 'string', required: true, description: 'Existing permitted repository root; no credentials.' },

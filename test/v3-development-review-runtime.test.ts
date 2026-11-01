@@ -24,7 +24,7 @@ const validateManifest: ValidateManifest = async (path, outputDir) => {
   catch (error) { return { ok: false, problems: [String(error)] }; }
 };
 
-async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direct') {
+async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direct', sharedReviewer = false) {
   const context = { actor: { larkAppId: 'cli_dev', openId: 'ou_owner' }, chatId: 'oc_fixture' };
   const bots = [
     { larkAppId: 'cli_dev', cliId: 'codex', workingDir: root },
@@ -36,16 +36,17 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direc
     roleSelections: { developer: 'cli_dev', correctness: 'cli_check', regression: 'cli_regress' } });
   const baseDir = join(root, 'runs');
   const run = await instantiatePublishedSavedWorkflow({ dataDir: root, context, ref: saved.metadata.workflowId,
-    bots, baseDir, runId: `fixture-${mode}`, roleSelections: { correctness: 'cli_alternate' },
+    bots, baseDir, runId: `fixture-${mode}`, roleSelections: { correctness: 'cli_alternate',
+      ...(sharedReviewer ? { regression: 'cli_alternate' } : {}) },
     rawParams: { mode: { kind: 'string', value: 'new' }, repo_path: { kind: 'string', value: root }, requirement: { kind: 'string', value: 'Fixture task' },
       target_branch: { kind: 'string', value: 'main' },
       validation_commands: { kind: 'json', value: [{ id: 'fixture', argv: ['node', '--version'] }] } } });
   const loop = run.dag.nodes.find(isLoopNode)!;
   const gatedNode = run.dag.nodes.find(node => node.humanGate)!;
-  const calls: Array<{ id: string; bot: string; inputs: GoalInputs }> = [];
+  const calls: Array<{ id: string; bot: string; inputs: GoalInputs; attemptDir: string }> = [];
   const runNode: RunNode = async req => {
     const inputs = JSON.parse(readFileSync(req.inputsPath, 'utf8')) as GoalInputs;
-    calls.push({ id: req.node.id, bot: req.botSnapshot.larkAppId, inputs });
+    calls.push({ id: req.node.id, bot: req.botSnapshot.larkAppId, inputs, attemptDir: req.attemptDir });
     const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH]!;
     if (mode === 'auth' && calls.length === 1) {
       writeFileSync(manifestPath, JSON.stringify({ schemaVersion: 1, status: 'fail', summary: 'Authentication required',
@@ -89,6 +90,24 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direc
 }
 
 describe('created development-review preset on the production runtime', () => {
+  it('executes both review nodes separately when the same bot fills both roles', async () => {
+    const { run, calls, outcome, events } = await fixture('unchanged', true);
+    expect(outcome).toMatchObject({ runStatus: 'succeeded' });
+    const reviews = calls.filter(call => call.id.includes('.review-'));
+    expect(reviews).toHaveLength(2);
+    expect(reviews.every(call => call.bot === 'cli_alternate')).toBe(true);
+    expect(new Set(reviews.map(call => call.attemptDir)).size).toBe(2);
+    const gate = calls.find(call => call.id.endsWith('.verify-review-gate'))!;
+    for (const review of reviews) {
+      expect(events.some(event => event.type === 'nodeSucceeded' && event.nodeId === review.id)).toBe(true);
+      expect(gate.inputs.inputs.some(input => input.path.startsWith(review.attemptDir))).toBe(true);
+    }
+    const saved = compileSavedWorkflowFromRun(run.runDir).revision;
+    expect(saved.roles?.correctness.defaultBot).toBe('cli_alternate');
+    expect(saved.roles?.regression.defaultBot).toBe('cli_alternate');
+    expect(saved.execution).toEqual(JSON.parse(readFileSync(join(run.runDir, 'definition.snapshot.json'), 'utf8')).definition.execution);
+  });
+
   it('repairs after a rejection and suspends before any PR creation', async () => {
     const { run, loop, calls, events, outcome, gatedNode } = await fixture('repair');
     expect(outcome.reason).toBe('awaitingGate');
@@ -152,7 +171,7 @@ describe('created development-review preset on the production runtime', () => {
     expect(calls.filter(call => !call.id.startsWith(`${loop.id}.`)).map(call => call.id)).toEqual(['preflight', 'prepare']);
     const resaved = compileSavedWorkflowFromRun(run.runDir, { allowDraft: true });
     expect(resaved.revision.execution).toEqual({ workingDirectoryParam: 'repo_path',
-      distinctRoles: ['developer', 'correctness', 'regression'] });
+      distinctRoleGroups: [['developer', 'correctness'], ['developer', 'regression']] });
     expect(resaved.revision.inputs.repo_path?.default).toBeUndefined();
   });
 

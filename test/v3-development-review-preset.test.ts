@@ -20,7 +20,7 @@ const sha = (path: string) => 'sha256:' + createHash('sha256').update(readFileSy
 const json = (path: string) => JSON.parse(readFileSync(path, 'utf8'));
 const write = (path: string, value: unknown) => writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
 
-function fixture(objectFormat = 'sha1') {
+function fixture(objectFormat = 'sha1', selected = BOTS) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'dev-review-preset-'))); roots.push(root);
   const repo = join(root, 'repo'), runId = 'fixture-run', run = join(root, runId);
   mkdirSync(repo); mkdirSync(run);
@@ -41,7 +41,7 @@ function fixture(objectFormat = 'sha1') {
     validation_commands: [{ id: 'behavior', argv: [process.execPath, '-e', 'process.stdout.write("verified")'], timeoutSec: 10 }] } });
   write(preflight, { schemaVersion: 1, state: 'READY', repositoryAccess: true, identity: 'fixture-user', runId,
     repoPath: repo, targetBranch: 'main', worktreePath: worktree, worktreeAllowed: true, branch: 'workflow/' + runId });
-  write(roles, Object.fromEntries(Object.entries(BOTS).map(([role, bot]) => [role, { bot, label: role, cliId: 'codex' }])));
+  write(roles, Object.fromEntries(Object.entries(selected).map(([role, bot]) => [role, { bot, label: role, cliId: 'codex' }])));
   const tool = (mode: string, args: string[], output: string) => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawnTsScript(script, [mode, '--expected-tools-sha', DEVELOPMENT_REVIEW_RESOURCES[0]!.sha256, ...args], {
       env: { ...env, BOTMUX_GOAL_OUTPUT_DIR: output, BOTMUX_GOAL_ATTEMPT_DIR: dirname(output), BOTMUX_GOAL_MANIFEST_PATH: join(dirname(output), 'manifest.json') },
@@ -55,8 +55,8 @@ function fixture(objectFormat = 'sha1') {
     prepare: () => tool('prepare', ['--preflight', preflight, '--params', params, '--roles', roles], prepared) };
 }
 
-async function evidenceFixture(objectFormat = 'sha1', round = 1) {
-  const f = fixture(objectFormat);
+async function evidenceFixture(objectFormat = 'sha1', round = 1, selected = BOTS) {
+  const f = fixture(objectFormat, selected);
   expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
   const context = join(f.prepared, 'context.json'), resources = join(f.prepared, 'resources.json'), ctx = json(context);
   writeFileSync(join(f.worktree, 'value.txt'), 'after\n'); f.git(f.worktree, 'add', 'value.txt'); f.git(f.worktree, 'commit', '-qm', 'fixture candidate');
@@ -66,7 +66,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
   const summary = join(implemented, 'change-summary.md'); writeFileSync(summary, 'Changed value.txt; behavior check passed.\n');
   const correctness = join(f.root, 'correctness.json'), regression = join(f.root, 'regression.json');
   for (const [role, filename] of [['correctness', correctness], ['regression', regression]]) {
-    write(filename!, { ...json(candidate), role, reviewerId: BOTS[role as keyof typeof BOTS], decision: 'approve', findings: [],
+    write(filename!, { ...json(candidate), role, reviewerId: selected[role as keyof typeof BOTS], decision: 'approve', findings: [],
       coverage: ['private-review-evidence-canary'], evidence: ['Examined the actual candidate'],
       candidateSha256: sha(candidate), validationSha256: sha(validation), contextSha256: sha(context) });
   }
@@ -78,7 +78,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -144,11 +144,21 @@ describe('authored development-review preset', () => {
 
   it('refuses unresolved or non-independent default identities', () => {
     expect(() => createDevelopmentReviewPreset({ ...BOTS, developer: 'A display name' })).toThrow(/resolved bot app/);
-    expect(() => createDevelopmentReviewPreset({ ...BOTS, regression: BOTS.correctness })).toThrow(/distinct/);
+    expect(() => createDevelopmentReviewPreset({ ...BOTS, correctness: BOTS.developer })).toThrow(/distinct/);
+    expect(() => createDevelopmentReviewPreset({ ...BOTS, regression: BOTS.developer })).toThrow(/distinct/);
   });
 });
 
 describe('fixed development-review executable resources', () => {
+  it('accepts two role-specific reports from one reviewer but rejects reusing one report for both roles', async () => {
+    const f = await evidenceFixture('sha1', 1, { ...BOTS, regression: BOTS.correctness });
+    expect(await f.gate()).toMatchObject({ code: 0 });
+    expect(json(f.result).passed).toBe(true);
+    write(f.regression, json(f.correctness));
+    await f.gate();
+    expect(json(f.result).passed).toBe(false);
+  });
+
   it.each(['correctness', 'regression'] as const)('rejects an approve carrying a %s nit and returns actionable feedback', async role => {
     const f = await evidenceFixture();
     const finding = { blocking: false, location: 'value.txt:1', impact: 'An unnecessary duplicate remains', evidence: 'The same value is assigned twice' };

@@ -45,7 +45,7 @@ export function buildDevRevLaunchCard(request: DevRevLaunch, feedback?: { messag
     body: { elements: [
       ...(feedback ? [{ tag: 'markdown', content: feedback.message }] : []),
       ...(submitted ? [{ tag: 'markdown', content: `请求已提交，重试将恢复同一任务：\`${request.runId}\`。` }] : []),
-      { tag: 'markdown', content: '选择仓库、模式与三个不同的机器人，填写需求后启动。新开发以本地默认分支为基线；已有 PR 先 fetch 再以本地为基线。任务在独立 worktree 中进行。' },
+      { tag: 'markdown', content: '选择仓库、模式及开发与评审机器人，填写需求后启动。两个评审角色可选同一个机器人，开发需使用另一机器人。新开发以本地默认分支为基线；已有 PR 先 fetch 再以本地为基线。任务在独立 worktree 中进行。' },
       { tag: 'form', name: 'dev_rev_launch', elements: [
         { tag: 'markdown', content: '**仓库**' },
         select('repo', '选择仓库', request.repos),

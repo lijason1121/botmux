@@ -175,7 +175,7 @@ function roles(value) {
     requireThat(object(role) && /^cli_[A-Za-z0-9_-]+$/.test(role.bot) && typeof role.cliId === 'string' && role.cliId && typeof role.label === 'string' && role.label, 'invalid role identity: ' + name);
     return role.bot;
   });
-  requireThat(new Set(selected).size === selected.length, 'development and independent reviewers require distinct bot identities');
+  requireThat(selected[0] !== selected[1] && selected[0] !== selected[2], 'development and review require distinct bot identities');
 }
 function same(subject, expected, fields, label) {
   for (const field of fields) requireThat(subject[field] === expected[field], label + ' mismatch: ' + field);
@@ -389,7 +389,7 @@ function gate(args) {
       try {
         version(review, role + ' review');
         same(review, candidate, ['runId', 'repo', 'baseSha', 'headSha', 'round'], role + ' review');
-        requireThat(review.role === role && review.reviewerId === context.roles[role].bot, 'wrong/duplicate reviewer identity');
+        requireThat(review.role === role && review.reviewerId === context.roles[role].bot, 'wrong review role or reviewer identity');
         requireThat(review.candidateSha256 === digest(args.candidate) && review.validationSha256 === digest(args.validation) && review.contextSha256 === digest(args.context), 'review input provenance mismatch');
         requireThat([review.coverage, review.evidence].every(items => Array.isArray(items) && items.length && items.every(item => typeof item === 'string' && item.trim())), 'review lacks nonempty string evidence/coverage');
         requireThat(Array.isArray(review.findings) && review.findings.every(finding => object(finding) && typeof finding.blocking === 'boolean' &&

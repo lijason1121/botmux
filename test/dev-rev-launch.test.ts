@@ -56,15 +56,33 @@ beforeEach(() => {
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe('dev-rev interactive launcher', () => {
-  it('upgrades an owned original definition on the next launch without overwriting the old revision', async () => {
+  it('starts with two configured bots and preserves both review roles on the same bot across a retry', async () => {
+    const request = await bound({ bots: bots.slice(0, 2).map(bot => ({ appId: bot.larkAppId, label: bot.name! })) });
+    deps.persistStartIntent = vi.fn().mockImplementationOnce(() => { throw new Error('intent write unavailable'); });
+    const shared = { ...form, regression: form.correctness };
+    await expect(click(request, { form: shared })).rejects.toThrow('intent write unavailable');
+    const reloaded = readDevRevLaunch(dataDir, request.id);
+    const fields = JSON.parse(buildDevRevLaunchCard(reloaded)).body.elements.find((x: any) => x.tag === 'form').elements;
+    expect(fields.find((x: any) => x.name === 'correctness').initial_option).toBe(shared.correctness);
+    expect(fields.find((x: any) => x.name === 'regression').initial_option).toBe(shared.correctness);
+    expect(await click(reloaded, { form: { ...shared, regression: 'bot-0' } })).toMatchObject({ started: true });
+    const loaded = loadAuthorizedV3Run(join(baseDir, request.runId));
+    expect(loaded.resolvedRoles).toMatchObject({ developer: { bot: 'cli_dev' }, correctness: { bot: 'cli_correct' }, regression: { bot: 'cli_correct' } });
+    expect(deps.driveDetached).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['v2', 'v10'])('upgrades an owned %s definition for shared review roles without overwriting the old revision', async version => {
     const selected = { developer: 'cli_dev', correctness: 'cli_correct', regression: 'cli_regress' };
-    const previous = JSON.parse(readFileSync(new URL('./fixtures/development-review/v2.json', import.meta.url), 'utf8'), (_key, value) =>
+    const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'), (_key, value) =>
       typeof value === 'string' ? ({ cli_developer: selected.developer, cli_correctness: selected.correctness, cli_regression: selected.regression } as Record<string, string>)[value] ?? value : value);
     const saved = await createSavedWorkflow(dataDir, { displayName: 'dev-rev', owner: context.actor,
       scope: { kind: 'chat', chatId: context.chatId }, revision: previous, publish: true });
     const oldPath = join(dataDir, 'workflow-library', saved.metadata.workflowId, 'revisions', saved.metadata.latestRevision + '.json');
     const oldBytes = readFileSync(oldPath, 'utf8');
-    const request = await bound(); expect(await click(request)).toMatchObject({ started: true });
+    const request = await bound(); expect(await click(request, { form: { ...form, regression: form.correctness } })).toMatchObject({ started: true });
+    expect(loadAuthorizedV3Run(join(baseDir, request.runId)).resolvedRoles).toMatchObject({
+      correctness: { bot: 'cli_correct' }, regression: { bot: 'cli_correct' },
+    });
     const updated = await loadVisibleSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId });
     expect(updated.revision.payload.humanVersion).toBe(2);
     const { workflowId, humanVersion, createdAt, createdBy, ...draft } = updated.revision.payload;
@@ -156,7 +174,7 @@ describe('dev-rev interactive launcher', () => {
   });
   it.each([
     { ...form, requirement: '' }, { ...form, repo: '/tmp/forged' }, { ...form, developer: 'bot-99' },
-    { ...form, developer: 'bot-1' }, { ...form, injected: 'unexpected' },
+    { ...form, developer: 'bot-1' }, { ...form, regression: 'bot-0' }, { ...form, injected: 'unexpected' },
   ])('rejects invalid form data before any run: %j', async value => {
     const request = await bound(); await expect(click(request, { form: value })).rejects.toThrow();
     expect(existsSync(baseDir)).toBe(false); expect(deps.persistStartIntent).not.toHaveBeenCalled();

@@ -1182,4 +1182,4 @@ Workflow v3 的核心不是“让多个 Agent 顺序聊天”，而是以下约�
 
 创建不执行代码任务或发送 PR；真实外部任务执行仍需另行提供参数及通过运行期审批。相同 owner/chat/name 与完全相同定义的重试返回同一对象；定义或默认身份不同则拒绝覆盖。
 
-可选 revision.execution 策略将已声明的非敏感字符串参数作为本轮workingDir，物化前解析为存在的真实目录并冻结到所有bot快照；distinctRoles要求指定角色实际bot互不相同。策略参数、身份冲突或目录缺失在创建run之前失败。没有该策略的旧定义仍使用原bot工作目录；策略随Saved definition重新保存保留。
+可选 revision.execution 策略将已声明的非敏感字符串参数作为本轮workingDir，物化前解析为存在的真实目录并冻结到所有bot快照；distinctRoles要求指定角色实际bot互不相同；distinctRoleGroups逐组执行相同约束，并与distinctRoles同时生效。开发评审预设仅要求开发与每个评审角色分离，两个评审角色可绑定同一bot，仍分别执行并按角色核验报告。策略参数、身份冲突或目录缺失在创建run之前失败。没有该策略的旧定义仍使用原bot工作目录；策略随Saved definition重新保存保留。
