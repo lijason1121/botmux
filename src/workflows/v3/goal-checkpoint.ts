@@ -1,6 +1,7 @@
-import { createHash } from 'node:crypto';
-import { createReadStream, lstatSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { closeSync, constants, createReadStream, fstatSync, lstatSync, openSync, readFileSync, readSync,
+  renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import { computeInputHash } from '../../utils/canonical-input-hash.js';
 import type { BotSnapshot, GoalInputs, ValidateManifest } from './contract.js';
 import type { V3Node } from './dag.js';
@@ -53,5 +54,71 @@ export async function restoreGoalCheckpoint(input: {
     // Optional progress cannot prevent a fresh attempt; no unchecked paths
     // or exception text from an old worker escape into its successor's input.
     return undefined;
+  }
+}
+
+/** Last-resort continuation context when the agent never published a valid
+ * checkpoint. Logs are untrusted observations, not validated progress or an
+ * approval. Only this node's prior attempt with identical inputs/identity is
+ * eligible; no sibling reviewers, growing native history stores or secrets
+ * configuration files are discovered here. */
+export function writeAttemptHistory(input: {
+  runDir: string;
+  runId: string;
+  nodeId: string;
+  previousAttemptId: string;
+  attemptDir: string;
+  previousInputHash: string;
+  inputHash: string;
+}): GoalInputs['inputs'][number] | undefined {
+  if (input.inputHash !== input.previousInputHash) return undefined;
+  const previousDir = join(input.runDir, input.previousAttemptId);
+  const output = join(input.attemptDir, 'previous-attempt.json');
+  const temporary = `${output}.${randomUUID()}.tmp`;
+  try {
+    const within = relative(input.runDir, previousDir);
+    if (!within || isAbsolute(within) || within.split(sep).some(p => !p || p === '..')) return undefined;
+    let directory = input.runDir;
+    const directories: { path: string; dev: number; ino: number }[] = [];
+    for (const part of within.split(sep)) {
+      directory = join(directory, part);
+      const stat = lstatSync(directory);
+      if (!stat.isDirectory()) return undefined; // also rejects symlinks
+      directories.push({ path: directory, dev: stat.dev, ino: stat.ino });
+    }
+    const logs: Record<string, { text: string; truncated: boolean }> = {};
+    for (const [name, limit] of [['pty.log', 64_000], ['stdout.log', 16_000], ['stderr.log', 16_000]] as const) {
+      let fd: number | undefined;
+      try {
+        const filename = join(previousDir, name), before = lstatSync(filename);
+        if (!before.isFile()) continue;
+        // NOFOLLOW protects the final component; recheck parent identities as
+        // well so a detected directory replacement discards optional history.
+        // NONBLOCK avoids hanging on a file replaced by a FIFO before open.
+        fd = openSync(filename, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
+        const stat = fstatSync(fd);
+        if (!stat.isFile() || !stat.size) continue;
+        if (stat.dev !== before.dev || stat.ino !== before.ino) return undefined;
+        for (const prior of directories) {
+          const current = lstatSync(prior.path);
+          if (!current.isDirectory() || current.dev !== prior.dev || current.ino !== prior.ino) return undefined;
+        }
+        const current = lstatSync(filename);
+        if (!current.isFile() || current.dev !== stat.dev || current.ino !== stat.ino) return undefined;
+        const buffer = Buffer.alloc(Math.min(stat.size, limit));
+        const length = readSync(fd, buffer, 0, buffer.length, Math.max(0, stat.size - buffer.length));
+        if (length) logs[name] = { text: buffer.subarray(0, length).toString('utf8'), truncated: stat.size > limit };
+      } catch { /* Missing/unreadable logs do not prevent a fresh attempt. */ }
+      finally { if (fd !== undefined) closeSync(fd); }
+    }
+    if (!Object.keys(logs).length) return undefined;
+    writeFileSync(temporary, JSON.stringify({ schemaVersion: 1, runId: input.runId, nodeId: input.nodeId,
+      previousAttemptId: input.previousAttemptId, inputHash: input.inputHash, approval: false, logs }), { flag: 'wx', mode: 0o600 });
+    renameSync(temporary, output);
+    return { from: 'attempt-history', name: 'previous-execution', kind: 'json', path: output };
+  } catch {
+    return undefined;
+  } finally {
+    try { unlinkSync(temporary); } catch { /* absent after successful rename */ }
   }
 }

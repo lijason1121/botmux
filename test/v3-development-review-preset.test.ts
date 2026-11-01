@@ -78,7 +78,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1) {
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -124,6 +124,7 @@ describe('authored development-review preset', () => {
       exit: { node: 'verify-review-gate', when: { path: 'result.passed', equals: true } }, feedback: ['verify-review-gate.result'] });
     for (const id of ['review-correctness', 'review-regression']) {
       const reviewer = loop.body!.nodes.find(node => node.id === id)!;
+      expect(reviewer.timeoutSec).toBe(loop.body!.nodes.find(node => node.id === 'implement')!.timeoutSec);
       expect(reviewer.depends).toEqual([{ from: 'implement' }]);
       expect(reviewer.inputs.every(input => input.from === 'implement')).toBe(true);
     }
@@ -516,6 +517,26 @@ describe('fixed development-review executable resources', () => {
     expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
     expect(json(join(f.prepared, 'context.json')).requirement).toBe('Actual document requirements');
   });
+  it('checkpoints real review progress without declaring completion or approval', async () => {
+    const f = fixture(), out = f.out('review-regression');
+    const inputHash = 'sha256:' + 'a'.repeat(64);
+    write(join(dirname(out), 'checkpoint-context.json'), { schemaVersion: 1, inputHash });
+    const progress = join(out, 'review-progress.md');
+    writeFileSync(progress, 'Verified API behavior; browser probe still pending.');
+    const args = ['--summary', 'API checked; browser pending', '--entry', 'progress', 'markdown', 'review-progress.md'];
+    expect(await f.tool('checkpoint', args, out)).toMatchObject({ code: 0, stderr: '' });
+    const manifest = await readAndValidateManifest(join(out, 'checkpoint.json'), out);
+    expect(manifest).toMatchObject({ status: 'fail', error: { code: 'CHECKPOINT_INCOMPLETE', retryable: true } });
+    expect(json(join(out, 'checkpoint.json')).inputHash).toBe(inputHash);
+    expect(existsSync(join(dirname(out), 'manifest.json'))).toBe(false);
+    writeFileSync(progress, 'API and browser checked; remaining backup probe.');
+    expect(await f.tool('checkpoint', args, out)).toMatchObject({ code: 0 });
+    expect((await readAndValidateManifest(join(out, 'checkpoint.json'), out)).files[0]!.sha256)
+      .toBe(sha(progress).slice('sha256:'.length));
+    write(join(dirname(out), 'checkpoint-context.json'), { schemaVersion: 1 });
+    expect(await f.tool('checkpoint', args, out)).toMatchObject({ code: 2 });
+  });
+
   it('prepares a real task worktree, records real argv execution, gates evidence, and publishes a valid manifest', async () => {
     const f = await evidenceFixture();
     expect(sha(f.resources)).toBe(DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256);
