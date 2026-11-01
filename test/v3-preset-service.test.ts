@@ -75,7 +75,7 @@ describe('reviewed preset creation', () => {
     { context: { ...context, actor: { larkAppId: 'cli_coordinator', openId: '' } } },
     { roleSelections: { developer: 'Developer', correctness: 'Correctness' } },
     { roleSelections: { ...roleSelections, unexpected: 'Alternate' } },
-    { roleSelections: { ...roleSelections, regression: 'Correctness' } },
+    { roleSelections: { ...roleSelections, regression: 'Developer' } },
     { roleSelections: { ...roleSelections, developer: 'Missing' } },
   ])('rejects invalid creation before creating library storage: %j', async input => {
     await expect(create(input)).rejects.toThrow();
@@ -111,6 +111,20 @@ describe('reviewed preset creation', () => {
       context: { ...context, actor: { ...context.actor, larkAppId: 'cli_elsewhere' } } })).rejects.toThrow();
   });
 
+  it.each(['defaults', 'override'] as const)('allows shared reviewers through %s while keeping distinct role artifacts', async mode => {
+    const saved = await create(mode === 'defaults' ? { roleSelections: { ...roleSelections, regression: 'Correctness' } } : {});
+    const run = await instantiatePublishedSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId,
+      bots, baseDir: join(dataDir, 'runs'), runId: 'shared-reviewer',
+      ...(mode === 'override' ? { roleSelections: { regression: 'Correctness' } } : {}),
+      rawParams: { mode: { kind: 'string', value: 'new' }, repo_path: { kind: 'string', value: dataDir },
+        requirement: { kind: 'string', value: 'Task' }, target_branch: { kind: 'string', value: 'main' },
+        validation_commands: { kind: 'json', value: [] } } });
+    expect(run.resolvedRoles?.correctness.bot).toBe('cli_correct');
+    expect(run.resolvedRoles?.regression.bot).toBe('cli_correct');
+    expect(run.resolvedRoles?.correctness.nodes).not.toEqual(run.resolvedRoles?.regression.nodes);
+    expect(loadAuthorizedV3Run(run.runDir).resolvedRoles).toEqual(run.resolvedRoles);
+  });
+
   it('rejects role collisions and missing workspaces before publishing a run directory', async () => {
     const saved = await create();
     const baseDir = join(dataDir, 'not-published');
@@ -119,6 +133,8 @@ describe('reviewed preset creation', () => {
       validation_commands: { kind: 'json' as const, value: [{ id: 'runtime', argv: ['node', '--version'] }] } };
     await expect(instantiatePublishedSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId,
       bots, baseDir, rawParams: params, roleSelections: { correctness: 'Developer' } })).rejects.toThrow(/distinct/);
+    await expect(instantiatePublishedSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId,
+      bots, baseDir, rawParams: params, roleSelections: { regression: 'Developer' } })).rejects.toThrow(/distinct/);
     await expect(instantiatePublishedSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId,
       bots, baseDir, rawParams: params })).rejects.toThrow(/ENOENT/);
     expect(existsSync(baseDir)).toBe(false);
@@ -129,8 +145,26 @@ describe('reviewed preset creation', () => {
     const { workflowId: _id, humanVersion: _v, createdAt: _at, createdBy: _by, ...draft } = saved.revision.payload;
     for (const execution of [{ workingDirectoryParam: 'missing' }, { workingDirectoryParam: 'validation_commands' },
       { distinctRoles: ['developer', 'missing'] }, { distinctRoles: ['developer', 'developer'] },
-      { distinctRoles: [] }, { unrelatedPolicy: true }]) {
+      { distinctRoles: [] }, { unrelatedPolicy: true },
+      ...[[], 'invalid', [['developer']], [['developer', 'missing']], [['developer', 'developer']],
+        [['developer', 1]], Array.from({ length: 65 }, () => ['developer', 'regression'])].map(distinctRoleGroups => ({ distinctRoleGroups }))]) {
       expect(() => validateSavedWorkflowRevisionDraft({ ...draft, execution })).toThrow(/execution/);
     }
+  });
+
+  it('preserves legacy all-distinct constraints alongside role groups', async () => {
+    const saved = await create();
+    const { workflowId: _id, humanVersion: _v, createdAt: _at, createdBy: _by, ...draft } = saved.revision.payload;
+    draft.execution!.distinctRoles = ['developer', 'correctness', 'regression'];
+    await appendSavedWorkflowRevision(dataDir, saved.metadata.workflowId, {
+      actor: context.actor, revision: draft, publish: true, expectedLatestRevision: saved.metadata.latestRevision,
+    });
+    const baseDir = join(dataDir, 'must-not-publish');
+    await expect(instantiatePublishedSavedWorkflow({ dataDir, context, ref: saved.metadata.workflowId, bots, baseDir,
+      roleSelections: { regression: 'Correctness' },
+      rawParams: { mode: { kind: 'string', value: 'new' }, repo_path: { kind: 'string', value: dataDir },
+        requirement: { kind: 'string', value: 'Task' }, target_branch: { kind: 'string', value: 'main' },
+        validation_commands: { kind: 'json', value: [] } } })).rejects.toThrow(/distinct/);
+    expect(existsSync(baseDir)).toBe(false);
   });
 });

@@ -113,7 +113,7 @@ export async function createDevRevLaunch(input: {
     const bots = [...new Map(input.bots.map(bot => [bot.appId, bot])).values()].slice(0, 100)
       .map((bot, i) => ({ ...bot, label: bot.label.slice(0, 160), value: `bot-${i}` }));
     if (!repos.length) fail('未找到可选仓库，请先配置机器人的仓库扫描目录。');
-    if (bots.length < 3) fail('本群至少需要三个已配置且支持工作流的机器人，请添加后重新运行。');
+    if (bots.length < 2) fail('本群至少需要两个已配置且支持工作流的机器人，开发与评审需使用不同机器人。');
     const request = schema.parse({ schemaVersion: 1, id, nonce: randomBytes(32).toString('hex'),
       context, expiresAt: (input.now ?? Date.now()) + 86400000, repos, bots,
       runId: `devrev-${id.slice(3)}`, started: false, cancelled: false });
@@ -194,7 +194,10 @@ export async function submitDevRevLaunch(input: {
       const actual = devRevRepoIdentity(repo.path);
       if (actual.commonDir !== repo.commonDir) fail('仓库已变化，请重新打开启动卡片。');
       const selected = Object.fromEntries(DEV_REV_ROLES.map(role => [role, r.bots.find(x => x.value === f[role])?.appId]));
-      if (Object.values(selected).some(x => !x) || new Set(Object.values(selected)).size !== 3) fail('三个角色必须选择不同的本群机器人。');
+      if (Object.values(selected).some(x => !x)) fail('三个角色都必须选择有效的本群机器人。');
+      if (selected.developer === selected.correctness || selected.developer === selected.regression) {
+        fail('开发与评审必须选择不同的机器人；两个评审角色可以使用同一个机器人。');
+      }
       const targetBranch = resolveDevRevLocalDefaultBranch(repo.path, f.mode);
       // Validate live membership before authoring a definition or publishing a run.
       const members = new Set((await deps.listChatBots(input.appId, ctx.chatId)).map(x => x.appId));

@@ -52,9 +52,6 @@ export async function createPresetSavedWorkflow(
     if (!isV3SupportedCli(bot.cliId)) throw new Error(`Role ${name} uses unsupported CLI ${bot.cliId}`);
     return [name, bot.larkAppId];
   })) as Record<typeof names[number], string>;
-  if (new Set(Object.values(bots)).size !== names.length) {
-    throw new Error('Development and independent review roles require three distinct bots');
-  }
   const revision = createDevelopmentReviewPreset(bots);
   const warnings: string[] = [];
   collectSavedWorkflowReusableTextWarnings(revision, 'preset', warnings);

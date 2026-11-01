@@ -1696,9 +1696,9 @@ description: 统一处理 v3 Workflow：把有界的复合目标 grill 后编排
 
 自然语言与命令是同一能力，用户不需要记 slash command：
 
-- 飞书中直接发送 \`/workflow run dev-rev\`，由 daemon 打开内置开发评审启动卡：选择仓库、模式（新开发 / 评审他人 PR / 续开发已有 PR）和三个不同的本群已配置机器人，填写需求文字、文档链接或 PR 链接后提交。无需预先保存流程或填写分支；新开发以本地默认分支为基线，PR 模式先 fetch 再以本地对象为基线，验证命令由认证预检读取仓库规则确定，需求文档须先读取正文。此入口需要操作权限，提交只接受发起人在原群和原 Bot 的原卡片操作。只有无其它参数的精确快捷命令进入表单；普通 Saved Workflow run 保持现有路径。不要用自制 callback 卡或伪造群成员代替原生表单。重复点击恢复同一请求；推送代码和在他人 PR 发评论前保留原生人工审批，评审门禁和发布核验由回归评审机器人执行。
+- 飞书中直接发送 \`/workflow run dev-rev\`，由 daemon 打开内置开发评审启动卡：选择仓库、模式（新开发 / 评审他人 PR / 续开发已有 PR）和三个角色对应的本群已配置机器人（两个评审角色可选同一个，开发需使用另一个），填写需求文字、文档链接或 PR 链接后提交。无需预先保存流程或填写分支；新开发以本地默认分支为基线，PR 模式先 fetch 再以本地对象为基线，验证命令由认证预检读取仓库规则确定，需求文档须先读取正文。此入口需要操作权限，提交只接受发起人在原群和原 Bot 的原卡片操作。只有无其它参数的精确快捷命令进入表单；普通 Saved Workflow run 保持现有路径。不要用自制 callback 卡或伪造群成员代替原生表单。重复点击恢复同一请求；推送代码和在他人 PR 发评论前保留原生人工审批，评审门禁和发布核验由回归评审机器人执行。
 
-- 用户明确要求从零创建通用开发评审流程时，可用 \`botmux workflow create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot\`。这是经验证的内置预设作者入口，只创建当前用户/当前群的参数化 Saved Workflow，不读取旧任务、不伪造 sourceRun 或成功记录，也不自动运行任务。三个 Bot 必须来自真实配置且互不相同。创建后的 active 表示可运行定义，不能宣称已有真实需求端到端执行通过。任意文件导入、全局发布、unsafe 确认和参数蒸馏仍不由此入口代办。
+- 用户明确要求从零创建通用开发评审流程时，可用 \`botmux workflow create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot\`。这是经验证的内置预设作者入口，只创建当前用户/当前群的参数化 Saved Workflow，不读取旧任务、不伪造 sourceRun 或成功记录，也不自动运行任务。三个角色的 Bot 必须来自真实配置；两个评审角色可使用同一个 Bot，开发 Bot 必须与评审 Bot 不同。创建后的 active 表示可运行定义，不能宣称已有真实需求端到端执行通过。任意文件导入、全局发布、unsafe 确认和参数蒸馏仍不由此入口代办。
 
 - “把刚才那个流程存下来（叫周报）” → \`botmux workflow save last 周报\`（IM 等价：\`/workflow save last 周报\`）。只保存已成功结束且属于当前用户/话题的 run；agent-facing CLI 固定为 chat scope。用户明确要求在**当前 Bot 的其它群**复用时，不得替用户执行 \`--global\`，请让用户本人在飞书显式发送 \`/workflow save last 周报 --global\`，由 daemon 校验 canOperate。\`--global\` 只表示当前 Bot 全局，不会对共享 dataDir 的其它 Bot 可见。
 - 参数蒸馏目前只做显式实验入口，不从自然语言自行触发。用户明确要求把成功 run 中的具体值抽成参数时，请让用户本人在飞书发送 \`/workflow save last <名称> --distill\`；agent-facing CLI 会拒绝该 flag。系统先生成不含原值的参数摘要卡，用户整包确认后才创建本群 Saved Workflow；P0 不支持 \`--global\`、\`--ack-unsafe\`、追加现有定义或局部接受。
