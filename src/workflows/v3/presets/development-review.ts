@@ -88,12 +88,17 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
     '本角色=' + role + '；真实reviewerId=${roles.' + role + '.bot}（${roles.' + role + '.label} / ${roles.' + role + '.cliId}），必须与prepare context的本角色身份一致。',
     role === 'correctness' ? '重点核对需求满足、根因、接口/数据兼容与关键失败路径，引用具体文件/行为证据。' : '重点核对修前失败修后通过、旧路径、平台/CLI/会话相关回归面，以及验证命令和报告是否真实且覆盖合理。',
     '阶段性发现和未验项按运行时检查点协议持续落盘。先核对同一repo/base/head、命令、依赖配置和日志摘要的统一validation记录，独立执行关键失败路径探针；仓库没有要求重复全量检查时不重复跑相同门禁。代码变化后检查增量并重新绑定当前候选，最终固定gate和仓库强制门禁保留。',
+    '完成输入核对后，先写review-progress.md列出候选SHA、有限的检查计划、已完成项、真实日志路径及剩余项；此后每完成一个实质探针就更新该文件，并执行固定tools.mjs checkpoint --entry progress markdown review-progress.md --summary <已验与未验摘要>，附固定tools hash参数。工具自动计算文件摘要和绑定本attempt的inputHash，不会结束节点或产生批准。不要等全部检查完成才保存。',
+    '读取runtime-context.json的budget，启动耗时命令前核对剩余时间并预留保存时间；已有足够证据的finding及时形成报告，不反复扩展检查范围。接近checkpointAtMs时优先保存并交付真实结论；有未验项不能approve，必要时按运行时协议保存检查点后以WORKER_TIME_BUDGET结束。',
     'context.mode=review时审查baseSha..headSha即他人PR的全部改动，开发者不会修改代码，意见经gate后发为PR评论；验证失败也须作为finding。new/continue模式审查本run候选。',
     '任何未解决的意见都必须放入findings，包括nit/非阻塞建议，不能仅写在review.md或coverage里。有任意finding必须changes_requested，证据不足则blocked；只有本角色对当前候选确认无遗留问题且findings=[]才可approve，禁止approve with nits。独立核对change-summary中开发者对既有意见的逐项处置；建议成立则确认修复，不成立则依据事实撤回，不能要求盲改或把未修复项标成非阻塞后放行。',
     '审查结果result.json必须包含schemaVersion:1,runId,repo,baseSha,headSha,round,role,reviewerId,decision(approve/changes_requested/blocked),findings(每项含blocking布尔及location/impact/evidence非空字符串),coverage和evidence均为非空字符串数组,candidateSha256,validationSha256,contextSha256；SHA/round取当前候选，三个文件摘要必须由实际输入字节计算且使用sha256:<64位小写hex>格式。写review.md。',
     HASH_INSTRUCTION,
     '用固定publish工具交付 --entry review json result.json --entry report markdown review.md。Manifest ok仅表示交付，不等于decision=approve。',
   ].join('\n'), { review: output('result.json'), report: output('review.md', 'markdown') }, ['implement'], [ref('implement', 'candidate'), ref('implement', 'validation'), ref('implement', 'change-summary')]),
+    // Review includes independent browser/mutation probes and needs the same
+    // ceiling as implementation and the independent validation gate.
+    timeoutSec: 14400,
     resultSchema: { type: 'object', properties: { decision: { type: 'string', enum: ['approve', 'changes_requested', 'blocked'] } }, required: ['decision'] },
   });
 

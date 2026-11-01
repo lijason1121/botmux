@@ -187,6 +187,10 @@ async function runNodeImpl(
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
   const backendType = v3WorkerBackendType();
+  const startedAtMs = Date.now();
+  const deadlineAtMs = startedAtMs + req.timeoutMs;
+  const budget = { startedAtMs, deadlineAtMs, timeoutMs: req.timeoutMs,
+    checkpointAtMs: deadlineAtMs - Math.min(120_000, req.timeoutMs / 10) };
   try {
     // Ephemeral sessions have no daemon session row. Publish only launch facts
     // already authorized for this run, instead of asking an agent to discover
@@ -204,7 +208,7 @@ async function runNodeImpl(
       workingDir: expandWorkflowWorkingDir(snapshot.workingDir) ?? cwd,
     });
     writeFileSync(join(req.attemptDir, 'runtime-context.json'), `${JSON.stringify({
-      schemaVersion: 1, runId: req.runId, attemptId: req.attemptId, backendType,
+      schemaVersion: 1, runId: req.runId, attemptId: req.attemptId, backendType, budget,
       current: describe(req.botSnapshot),
       bots: Object.fromEntries(Object.entries(req.frozenBotSnapshots ?? { [req.botSnapshot.larkAppId]: req.botSnapshot })
         .map(([selector, snapshot]) => [selector, describe(snapshot)])),
@@ -413,7 +417,7 @@ async function runNodeImpl(
 
     const hardDeadline = setTimeout(() => {
       finish('fail', 'timeout', `node timed out after ${Math.round(req.timeoutMs / 1000)}s`);
-    }, req.timeoutMs);
+    }, Math.max(0, deadlineAtMs - Date.now()));
 
     function sessionInfo(): WorkerSessionInfo {
       return {
@@ -511,6 +515,12 @@ async function runNodeImpl(
 
     function sendGoalIfReady(): void {
       if (!initSent || webPort === undefined || goalSent) return;
+      // Startup may consume the budget before the timer gets an event-loop
+      // turn. Never dispatch fresh work after the published hard deadline.
+      if (Date.now() >= deadlineAtMs) {
+        finish('fail', 'timeout', `node timed out after ${Math.round(req.timeoutMs / 1000)}s`);
+        return;
+      }
       // Claim before IPC: a throw cannot prove the child did not receive it.
       goalSent = true;
       worker.send({ type: 'raw_input', content: buildGoalCommand(req) });
