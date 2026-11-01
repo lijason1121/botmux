@@ -251,6 +251,63 @@ describe('v3 ephemeral pool', () => {
     }
   });
 
+  it('does not deliver a goal when startup has already exhausted its published budget', async () => {
+    vi.useFakeTimers();
+    const worker = new ScriptedWorker();
+    const req = { ...request(), timeoutMs: 1000 };
+    const pool = createEphemeralPool({ factory: { spawn: () => {
+      vi.setSystemTime(Date.now() + req.timeoutMs);
+      return worker;
+    } }, workerPath: '/tmp/worker.js', resolveLarkAppSecret: () => 'secret' });
+    const running = pool.runNode(req);
+    await worker.waitForInit();
+    try {
+      worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+      worker.emitMessage({ type: 'prompt_ready' });
+      expect(worker.rawInputs).toEqual([]);
+      worker.emitExit(0);
+      await expect(running).resolves.toMatchObject({ status: 'fail', failureReason: 'timeout', goalNotStarted: true });
+    } finally {
+      worker.emitExit(0);
+      await running;
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])('publishes and enforces a deadline including startup; cancel before exit: %s', async cancel => {
+    vi.useFakeTimers();
+    const worker = new ScriptedWorker();
+    const ac = new AbortController();
+    const req = { ...request(), timeoutMs: 1000, cancelSignal: ac.signal };
+    const pool = createEphemeralPool({ factory: { spawn: () => {
+      vi.setSystemTime(Date.now() + 400);
+      return worker;
+    } }, workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret' });
+    const running = pool.runNode(req);
+    await worker.waitForInit();
+    try {
+      const { budget } = JSON.parse(readFileSync(join(req.attemptDir, 'runtime-context.json'), 'utf8'));
+      expect(budget).toBeDefined();
+      expect(budget.deadlineAtMs - budget.startedAtMs).toBe(req.timeoutMs);
+      expect(budget.checkpointAtMs).toBeGreaterThan(budget.startedAtMs);
+      expect(budget.checkpointAtMs).toBeLessThan(budget.deadlineAtMs);
+      const send = vi.spyOn(worker, 'send');
+      await vi.advanceTimersByTimeAsync(budget.deadlineAtMs - Date.now() - 1);
+      expect(send.mock.calls.some(([m]) => (m as any).type === 'close')).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(send.mock.calls.some(([m]) => (m as any).type === 'close')).toBe(true);
+      if (cancel) ac.abort('user-cancel');
+      worker.emitExit(0);
+      await expect(running).resolves.toMatchObject(cancel ? { status: 'cancelled', cancelReason: 'user-cancel' }
+        : { status: 'fail', failureReason: 'timeout' });
+    } finally {
+      worker.emitExit(0);
+      await running;
+      vi.useRealTimers();
+    }
+  });
+
   it('provides frozen role launch information before init without querying ordinary sessions', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);

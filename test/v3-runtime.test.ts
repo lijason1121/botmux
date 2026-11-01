@@ -287,6 +287,66 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
       } finally { rmSync(base, { recursive: true, force: true }); }
     });
 
+  it.each(['intact', 'input-changed', 'identity-changed', 'symlink', 'absent', 'cancelled'] as const)(
+    'provides bounded previous-attempt activity on retry without fabricating a checkpoint: %s', async mode => {
+      const base = mkdtempSync(join(tmpdir(), 'v3-attempt-history-'));
+      let attempts = 0, upstream = '';
+      let history: GoalInputs['inputs'] = [];
+      try {
+        const runNode: RunNode = async req => {
+          if (req.node.id === 'research') {
+            upstream = join(req.outputDir, 'report.md');
+            return { status: 'ok', manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'input',
+              files: [product(req.outputDir, 'report.md', 'candidate A')] }) };
+          }
+          if (++attempts === 1) {
+            if (mode === 'symlink') {
+              const other = join(base, 'not-this-attempt.log'); writeFileSync(other, 'unrelated secret');
+              symlinkSync(other, join(req.attemptDir, 'pty.log'));
+            } else if (mode !== 'absent') {
+              writeFileSync(join(req.attemptDir, 'pty.log'), 'old noise\n'.repeat(20_000) + 'API probe completed; E2E pending');
+            }
+            return { status: 'fail', failureReason: 'timeout', failureDetail: 'node timed out after 1800s',
+              manifestPath: join(req.attemptDir, 'manifest.json') };
+          }
+          const inputs = JSON.parse(readFileSync(req.inputsPath, 'utf8')) as GoalInputs;
+          history = inputs.inputs.filter(i => i.from === 'attempt-history');
+          expect(inputs.inputs.some(i => i.from === 'checkpoint')).toBe(false);
+          return { status: 'ok', manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'done',
+            files: [product(req.outputDir, 'report.md', 'remaining checks completed')] }) };
+        };
+        const dag = validateDag(TWO_NODE), deps = { runNode, validateManifest, resolveBotSnapshot };
+        expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'blocked' });
+        if (mode === 'cancelled') {
+          appendEvent(join(base, dag.runId, 'journal.ndjson'), { type: 'runCancelRequested', cancelRequestId: 'user-cancel', by: 'user' });
+          expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'cancelled' });
+          expect(attempts).toBe(1);
+          expect(history).toEqual([]);
+          return;
+        }
+        if (mode === 'input-changed') writeFileSync(upstream, 'candidate B');
+        if (mode === 'identity-changed') deps.resolveBotSnapshot = () => ({ ...resolveBotSnapshot(), model: 'different-model' });
+        expect(requestV3Retry(base, dag.runId)).toMatchObject({ kind: 'requested' });
+        if (mode === 'identity-changed') {
+          await expect(runWorkflow(dag, deps, { baseDir: base })).rejects.toThrow('frozen execution profile snapshot');
+          expect(attempts).toBe(1);
+          expect(history).toEqual([]);
+          return;
+        }
+        expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'succeeded' });
+        expect(history).toHaveLength(mode === 'intact' ? 1 : 0);
+        if (mode === 'intact') {
+          const bytes = readFileSync(history[0]!.path, 'utf8');
+          expect(bytes.length).toBeLessThan(130_000);
+          const data = JSON.parse(bytes);
+          expect(data).toMatchObject({ schemaVersion: 1, runId: dag.runId, nodeId: 'summarize', approval: false });
+          expect(data.logs['pty.log'].text).toContain('API probe completed; E2E pending');
+          expect(data.logs['pty.log'].truncated).toBe(true);
+        }
+        expect(readJournal(join(base, dag.runId, 'journal.ndjson')).some(e => e.type === 'nodeCheckpointRestored')).toBe(false);
+      } finally { rmSync(base, { recursive: true, force: true }); }
+    });
+
   it.each(['approve', 'changes_requested', 'blocked'] as const)('records explicit review decision %s independently of execution success', async decision => {
     const base = mkdtempSync(join(tmpdir(), 'v3-review-decision-'));
     try {

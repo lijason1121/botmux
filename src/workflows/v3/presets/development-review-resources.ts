@@ -552,7 +552,7 @@ function verifyPublication(args) {
     approvalRequired: routed.approvalRequired, directPublish: routed.directPublish, identityConfirmed: routed.identityConfirmed === true,
     planSha256: digest(args.plan), routeSha256: digest(args.route) });
 }
-function publish(args) {
+function publish(args, checkpoint = false) {
   const output = process.env.BOTMUX_GOAL_OUTPUT_DIR, manifest = process.env.BOTMUX_GOAL_MANIFEST_PATH;
   requireThat(output && manifest, 'goal output/manifest environment required');
   const files = [], names = new Set(), paths = new Set();
@@ -567,6 +567,17 @@ function publish(args) {
       mime: kind === 'json' ? 'application/json' : kind === 'markdown' ? 'text/markdown' : 'text/plain' });
   }
   requireThat(files.length, 'at least one real product required');
+  if (checkpoint) {
+    const attempt = process.env.BOTMUX_GOAL_ATTEMPT_DIR;
+    requireThat(attempt && path.resolve(output) === path.join(path.resolve(attempt), 'work'), 'checkpoint must use this attempt output');
+    const context = read(regular(attempt, 'checkpoint-context.json'));
+    requireThat(context.schemaVersion === 1 && /^sha256:[a-f0-9]{64}$/.test(context.inputHash), 'checkpoint input hash unavailable');
+    requireThat(!paths.has('checkpoint.json'), 'checkpoint cannot include itself');
+    atomic(path.join(output, 'checkpoint.json'), { schemaVersion: 1, status: 'fail', inputHash: context.inputHash,
+      summary: args.summary || 'Partial progress; remaining work is recorded in the artifacts.',
+      error: { code: 'CHECKPOINT_INCOMPLETE', message: 'Work remains; this is not an approval.', retryable: true }, files });
+    return;
+  }
   atomic(manifest, { schemaVersion: 1, status: 'ok', summary: args.summary || 'Products delivered; decisions are in the artifacts.', files });
 }
 const args = { entries: [] }, mode = process.argv[2];
@@ -589,6 +600,7 @@ try {
   else if (mode === 'route') route(args);
   else if (mode === 'verify-publication') verifyPublication(args);
   else if (mode === 'publish') publish(args);
+  else if (mode === 'checkpoint') publish(args, true);
   else throw new Error('unsupported development-review tool mode');
 } catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 2; }
 `;
