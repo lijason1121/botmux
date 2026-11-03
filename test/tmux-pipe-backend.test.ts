@@ -16,6 +16,9 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// This suite exercises pipe-pane commands, never an attach PTY.
+vi.mock('node-pty', () => ({ spawn: () => { throw new Error('Unexpected attach PTY'); } }));
+
 // Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's `vi`
 // shim has no `importActual`, and a fill that resolved without loading the module would
 // silently un-mock. The real module is SPREAD IN because bun links named exports for
@@ -160,14 +163,14 @@ describe('TmuxPipeBackend.spawn', () => {
     // Step 1: mkfifo via spawnSync
     expect(mockedSpawnSync).toHaveBeenCalledWith('mkfifo', expect.arrayContaining([expect.stringMatching(/botmux-pipe-/)]), expect.any(Object));
 
-    // Step 2: tmux pipe-pane -O -t 0:2.0 'cat > <fifo>'
+    // Step 2: subscribe an immediate byte-stream relay into the fifo.
     const pipeCalls = mockedExecSync.mock.calls
       .map(c => String(c[0]))
       .filter(c => c.includes('pipe-pane'));
     expect(pipeCalls.length).toBe(1);
     expect(pipeCalls[0]).toContain('-O');
     expect(pipeCalls[0]).toContain("'0:2.0'");
-    expect(pipeCalls[0]).toMatch(/cat > '.*botmux-pipe-.*\.fifo'/);
+    expect(pipeCalls[0]).toMatch(/dd bs=65536 > .*botmux-pipe-.*\.fifo/);
   });
 
   it('retries pipe-pane after a transient connect failure instead of failing the session start', () => {
@@ -1059,7 +1062,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
         .find(c => c.includes('pipe-pane'));
       expect(cancelCall).toBeDefined();
       expect(cancelCall).toContain("'0:2.0'");
-      expect(cancelCall).not.toContain('cat >');
+      expect(cancelCall).not.toContain('dd bs=');
     } finally {
       errSpy.mockRestore();
       killSpy.mockRestore();
@@ -1215,7 +1218,7 @@ describe('TmuxPipeBackend.kill', () => {
       .map(c => String(c[0]))
       .find(c => c.includes('pipe-pane'));
     expect(pipeCall).toBeDefined();
-    expect(pipeCall).not.toContain('cat >');  // no command = cancel
+    expect(pipeCall).not.toContain('dd bs=');  // no command = cancel
     expect(pipeCall).toContain("'0:2.0'");
 
     expect(mockedUnlinkSync).toHaveBeenCalledWith(expect.stringMatching(/botmux-pipe-.*\.fifo/));
