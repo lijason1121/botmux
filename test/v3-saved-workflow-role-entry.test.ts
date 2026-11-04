@@ -19,6 +19,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.stubEnv('SESSION_DATA_DIR', '/test-data');
   h.instantiate.mockResolvedValue({ runId: 'role-run', runDir: '/role-run',
+    envelope: { runId: 'role-run', source: { kind: 'saved_definition', workflowId: 'wf_test', humanVersion: 1 } },
     resolvedRoles: { developer: { nodes: ['work'], bot: 'cli_codex', label: 'Codex', cliId: 'codex' } } });
   h.start.mockResolvedValue({ ok: true });
   h.source.mockResolvedValue('/source-run');
