@@ -290,7 +290,7 @@ function prepareDependencies(worktree, repository, checked, replaceTaskLink = fa
     // dependency link, including one prepared in an earlier development round.
     // Never remove a directory or write into the link's shared target.
     if (replaceTaskLink && fs.lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()
-      && fs.realpathSync(target) !== modules) fs.unlinkSync(target);
+      && (!fs.existsSync(target) || fs.realpathSync(target) !== modules)) fs.unlinkSync(target);
     if (fs.existsSync(target) || fs.lstatSync(target, { throwIfNoEntry: false })) {
       requireThat(fs.realpathSync(target) === modules, 'task dependencies already point to a different environment');
     } else fs.symlinkSync(modules, target, process.platform === 'win32' ? 'junction' : 'dir');

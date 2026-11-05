@@ -78,7 +78,7 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1, selected = BOTS
 }
 
 describe('authored development-review preset', () => {
-  it('switches development to a matching external dependency environment without mutating the original shared target', async () => {
+  it.each(['intact', 'dangling'] as const)('switches development to a matching external dependency environment without mutating the original shared target: %s', async mode => {
     const f = fixture();
     write(join(f.repo, 'package.json'), { dependencies: { fixture: '1.0.0' } });
     writeFileSync(join(f.repo, 'bun.lock'), 'lock-1'); writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
@@ -98,10 +98,12 @@ describe('authored development-review preset', () => {
     writeFileSync(join(source, 'package.json'), readFileSync(join(f.worktree, 'package.json')));
     writeFileSync(join(source, 'bun.lock'), 'lock-2');
     write(join(source, 'node_modules', 'fixture', 'package.json'), { name: 'fixture', version: '2.0.0' });
+    if (mode === 'dangling') rmSync(join(f.repo, 'node_modules'), { recursive: true });
     expect(await f.tool('record', [...args, '--dependency-source', source], implemented)).toMatchObject({ code: 0, stderr: '' });
     expect(json(join(implemented, 'validation.json')).checks[0].exitCode).toBe(0);
     expect(realpathSync(join(f.worktree, 'node_modules'))).toBe(join(source, 'node_modules'));
-    expect(json(join(f.repo, 'node_modules', 'fixture', 'package.json')).version).toBe('1.0.0');
+    if (mode === 'intact') expect(json(join(f.repo, 'node_modules', 'fixture', 'package.json')).version).toBe('1.0.0');
+    else expect(existsSync(join(f.repo, 'node_modules'))).toBe(false);
     expect(readFileSync(join(f.repo, 'bun.lock'), 'utf8')).toBe('lock-1');
   });
 
