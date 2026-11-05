@@ -669,7 +669,7 @@ function stage(args) {
     add('gate-result', 'json', 'result.json'); add('release-candidate', 'json', 'release-candidate.json'); add('feedback', 'markdown', 'feedback.md');
     if (fs.existsSync(path.join(output, 'independent-validation.json'))) {
       add('independent-validation', 'json', 'independent-validation.json');
-      for (const check of read(local('independent-validation.json')).checks) { regular(output, check.log.path); add('independent-' + check.id, 'log', check.log.path); }
+      for (const check of read(local('independent-validation.json')).checks) { regular(output, check.log.path); add('independent-log-' + check.id, 'log', check.log.path); }
     }
   } else {
     const bound = { context, release: input('development-review-loop', 'release-candidate') };

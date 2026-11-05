@@ -17,7 +17,7 @@ const write = (file: string, value: unknown) => writeFileSync(file, JSON.stringi
 const sha = (file: string) => 'sha256:' + createHash('sha256').update(readFileSync(file)).digest('hex');
 type Input = { from: string; name: string; path: string; kind?: string };
 
-async function fixture(mode: 'new' | 'review' | 'continue' = 'new', changed = true, failedCheck = false, ownPr = false) {
+async function fixture(mode: 'new' | 'review' | 'continue' = 'new', changed = true, failedCheck = false, ownPr = false, checkId = 'behavior') {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'dev-rev-mechanical-'))); roots.push(root);
   const repo = join(root, 'repo'), remote = join(root, 'remote.git'), run = join(root, 'fixture-run');
   mkdirSync(repo); mkdirSync(run);
@@ -39,7 +39,7 @@ async function fixture(mode: 'new' | 'review' | 'continue' = 'new', changed = tr
   const params = join(root, 'params.json'), preflight = join(root, 'preflight.json'), roles = join(root, 'roles.json');
   const target = { url: 'https://example.invalid/pull/23', author: 'fixture-author', remote: 'origin', sourceBranch: 'feature', targetBranch: 'main', headSha: git(repo, 'rev-parse', 'HEAD') };
   write(params, { params: { mode, repo_path: repo, requirement: 'Fixture task', target_branch: 'main',
-    validation_commands: [{ id: 'behavior', argv: [process.execPath, '-e', `process.exit(${failedCheck ? 3 : 0})`], timeoutSec: 10 }] } });
+    validation_commands: [{ id: checkId, argv: [process.execPath, '-e', `process.exit(${failedCheck ? 3 : 0})`], timeoutSec: 10 }] } });
   write(preflight, { schemaVersion: 1, state: 'READY', runId: 'fixture-run', repoPath: repo, targetBranch: 'main',
     repositoryAccess: true, identity: 'fixture', login: ownPr ? target.author : 'fixture-reviewer',
     worktreeAllowed: true, worktreePath: join(root, 'task'), branch: 'workflow/fixture-run', ...(mode !== 'new' ? { reviewTarget: target } : {}) });
@@ -121,6 +121,15 @@ describe('fixed development-review mechanical stages', () => {
     expect(json(join(f.gated, 'result.json'))).toMatchObject({ passed: true, headSha: json(f.candidate).headSha });
     const manifest = await readAndValidateManifest(join(dirname(f.gated), 'manifest.json'), f.gated);
     expect(manifest.files.map(file => file.name)).toEqual(expect.arrayContaining(['gate-result', 'release-candidate', 'feedback', 'independent-validation']));
+  });
+
+  it('delivers a passing gate when a valid check id also names a standard product', async () => {
+    const f = await fixture('new', true, false, false, 'validation');
+    expect(await f.tool('stage', ['--expected-resources-sha', DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256], f.gated, f.gateInputs)).toMatchObject({ code: 0, stderr: '' });
+    const manifest = await readAndValidateManifest(join(dirname(f.gated), 'manifest.json'), f.gated);
+    expect(manifest.files.some(file => file.kind === 'log' && file.path === 'independent-validation.log')).toBe(true);
+    expect(manifest.files.some(file => file.kind === 'json' && file.path === 'independent-validation.json')).toBe(true);
+    expect(new Set(manifest.files.map(file => file.name)).size).toBe(manifest.files.length);
   });
 
   it('does not guess between duplicate or incomplete frozen inputs', async () => {
