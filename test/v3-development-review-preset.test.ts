@@ -78,13 +78,23 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1, selected = BOTS
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
       typeof value === 'string' ? Object.entries(BOTS).reduce((v, [role, bot]) => v === bot ? selected[role as keyof typeof selected] : v, value) : value);
     expect(upgradeDevelopmentReviewPreset(bound)).toEqual(createDevelopmentReviewPreset(selected));
     bound.specTemplate.requirement += ' customized behavior';
+    expect(upgradeDevelopmentReviewPreset(bound)).toBeUndefined();
+    expect(upgradeDevelopmentReviewPreset(createDevelopmentReviewPreset(selected))).toBeUndefined();
+  });
+  it('upgrades only an exact previous built-in when the two review roles share a bot', () => {
+    const previous = JSON.parse(readFileSync(new URL('./fixtures/development-review/v11.json', import.meta.url), 'utf8'));
+    const selected = { developer: 'cli_custom_dev', correctness: 'cli_shared', regression: 'cli_shared' };
+    const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
+      typeof value === 'string' ? Object.entries(BOTS).reduce((v, [role, bot]) => v === bot ? selected[role as keyof typeof selected] : v, value) : value);
+    expect(upgradeDevelopmentReviewPreset(bound)).toEqual(createDevelopmentReviewPreset(selected));
+    bound.dagTemplate.nodes.find((node: { id: string }) => node.id === 'complete').goal += ' custom';
     expect(upgradeDevelopmentReviewPreset(bound)).toBeUndefined();
     expect(upgradeDevelopmentReviewPreset(createDevelopmentReviewPreset(selected))).toBeUndefined();
   });

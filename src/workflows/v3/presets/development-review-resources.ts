@@ -208,6 +208,15 @@ function prepare(args) {
   requireThat(fs.realpathSync(git(repository, ['rev-parse', '--show-toplevel'])) === repository, 'repo_path must be the repository root');
   requireThat(checked.repoPath === repository, 'preflight target mismatch');
   const reviewTarget = checked.reviewTarget;
+  // A preflight-verified CLI location is a hint for fresh independent queries, not
+  // cached identity/permission evidence. Old preflights need not provide it.
+  let repositoryCliPath;
+  if (checked.repositoryCliPath !== undefined) {
+    requireThat(typeof checked.repositoryCliPath === 'string' && path.isAbsolute(checked.repositoryCliPath), 'repository CLI must use an absolute executable path');
+    repositoryCliPath = fs.realpathSync(checked.repositoryCliPath);
+    requireThat(fs.statSync(repositoryCliPath).isFile(), 'repository CLI must be a regular executable');
+    fs.accessSync(repositoryCliPath, fs.constants.X_OK);
+  }
   let targetBranch, baseSha, startSha;
   if (mode === 'new') {
     requireThat(reviewTarget === undefined, 'new development must not carry a PR target');
@@ -295,7 +304,7 @@ function prepare(args) {
   const context = { schemaVersion: 1, runId: checked.runId, mode, repo: repository, worktree, branch, targetBranch,
     ...(object(recovery) && recovery.sourceRunId ? { recoveredFrom: { runId: recovery.sourceRunId, attemptId: recovery.sourceAttemptId,
       candidateSha256: recovery.candidateSha256, journalSha256: recovery.journalSha256 } } : {}),
-    baseSha, startSha, ...(reviewTarget ? { reviewTarget } : {}), login, requirement, requirementSha256: sha(Buffer.from(requirement)), roles: selected,
+    baseSha, startSha, ...(reviewTarget ? { reviewTarget } : {}), ...(repositoryCliPath ? { repositoryCliPath } : {}), login, requirement, requirementSha256: sha(Buffer.from(requirement)), roles: selected,
     validationCommands: commands, preflightSha256: digest(args.preflight), resourcesSha256: digest(path.join(output, 'resources.json')) };
   atomic(path.join(output, 'context.json'), context);
   atomic(path.join(output, 'result.json'), { ready: true, runId: checked.runId, mode, baseSha, startSha });
@@ -552,6 +561,129 @@ function verifyPublication(args) {
     approvalRequired: routed.approvalRequired, directPublish: routed.directPublish, identityConfirmed: routed.identityConfirmed === true,
     planSha256: digest(args.plan), routeSha256: digest(args.route) });
 }
+// The stage entry point resolves the runtime's frozen refs, then calls the same
+// guards as the public low-level commands. No model assembles provenance paths.
+function stageInputs() {
+  const envelope = read(process.env.BOTMUX_GOAL_INPUTS_PATH);
+  requireThat(object(envelope) && Array.isArray(envelope.inputs), 'frozen goal inputs unavailable');
+  const keys = new Set();
+  for (const input of envelope.inputs) {
+    requireThat(object(input) && typeof input.from === 'string' && typeof input.name === 'string' &&
+      typeof input.path === 'string' && path.isAbsolute(input.path), 'invalid frozen input');
+    const key = JSON.stringify([input.from, input.name]);
+    requireThat(!keys.has(key), 'duplicate frozen input'); keys.add(key);
+  }
+  return (from, name, optional = false) => {
+    const input = envelope.inputs.find(input => input.from === from && input.name === name);
+    if (!input && optional) return undefined;
+    requireThat(input, 'missing frozen input: ' + from + '/' + name);
+    requireThat(!fs.lstatSync(input.path).isSymbolicLink() && fs.statSync(input.path).isFile(), 'frozen input must be a regular file');
+    return input.path;
+  };
+}
+function completeStage(args, input, output) {
+  const { deliveryPlan: planned, context, release } = checkPlan(args);
+  cleanHead(context, planned.headSha, 'completion candidate');
+  requireThat(release.artifacts.context.sha256 === digest(args.context), 'completion context changed');
+  const evidence = {};
+  for (const key of ['context', 'resources', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'independent-validation']) {
+    const artifact = release.artifacts[key];
+    requireThat(object(artifact) && typeof artifact.path === 'string' && !fs.lstatSync(artifact.path).isSymbolicLink() &&
+      fs.statSync(artifact.path).isFile() && digest(artifact.path) === artifact.sha256, 'release evidence changed: ' + key);
+    evidence[key] = key === 'change-summary' ? fs.readFileSync(artifact.path, 'utf8') : read(artifact.path);
+  }
+  const gateFile = input('development-review-loop', 'gate-result', true);
+  if (gateFile) requireThat(JSON.stringify(read(gateFile)) === JSON.stringify(release.gate), 'completion gate differs from the release');
+  let verified, observed, url = null;
+  if (planned.publicationRequired) {
+    verified = read(input('verify-publication', 'verification'));
+    version(verified, 'verification');
+    requireThat(verified.verified === true && verified.planSha256 === digest(args.plan) &&
+      /^sha256:[a-f0-9]{64}$/.test(verified.routeSha256), 'verification is not bound to this plan');
+    same(verified, planned, ['runId', 'mode', 'action', 'headSha', 'sourceBranch', 'targetBranch'], 'verification');
+    requireThat(typeof verified.url === 'string' && /^https:\/\//.test(verified.url) &&
+      (!planned.existingPr || verified.url === planned.existingPr.url), 'verification targets another PR');
+    requireThat(typeof verified.approvalRequired === 'boolean' && verified.directPublish === !verified.approvalRequired &&
+      (!verified.directPublish || (planned.directPublish && verified.identityConfirmed === true)), 'verification skipped a required approval');
+    url = verified.url;
+  } else if (planned.action === 'reuse') {
+    observed = read(regular(output, 'observed-pr.json'));
+    requireThat(observed.state === 'OPEN' && observed.url === planned.existingPr.url, 'reused PR is no longer open or has another URL');
+    same(observed, planned, ['headSha', 'sourceBranch', 'targetBranch'], 'reused PR');
+    requireThat(remoteHead(context.repo, planned.pushRemote, planned.sourceBranch) === planned.headSha, 'reused PR head changed');
+    url = observed.url;
+  }
+  const completion = { schemaVersion: 1, runId: context.runId, mode: context.mode, action: planned.action, url,
+    sourceBranch: planned.sourceBranch, targetBranch: planned.targetBranch, headSha: planned.headSha, baseSha: planned.baseSha,
+    publicationRequired: planned.publicationRequired, approvalRequired: verified ? verified.approvalRequired : false,
+    pushed: planned.action === 'create' || planned.action === 'update', commented: planned.action === 'comment',
+    validationFailures: release.gate.validationFailures || [], unresolvedFindings: release.gate.unresolvedFindings,
+    planSha256: digest(args.plan), ...(verified ? { verificationSha256: digest(input('verify-publication', 'verification')) } : {}) };
+  const lines = ['# Task report', '', 'Mode: ' + completion.mode, 'Action: ' + completion.action,
+    'PR: ' + (url || '(none)'), 'Head: ' + completion.headSha, 'Base: ' + completion.baseSha,
+    'Pushed: ' + completion.pushed, 'Commented: ' + completion.commented,
+    'Human approval required: ' + completion.approvalRequired, '', '## Delivery summary', '', inert(planned.summary),
+    '', '## Changes, validation and limitations', '', inert(evidence['change-summary']),
+    '', '## Recorded checks', '', inert(JSON.stringify(evidence.validation.checks, null, 2)),
+    '', '## Independent checks', '', inert(JSON.stringify(evidence['independent-validation'].checks, null, 2)),
+    '', '## Review findings (including nits)', '', inert(JSON.stringify(completion.unresolvedFindings, null, 2)),
+    '', 'Failed checks: ' + JSON.stringify(completion.validationFailures)];
+  for (const role of ['correctness', 'regression']) {
+    const review = evidence[role];
+    lines.push('', '## ' + role, '', 'Decision: ' + review.decision,
+      'Coverage: ' + inert(JSON.stringify(review.coverage)), 'Evidence: ' + inert(JSON.stringify(review.evidence)));
+  }
+  fs.writeFileSync(path.join(output, 'task-report.md'), lines.join('\n') + '\n', { mode: 0o600 });
+  atomic(path.join(output, 'completion.json'), completion);
+  publish({ entries: [['task-report', 'markdown', 'task-report.md'], ['completion', 'json', 'completion.json'],
+    ...(observed ? [['observed-pr', 'json', 'observed-pr.json']] : [])] });
+}
+function stage(args) {
+  const output = process.env.BOTMUX_GOAL_OUTPUT_DIR, attempt = process.env.BOTMUX_GOAL_ATTEMPT_DIR;
+  requireThat(output && attempt && path.resolve(output) === path.join(path.resolve(attempt), 'work'), 'stage must use this attempt output');
+  const node = path.basename(path.dirname(path.dirname(attempt))), input = stageInputs();
+  const preparedTools = input('prepare', 'tools');
+  requireThat(fs.realpathSync(preparedTools) === fs.realpathSync(self), 'stage must use the frozen prepare tool');
+  const context = input('prepare', 'context');
+  const local = name => regular(output, name), entries = [];
+  const add = (name, kind, filename) => entries.push([name, kind, filename]);
+  if (/^development-review-loop\.i[0-9]+\.verify-review-gate$/.test(node)) {
+    const prefix = node.slice(0, node.lastIndexOf('.') + 1);
+    gate({ context, resources: input('prepare', 'resources'), 'expected-resources-sha': args['expected-resources-sha'],
+      candidate: input(prefix + 'implement', 'candidate'), validation: input(prefix + 'implement', 'validation'),
+      'change-summary': input(prefix + 'implement', 'change-summary'), correctness: input(prefix + 'review-correctness', 'review'),
+      regression: input(prefix + 'review-regression', 'review'), round: String(runtimeRound()), out: path.join(output, 'result.json') });
+    add('gate-result', 'json', 'result.json'); add('release-candidate', 'json', 'release-candidate.json'); add('feedback', 'markdown', 'feedback.md');
+    if (fs.existsSync(path.join(output, 'independent-validation.json'))) {
+      add('independent-validation', 'json', 'independent-validation.json');
+      for (const check of read(local('independent-validation.json')).checks) { regular(output, check.log.path); add('independent-' + check.id, 'log', check.log.path); }
+    }
+  } else {
+    const bound = { context, release: input('development-review-loop', 'release-candidate') };
+    const id = node.replace(/#[0-9]+$/, '');
+    if (id === 'prepare-mr') {
+      const review = read(context).mode === 'review';
+      delivery({ ...bound, draft: local('mr-draft.json'), ...(review ? { comment: local('review-comment.md') } : { title: local('mr-title.txt'), body: local('mr-body.md') }) });
+      add('mr-draft', 'json', 'mr-draft.json'); add('delivery-plan', 'json', 'result.json');
+      for (const [name, kind, filename] of review ? [['review-comment', 'markdown', 'review-comment.md']] : [['mr-title', 'text', 'mr-title.txt'], ['mr-body', 'markdown', 'mr-body.md']]) add(name, kind, filename);
+    } else {
+      const planned = { ...bound, plan: input('prepare-mr', 'delivery-plan') };
+      if (id === 'check-delivery') {
+        const observed = fs.existsSync(path.join(output, 'observed-identity.json')) ? local('observed-identity.json') : undefined;
+        route({ ...planned, out: path.join(output, 'result.json'), 'observed-identity': observed });
+        add('route', 'json', 'result.json'); if (observed) add('observed-identity', 'json', 'observed-identity.json');
+      } else if (id === 'verify-publication') {
+        const comment = read(planned.plan).action === 'comment';
+        verifyPublication({ ...planned, route: input('check-delivery', 'route'), observed: local('observed-pr.json'),
+          ...(comment ? { 'observed-comment': local('observed-comment.md') } : {}), out: path.join(output, 'verification.json') });
+        add('verification', 'json', 'verification.json'); add('observed-pr', 'json', 'observed-pr.json');
+        if (comment) add('observed-comment', 'markdown', 'observed-comment.md');
+      } else if (id === 'complete') { completeStage(planned, input, output); return; }
+      else throw new Error('unsupported mechanical stage');
+    }
+  }
+  publish({ entries });
+}
 function publish(args, checkpoint = false) {
   const output = process.env.BOTMUX_GOAL_OUTPUT_DIR, manifest = process.env.BOTMUX_GOAL_MANIFEST_PATH;
   requireThat(output && manifest, 'goal output/manifest environment required');
@@ -599,6 +731,7 @@ try {
   else if (mode === 'push') push(args);
   else if (mode === 'route') route(args);
   else if (mode === 'verify-publication') verifyPublication(args);
+  else if (mode === 'stage') stage(args);
   else if (mode === 'publish') publish(args);
   else if (mode === 'checkpoint') publish(args, true);
   else throw new Error('unsupported development-review tool mode');
