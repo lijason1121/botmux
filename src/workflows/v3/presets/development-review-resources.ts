@@ -246,17 +246,25 @@ function checkWorkspaceLinks(worktree, source, modules, files) {
   requireThat(Array.isArray(patterns) && patterns.length && patterns.every(value => typeof value === 'string' && !value.includes('..') && !value.startsWith('/')), 'workspace package patterns required');
   const match = (pattern, directory) => new RegExp('^' + pattern.replace(/[.+^$(){}|[\]\\]/g, '\\$&')
     .replace(/\*\*/g, '\0').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\0/g, '.*') + '$').test(directory);
+  const packages = new Map();
   for (const file of files.filter(file => file !== 'package.json' && file.endsWith('/package.json'))) {
     const directory = path.posix.dirname(file);
     if (!patterns.some(pattern => !pattern.startsWith('!') && match(pattern, directory)) || patterns.some(pattern => pattern.startsWith('!') && match(pattern.slice(1), directory))) continue;
     const name = read(path.join(worktree, file)).name;
     requireThat(typeof name === 'string' && /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(name), 'workspace package name required');
+    requireThat(!packages.has(name), 'duplicate workspace package name');
+    packages.set(name, directory);
+  }
+  for (const [name, directory] of packages) {
     const installed = path.join(modules, name);
-    requireThat(fs.realpathSync(installed) === fs.realpathSync(path.join(source, path.dirname(file))), 'workspace link points outside the matching snapshot');
-    const child = read(path.join(worktree, file));
+    requireThat(fs.realpathSync(installed) === fs.realpathSync(path.join(source, directory)), 'workspace link points outside the matching snapshot');
+    const child = read(path.join(worktree, directory, 'package.json'));
     for (const dependency of Object.keys({ ...child.dependencies, ...child.devDependencies })) {
       requireThat(/^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(dependency), 'invalid workspace dependency name');
-      requireThat(fs.existsSync(path.join(source, directory, 'node_modules', dependency, 'package.json')) || fs.existsSync(path.join(modules, dependency, 'package.json')), 'workspace dependency missing: ' + dependency);
+      const local = path.join(source, directory, 'node_modules', dependency);
+      const resolved = fs.existsSync(path.join(local, 'package.json')) ? local : path.join(modules, dependency);
+      requireThat(fs.existsSync(path.join(resolved, 'package.json')), 'workspace dependency missing: ' + dependency);
+      if (packages.has(dependency)) requireThat(fs.realpathSync(resolved) === fs.realpathSync(path.join(source, packages.get(dependency))), 'nested workspace link points outside the matching snapshot');
     }
   }
 }
