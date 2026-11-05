@@ -7,6 +7,8 @@ import { createDevelopmentReviewPreset, type DevelopmentReviewDefaultBots } from
 // Earlier embedded tools contained non-ASCII text, so Bun and Node produced different
 // bytes for the same build; both variants of those builds are listed.
 const PREVIOUS_DRAFT_SHA256 = new Set([
+  '983e803a7ce70baec19dcd759cf557e4b133747d453447947a8940cc5486cb56',
+  '4c6da8a39deacceb4d050ce1c4ed3940b115bff967f599b277e0246e5bd5e5d7',
   '22b2d3126fbe267db96a872de51d954c15f8d6535bf91ba06b8fd6014b0ac6fc',
   'b6bbebfd95baf3980c64ee195c8ef072257a7185f06a106968cbb007305d8f7e',
   '17d8452a966011acc59f3b0226d14734c5fc20779b7df67424f7cf323cfa8190',
@@ -24,7 +26,7 @@ const PREVIOUS_DRAFT_SHA256 = new Set([
 export function upgradeDevelopmentReviewPreset(draft: SavedWorkflowRevisionDraft): SavedWorkflowRevisionDraft | undefined {
   const names = ['developer', 'correctness', 'regression'] as const;
   const defaults = Object.fromEntries(names.map(name => [name, draft.roles?.[name]?.defaultBot]));
-  if (names.some(name => !defaults[name]) || new Set(Object.values(defaults)).size !== 3) return undefined;
+  if (names.some(name => !defaults[name]) || defaults.developer === defaults.correctness || defaults.developer === defaults.regression) return undefined;
   const substitutions = new Map(names.map(name => [defaults[name], `cli_${name}`]));
   const normalized = JSON.parse(JSON.stringify(draft), (_key, value: unknown) =>
     typeof value === 'string' ? substitutions.get(value) ?? value : value);
