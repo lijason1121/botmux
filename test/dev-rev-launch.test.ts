@@ -90,6 +90,12 @@ describe('dev-rev interactive launcher', () => {
     expect(readFileSync(oldPath, 'utf8')).toBe(oldBytes);
     expect(deps.driveDetached).toHaveBeenCalledTimes(1);
   });
+  it('accepts the IM message context including humanTurn and keeps it across reload', async () => {
+    for (const humanTurn of [true, false]) {
+      const request = await open({ context: { ...context, humanTurn }, requestKey: `message-human-${humanTurn}` });
+      expect(readDevRevLaunch(dataDir, request.id).context.humanTurn).toBe(humanTurn);
+    }
+  });
   it('parses the short IM invocation and opens one durable form without creating any run', async () => {
     expect(parseV3SavedWorkflowCommand('/workflow run dev-rev')).toMatchObject({ kind: 'run', ref: 'dev-rev', rawParams: {} });
     const [a, b] = await Promise.all([open(), open()]);
