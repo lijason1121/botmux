@@ -17,9 +17,12 @@ const object = value => value && typeof value === 'object' && !Array.isArray(val
 const requireThat = (ok, message) => { if (!ok) throw new Error(message); };
 const version = (value, label) => requireThat(object(value) && value.schemaVersion === 1, label + ' schemaVersion must be 1');
 function atomic(filename, value) {
+  atomicText(filename, JSON.stringify(value, null, 2) + '\n');
+}
+function atomicText(filename, value) {
   const temporary = filename + '.tmp-' + process.pid;
   const fd = fs.openSync(temporary, 'wx', 0o600);
-  try { fs.writeFileSync(fd, JSON.stringify(value, null, 2) + '\n'); fs.fsyncSync(fd); }
+  try { fs.writeFileSync(fd, value); fs.fsyncSync(fd); }
   finally { fs.closeSync(fd); }
   fs.renameSync(temporary, filename);
 }
@@ -581,6 +584,15 @@ function stageInputs() {
     return input.path;
   };
 }
+// Evidence text is data even when it contains headings, HTML or unfinished
+// fences. A delimiter longer than any run in the text cannot be closed by it.
+function reportBlock(value, language = 'text') {
+  const text = String(value);
+  let longest = 2;
+  for (const match of text.matchAll(/\x60+/g)) longest = Math.max(longest, match[0].length);
+  const fence = String.fromCharCode(96).repeat(longest + 1);
+  return fence + language + '\n' + text + (text.endsWith('\n') ? '' : '\n') + fence;
+}
 function completeStage(args, input, output) {
   const { deliveryPlan: planned, context, release } = checkPlan(args);
   cleanHead(context, planned.headSha, 'completion candidate');
@@ -620,20 +632,21 @@ function completeStage(args, input, output) {
     validationFailures: release.gate.validationFailures || [], unresolvedFindings: release.gate.unresolvedFindings,
     planSha256: digest(args.plan), ...(verified ? { verificationSha256: digest(input('verify-publication', 'verification')) } : {}) };
   const lines = ['# Task report', '', 'Mode: ' + completion.mode, 'Action: ' + completion.action,
-    'PR: ' + (url || '(none)'), 'Head: ' + completion.headSha, 'Base: ' + completion.baseSha,
+    'PR:', reportBlock(url || '(none)'), 'Source branch:', reportBlock(completion.sourceBranch),
+    'Target branch:', reportBlock(completion.targetBranch), 'Head: ' + completion.headSha, 'Base: ' + completion.baseSha,
     'Pushed: ' + completion.pushed, 'Commented: ' + completion.commented,
-    'Human approval required: ' + completion.approvalRequired, '', '## Delivery summary', '', inert(planned.summary),
-    '', '## Changes, validation and limitations', '', inert(evidence['change-summary']),
-    '', '## Recorded checks', '', inert(JSON.stringify(evidence.validation.checks, null, 2)),
-    '', '## Independent checks', '', inert(JSON.stringify(evidence['independent-validation'].checks, null, 2)),
-    '', '## Review findings (including nits)', '', inert(JSON.stringify(completion.unresolvedFindings, null, 2)),
+    'Human approval required: ' + completion.approvalRequired, '', '## Delivery summary', '', reportBlock(planned.summary),
+    '', '## Changes, validation and limitations', '', reportBlock(evidence['change-summary']),
+    '', '## Recorded checks', '', reportBlock(JSON.stringify(evidence.validation.checks, null, 2), 'json'),
+    '', '## Independent checks', '', reportBlock(JSON.stringify(evidence['independent-validation'].checks, null, 2), 'json'),
+    '', '## Review findings (including nits)', '', reportBlock(JSON.stringify(completion.unresolvedFindings, null, 2), 'json'),
     '', 'Failed checks: ' + JSON.stringify(completion.validationFailures)];
   for (const role of ['correctness', 'regression']) {
     const review = evidence[role];
-    lines.push('', '## ' + role, '', 'Decision: ' + review.decision,
-      'Coverage: ' + inert(JSON.stringify(review.coverage)), 'Evidence: ' + inert(JSON.stringify(review.evidence)));
+    lines.push('', '## ' + role, '', 'Decision: ' + review.decision, '',
+      'Coverage:', reportBlock(JSON.stringify(review.coverage), 'json'), 'Evidence:', reportBlock(JSON.stringify(review.evidence), 'json'));
   }
-  fs.writeFileSync(path.join(output, 'task-report.md'), lines.join('\n') + '\n', { mode: 0o600 });
+  atomicText(path.join(output, 'task-report.md'), lines.join('\n') + '\n');
   atomic(path.join(output, 'completion.json'), completion);
   publish({ entries: [['task-report', 'markdown', 'task-report.md'], ['completion', 'json', 'completion.json'],
     ...(observed ? [['observed-pr', 'json', 'observed-pr.json']] : [])] });
