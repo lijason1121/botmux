@@ -89,8 +89,8 @@ function checkPlan(args) {
   if (action === 'comment') {
     requireThat(typeof deliveryPlan.commentBody === 'string' && deliveryPlan.commentBody === commentText(deliveryPlan.commentBody) &&
       sha(Buffer.from(deliveryPlan.commentBody)) === deliveryPlan.commentSha256 &&
-      deliveryPlan.commentBody.startsWith(commentPrefix(release.gate)) &&
-      !deliveryPlan.commentBody.slice(commentPrefix(release.gate).length).includes('<'), 'planned comment does not carry every finding');
+      deliveryPlan.commentBody.startsWith(commentPrefix(release.gate, context)) &&
+      !deliveryPlan.commentBody.slice(commentPrefix(release.gate, context).length).includes('<'), 'planned comment does not carry every finding');
   }
   return { deliveryPlan, context, release };
 }
@@ -101,18 +101,30 @@ function boundPlan(args) {
 }
 // Raw HTML (e.g. an unclosed comment) could hide or restyle the following text when rendered.
 function inert(text) { return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+// Keep the frozen private evidence intact. Public material has repository
+// locations or diagnostic basenames, never worker/home/run directory names.
+function publicText(value, context) {
+  let text = String(value);
+  for (const root of [context.worktree, context.repo].filter(Boolean).sort((a, b) => b.length - a.length)) {
+    text = text.split(root + path.sep).join('');
+  }
+  return text.split(/(https?:\/\/[^\s<>"'\x60\]\)]+)/g).map((part, index) => index % 2 ? part : part
+    .replace(/(^|[^A-Za-z0-9_.\/-])(?:file:\/\/)?(?:[A-Za-z]:[\\/]|\\\\|\/)[^\s<>"'\x60\]\)\uFF0C\u3002\uFF1B]+/g,
+      (match, before) => before + 'diagnostic:' + match.slice(before.length).replace(/\\/g, '/').split('/').pop())
+    .replace(/(?:\.?botmux\/)?v3-runs\/[^\s<>"'\x60\]\)]+/g, value => 'diagnostic:' + value.split('/').pop())).join('');
+}
 // The findings section is generated from the gate and comes first; the developer's note
 // follows it, so nothing the developer writes can drop, soften or hide the findings.
-function commentPrefix(gate) {
+function commentPrefix(gate, context) {
   const findings = gate.unresolvedFindings, failures = gate.validationFailures || [];
   const lines = [findings.length || failures.length
     ? '\u7ED3\u8BBA\uFF1A\u9700\u8981\u4FEE\u6539\uFF08' + findings.length + ' \u6761\u610F\u89C1\uFF0C' + failures.length + ' \u9879\u68C0\u67E5\u5931\u8D25\uFF09' : '\u7ED3\u8BBA\uFF1A\u8BC4\u5BA1\u901A\u8FC7\uFF0C\u65E0\u9057\u7559\u610F\u89C1'];
-  findings.forEach((finding, index) => lines.push((index + 1) + '. [' + (finding.blocking ? '\u963B\u585E' : '\u5EFA\u8BAE') + '] ' + inert(finding.location),
-    '   \u5F71\u54CD\uFF1A' + inert(finding.impact), '   \u8BC1\u636E\uFF1A' + inert(finding.evidence)));
+  findings.forEach((finding, index) => lines.push((index + 1) + '. [' + (finding.blocking ? '\u963B\u585E' : '\u5EFA\u8BAE') + '] ' + inert(publicText(finding.location, context)),
+    '   \u5F71\u54CD\uFF1A' + inert(publicText(finding.impact, context)), '   \u8BC1\u636E\uFF1A' + inert(publicText(finding.evidence, context))));
   if (failures.length) lines.push('\u68C0\u67E5\u5931\u8D25\uFF1A' + failures.map(inert).join('\u3001'));
   return commentText(lines.join('\n')) + '\n\n---\n\u8BC4\u5BA1\u8BF4\u660E\uFF1A\n';
 }
-function composeComment(gate, note) { return commentText(commentPrefix(gate) + inert(commentText(note))); }
+function composeComment(gate, note, context) { return commentText(commentPrefix(gate, context) + inert(publicText(commentText(note), context))); }
 // Approval material is rebuilt from the plan's checked fields, not taken from developer prose.
 function approvalMaterial(deliveryPlan, context) {
   const action = deliveryPlan.action, pushes = action === 'create' || action === 'update', existing = deliveryPlan.existingPr;
@@ -196,6 +208,122 @@ function resource(context, filename, expected) {
   const item = manifest.files[0];
   requireThat(item.path === 'tools.mjs' && digest(regular(path.dirname(filename), item.path)) === item.sha256, 'resource bytes changed');
   requireThat(item.sha256 === digest(self), 'wrong fixed tools resource');
+}
+function dependencyFailure(message) {
+  const error = new Error(message);
+  error.code = 'DEPENDENCY_ENVIRONMENT_NOT_READY';
+  throw error;
+}
+function dependencyInputs(worktree) {
+  return git(worktree, ['ls-files', '-z']).split('\0').filter(file => /(^|\/)(package\.json|bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|\.npmrc|\.yarnrc\.yml)$/.test(file)).sort();
+}
+function dependencyDigest(root, files) { return sha(Buffer.from(JSON.stringify(files.map(file => [file, digest(path.join(root, file))])))); }
+function workspaceDigest(root, files) {
+  return sha(Buffer.from(JSON.stringify(files.map(file => {
+    const filename = path.join(root, file), stat = fs.lstatSync(filename);
+    requireThat(stat.isFile() || stat.isSymbolicLink(), 'workspace snapshot contains an unsupported entry');
+    return [file, stat.isSymbolicLink() ? ['link', fs.readlinkSync(filename)] : ['file', digest(filename)]];
+  }))));
+}
+function checkInstalledPackages(modules, names) {
+  for (const name of names) {
+    requireThat(/^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(name), 'invalid dependency name');
+    requireThat(fs.statSync(path.join(modules, name, 'package.json')).isFile(), 'required dependency missing: ' + name);
+  }
+}
+function checkWorkspaceLinks(worktree, source, modules, files) {
+  const pkg = read(path.join(worktree, 'package.json'));
+  let patterns = Array.isArray(pkg.workspaces) ? pkg.workspaces : pkg.workspaces?.packages;
+  if (!patterns && fs.existsSync(path.join(worktree, 'pnpm-workspace.yaml'))) {
+    const yaml = fs.readFileSync(path.join(worktree, 'pnpm-workspace.yaml'), 'utf8');
+    const block = /(?:^|\n)packages:[ \t]*\r?\n((?:[ \t]+[^\n]*\n?|[ \t]*\n)*)/.exec(yaml)?.[1];
+    requireThat(block, 'workspace package patterns must be an explicit list');
+    patterns = block.split('\n').filter(line => line.trim() && !line.trim().startsWith('#')).map(line => {
+      const item = /^\s+-\s+(['"]?)([^'"\s]+)\1\s*(?:#.*)?$/.exec(line);
+      requireThat(item, 'unsupported workspace package pattern'); return item[2];
+    });
+  }
+  requireThat(Array.isArray(patterns) && patterns.length && patterns.every(value => typeof value === 'string' && !value.includes('..') && !value.startsWith('/')), 'workspace package patterns required');
+  const match = (pattern, directory) => new RegExp('^' + pattern.replace(/[.+^$(){}|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '\0').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\0/g, '.*') + '$').test(directory);
+  for (const file of files.filter(file => file !== 'package.json' && file.endsWith('/package.json'))) {
+    const directory = path.posix.dirname(file);
+    if (!patterns.some(pattern => !pattern.startsWith('!') && match(pattern, directory)) || patterns.some(pattern => pattern.startsWith('!') && match(pattern.slice(1), directory))) continue;
+    const name = read(path.join(worktree, file)).name;
+    requireThat(typeof name === 'string' && /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(name), 'workspace package name required');
+    const installed = path.join(modules, name);
+    requireThat(fs.realpathSync(installed) === fs.realpathSync(path.join(source, path.dirname(file))), 'workspace link points outside the matching snapshot');
+    const child = read(path.join(worktree, file));
+    for (const dependency of Object.keys({ ...child.dependencies, ...child.devDependencies })) {
+      requireThat(/^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(dependency), 'invalid workspace dependency name');
+      requireThat(fs.existsSync(path.join(source, directory, 'node_modules', dependency, 'package.json')) || fs.existsSync(path.join(modules, dependency, 'package.json')), 'workspace dependency missing: ' + dependency);
+    }
+  }
+}
+function prepareDependencies(worktree, repository, checked, replaceTaskLink = false) {
+  if (!fs.existsSync(path.join(worktree, 'package.json'))) return { state: 'not-required' };
+  const pkg = read(path.join(worktree, 'package.json'));
+  const hasWorkspaces = !!pkg.workspaces || fs.existsSync(path.join(worktree, 'pnpm-workspace.yaml'));
+  const required = Object.entries({ ...pkg.dependencies, ...pkg.devDependencies }).filter(([, spec]) => !String(spec).startsWith('workspace:'));
+  if (!required.length && !hasWorkspaces) return { state: 'not-required' };
+  try {
+    requireThat(checked.dependencyReuseAllowed === true, 'preflight must approve dependency reuse under repository rules');
+    const source = fs.realpathSync(checked.dependencySourcePath || repository), files = dependencyInputs(worktree);
+    requireThat(files.includes('package.json') && files.some(file => /(^|\/)(bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(file)), 'frozen dependency lockfile required');
+    const inputsSha256 = dependencyDigest(worktree, files);
+    requireThat(dependencyDigest(source, files) === inputsSha256, 'dependency source manifests/lockfiles differ from the task checkout');
+    const modules = fs.realpathSync(path.join(source, 'node_modules'));
+    requireThat(fs.statSync(modules).isDirectory(), 'dependency source node_modules missing');
+    const names = required.map(([name]) => name);
+    checkInstalledPackages(modules, names);
+    let workspace;
+    if (hasWorkspaces) {
+      requireThat(source !== repository && source !== worktree && modules.startsWith(source + path.sep), 'workspaces require an independently installed snapshot outside the repository/worktree');
+      const snapshotFiles = git(worktree, ['ls-files', '-z']).split('\0').filter(Boolean).sort();
+      const snapshotSha256 = workspaceDigest(worktree, snapshotFiles);
+      requireThat(workspaceDigest(source, snapshotFiles) === snapshotSha256, 'workspace source code differs from the task snapshot');
+      checkWorkspaceLinks(worktree, source, modules, files);
+      workspace = { sha256: snapshotSha256 };
+    }
+    const target = path.join(worktree, 'node_modules');
+    // An explicit record --dependency-source can detach this clean task's
+    // dependency link, including one prepared in an earlier development round.
+    // Never remove a directory or write into the link's shared target.
+    if (replaceTaskLink && fs.lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()
+      && fs.realpathSync(target) !== modules) fs.unlinkSync(target);
+    if (fs.existsSync(target) || fs.lstatSync(target, { throwIfNoEntry: false })) {
+      requireThat(fs.realpathSync(target) === modules, 'task dependencies already point to a different environment');
+    } else fs.symlinkSync(modules, target, process.platform === 'win32' ? 'junction' : 'dir');
+    requireThat(!git(worktree, ['status', '--porcelain', '--', 'node_modules']), 'repository rules must ignore the prepared dependency link');
+    return { state: 'ready', source, inputsSha256, files, modules, names, ...(workspace ? { workspace } : {}) };
+  } catch (error) { dependencyFailure(error.message); }
+}
+function checkDependencies(context, dependencies = context.dependencies) {
+  if (dependencies?.state !== 'ready') {
+    if (fs.existsSync(path.join(context.worktree, 'package.json'))) {
+      const pkg = read(path.join(context.worktree, 'package.json'));
+      if (Object.keys({ ...pkg.dependencies, ...pkg.devDependencies }).length || pkg.workspaces || fs.existsSync(path.join(context.worktree, 'pnpm-workspace.yaml'))) {
+        dependencyFailure('prepare a matching dependency source and pass record --dependency-source before validation');
+      }
+    }
+    return;
+  }
+  const { source, files, inputsSha256, modules } = dependencies;
+  try {
+    requireThat(dependencyDigest(context.worktree, dependencyInputs(context.worktree)) === inputsSha256 && dependencyDigest(source, files) === inputsSha256,
+      'dependency inputs changed; prepare a matching isolated environment before validation');
+    requireThat(fs.realpathSync(path.join(context.worktree, 'node_modules')) === modules && fs.realpathSync(path.join(source, 'node_modules')) === modules && fs.statSync(modules).isDirectory(), 'prepared dependencies are unavailable');
+    const pkg = read(path.join(context.worktree, 'package.json'));
+    checkInstalledPackages(modules, Object.keys({ ...pkg.dependencies, ...pkg.devDependencies }));
+    const workspace = dependencies.workspace;
+    if (pkg.workspaces || fs.existsSync(path.join(context.worktree, 'pnpm-workspace.yaml'))) {
+      requireThat(workspace && source !== context.repo && source !== context.worktree && modules.startsWith(source + path.sep), 'workspace dependencies must use an independent snapshot');
+      const snapshotFiles = git(context.worktree, ['ls-files', '-z']).split('\0').filter(Boolean).sort();
+      requireThat(workspaceDigest(context.worktree, snapshotFiles) === workspace.sha256 && workspaceDigest(source, snapshotFiles) === workspace.sha256,
+        'workspace code changed; prepare a new task-specific dependency snapshot');
+      checkWorkspaceLinks(context.worktree, source, modules, dependencyInputs(context.worktree));
+    }
+  } catch (error) { dependencyFailure(error.message); }
 }
 function prepare(args) {
   const output = process.env.BOTMUX_GOAL_OUTPUT_DIR;
@@ -302,13 +430,14 @@ function prepare(args) {
     requireThat(fs.realpathSync(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])) === fs.realpathSync(git(repository, ['rev-parse', '--path-format=absolute', '--git-common-dir'])), 'existing worktree belongs to another repository');
     requireThat(git(worktree, ['branch', '--show-current']) === branch && git(worktree, ['rev-parse', 'HEAD']) === startSha && !git(worktree, ['status', '--porcelain']), 'existing worktree is not this pristine preparation');
   }
+  const dependencies = prepareDependencies(worktree, repository, checked);
   const manifest = { preset: 'development-review', version: 1, files: [{ path: 'tools.mjs', sha256: digest(self) }] };
   atomic(path.join(output, 'resources.json'), manifest);
   const context = { schemaVersion: 1, runId: checked.runId, mode, repo: repository, worktree, branch, targetBranch,
     ...(object(recovery) && recovery.sourceRunId ? { recoveredFrom: { runId: recovery.sourceRunId, attemptId: recovery.sourceAttemptId,
       candidateSha256: recovery.candidateSha256, journalSha256: recovery.journalSha256 } } : {}),
     baseSha, startSha, ...(reviewTarget ? { reviewTarget } : {}), ...(repositoryCliPath ? { repositoryCliPath } : {}), login, requirement, requirementSha256: sha(Buffer.from(requirement)), roles: selected,
-    validationCommands: commands, preflightSha256: digest(args.preflight), resourcesSha256: digest(path.join(output, 'resources.json')) };
+    dependencies, validationCommands: commands, preflightSha256: digest(args.preflight), resourcesSha256: digest(path.join(output, 'resources.json')) };
   atomic(path.join(output, 'context.json'), context);
   atomic(path.join(output, 'result.json'), { ready: true, runId: checked.runId, mode, baseSha, startSha });
 }
@@ -325,7 +454,8 @@ function candidate(args) {
   atomic(path.join(output, 'candidate.json'), { schemaVersion: 1, runId: context.runId, repo: context.repo, baseSha: context.baseSha,
     headSha, round, contextSha256: digest(args.context), resourcesSha256: context.resourcesSha256 });
 }
-function runChecks(context, output, prefix) {
+function runChecks(context, output, prefix, dependencies = context.dependencies) {
+  checkDependencies(context, dependencies);
   return plan(context.validationCommands).map(command => {
     const startedAtMs = Date.now(), before = git(context.worktree, ['rev-parse', 'HEAD']);
     const result = spawnSync(command.argv[0], command.argv.slice(1), { cwd: context.worktree, encoding: 'utf8', timeout: command.timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024, shell: false });
@@ -344,8 +474,14 @@ function record(args) {
   requireThat(Number.isSafeInteger(candidate.round) && Number(args.round) === candidate.round && candidate.round === runtimeRound(), 'wrong current round');
   requireThat(candidate.contextSha256 === digest(args.context) && candidate.resourcesSha256 === context.resourcesSha256, 'candidate context/resource mismatch');
   requireThat(git(context.worktree, ['rev-parse', 'HEAD']) === candidate.headSha && !git(context.worktree, ['status', '--porcelain']), 'candidate must be the clean live HEAD');
+  let dependencies = context.dependencies;
+  if (args['dependency-source']) {
+    requireThat(context.mode !== 'review', 'review mode must use its prepared dependencies');
+    dependencies = prepareDependencies(context.worktree, context.repo,
+      { dependencyReuseAllowed: true, dependencySourcePath: args['dependency-source'] }, true);
+  }
   const validation = { schemaVersion: 1, runId: candidate.runId, repo: candidate.repo, baseSha: candidate.baseSha, headSha: candidate.headSha,
-    round: candidate.round, candidateSha256: digest(args.candidate), contextSha256: digest(args.context), checks: runChecks(context, output, '') };
+    round: candidate.round, candidateSha256: digest(args.candidate), contextSha256: digest(args.context), dependencies, checks: runChecks(context, output, '', dependencies) };
   validation.completedAtMs = Date.now();
   atomic(path.join(output, 'validation.json'), validation);
 }
@@ -390,7 +526,8 @@ function gate(args) {
       }
     }
     // validation.json is developer-authored: re-run every check here and require the same outcome.
-    const rerun = runChecks(context, path.dirname(args.out), 'independent-');
+    requireThat(mode !== 'review' || JSON.stringify(validation.dependencies) === JSON.stringify(context.dependencies), 'review dependency environment changed');
+    const rerun = runChecks(context, path.dirname(args.out), 'independent-', validation.dependencies);
     atomic(path.join(path.dirname(args.out), 'independent-validation.json'), { schemaVersion: 1, runId: candidate.runId, headSha: candidate.headSha, checks: rerun });
     requireThat(git(context.worktree, ['rev-parse', 'HEAD']) === candidate.headSha, 'independent validation changed HEAD');
     rerun.forEach((check, index) => requireThat(check.exitCode === validation.checks[index].exitCode &&
@@ -463,7 +600,7 @@ function delivery(args) {
       requireThat(headSha === context.startSha, 'review mode must not change the PR head');
       const preface = commentText(fs.readFileSync(args.comment, 'utf8'));
       requireThat(preface, 'review comment required');
-      commentBody = composeComment(release.gate, preface);
+      commentBody = composeComment(release.gate, preface, context);
       action = 'comment';
     } else {
       prHead = remoteHead(context.repo, draft.pushRemote, sourceBranch);
@@ -483,9 +620,9 @@ function delivery(args) {
   const approvalRequired = publicationRequired && !ownComment(context, action);
   const result = { schemaVersion: 1, runId: context.runId, mode, action, publicationRequired,
     approvalRequired, directPublish: publicationRequired && !approvalRequired,
-    repository: draft.repository, summary: draft.summary, existingPr: existing || null, pushRemote: mode === 'review' ? null : draft.pushRemote || null,
+    repository: publicText(draft.repository, context), summary: publicText(draft.summary, context), existingPr: existing || null, pushRemote: mode === 'review' ? null : draft.pushRemote || null,
     sourceBranch, targetBranch: context.targetBranch, headSha, baseSha: context.baseSha, prHead,
-    title: title || null, body: body || null,
+    title: title ? publicText(title, context) : null, body: body ? publicText(body, context) : null,
     commentBody, commentSha256: commentBody ? sha(Buffer.from(commentBody)) : null,
     releaseSha256: digest(args.release), contextSha256: digest(args.context), draftSha256: digest(args.draft),
     titleSha256: args.title ? digest(args.title) : null, bodySha256: args.body ? digest(args.body) : null };
@@ -671,6 +808,11 @@ function stage(args) {
       add('independent-validation', 'json', 'independent-validation.json');
       for (const check of read(local('independent-validation.json')).checks) { regular(output, check.log.path); add('independent-log-' + check.id, 'log', check.log.path); }
     }
+    const decision = read(local('result.json'));
+    if (decision.mode === 'review' && !decision.passed) {
+      publish({ entries, error: { code: 'REVIEW_EVIDENCE_INCOMPLETE', message: decision.reasons.join('; '), retryable: true } });
+      return;
+    }
   } else {
     const bound = { context, release: input('development-review-loop', 'release-candidate') };
     const id = node.replace(/#[0-9]+$/, '');
@@ -723,10 +865,10 @@ function publish(args, checkpoint = false) {
       error: { code: 'CHECKPOINT_INCOMPLETE', message: 'Work remains; this is not an approval.', retryable: true }, files });
     return;
   }
-  atomic(manifest, { schemaVersion: 1, status: 'ok', summary: args.summary || 'Products delivered; decisions are in the artifacts.', files });
+  atomic(manifest, { schemaVersion: 1, status: args.error ? 'fail' : 'ok', ...(args.error ? { error: args.error } : {}), summary: args.summary || 'Products delivered; decisions are in the artifacts.', files });
 }
 const args = { entries: [] }, mode = process.argv[2];
-const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment', 'observed-identity', 'route']);
+const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment', 'observed-identity', 'route', 'dependency-source']);
 try {
   for (let index = 3; index < process.argv.length; index++) {
     const flag = process.argv[index];
@@ -748,7 +890,13 @@ try {
   else if (mode === 'publish') publish(args);
   else if (mode === 'checkpoint') publish(args, true);
   else throw new Error('unsupported development-review tool mode');
-} catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 2; }
+} catch (error) {
+  if (error.code === 'DEPENDENCY_ENVIRONMENT_NOT_READY' && process.env.BOTMUX_GOAL_MANIFEST_PATH) {
+    atomic(process.env.BOTMUX_GOAL_MANIFEST_PATH, { schemaVersion: 1, status: 'fail', summary: 'Dependency environment requires preparation before review.',
+      error: { code: error.code, message: error.message, retryable: true }, files: [] });
+  }
+  process.stderr.write(error.message + '\n'); process.exitCode = 2;
+}
 `;
 
 export const DEVELOPMENT_REVIEW_RESOURCE_VERSION = 1;

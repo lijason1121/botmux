@@ -94,6 +94,33 @@ function manager(tx: V3ProgressCardTransport, now = new Date('2026-07-11T00:05:0
 }
 
 describe('V3ProgressCardManager', () => {
+  it('posts a durable failure notice even when the progress card PATCH succeeds', async () => {
+    const runDir = seedRun('progress-failure-notice'), tx = transport(), cards = manager(tx);
+    await cards.refresh('progress-failure-notice', { allowCreate: true });
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runFailed', failedNodeId: 'work' });
+    expect(await cards.finalize('progress-failure-notice')).toBe(true);
+    expect(tx.patch).toHaveBeenCalledTimes(1);
+    expect(tx.reply).toHaveBeenCalledTimes(2);
+    const notice = vi.mocked(tx.reply).mock.calls[1]!;
+    expect(notice[2]).toContain('ou_owner');
+    expect(notice[3]).not.toBe(vi.mocked(tx.reply).mock.calls[0]![3]);
+    await manager(tx).coldAttach('cli_test');
+    expect(tx.reply).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays the same failure delivery UUID after a lost receipt and daemon restart', async () => {
+    const runDir = seedRun('progress-failure-restart'), tx = transport(), cards = manager(tx);
+    await cards.refresh('progress-failure-restart', { allowCreate: true });
+    appendEvent(join(runDir, 'journal.ndjson'), { type: 'runFailed', failedNodeId: 'work' });
+    vi.mocked(tx.reply).mockRejectedValueOnce(new Error('receipt lost'));
+    expect(await cards.finalize('progress-failure-restart')).toBe(false);
+    const uuid = vi.mocked(tx.reply).mock.calls[1]![3];
+    await manager(tx).coldAttach('cli_test');
+    expect(tx.reply).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(tx.reply).mock.calls[2]![3]).toBe(uuid);
+    await cards.refresh('progress-failure-restart', { allowCreate: true });
+    expect(tx.reply).toHaveBeenCalledTimes(3);
+  });
   it('persists a 0600 pending intent before one reply and PATCHes only visual changes', async () => {
     const runDir = seedRun('progress-001');
     const sidecarPath = join(runDir, V3_PROGRESS_SIDECAR);

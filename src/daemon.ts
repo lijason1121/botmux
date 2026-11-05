@@ -7322,7 +7322,10 @@ const v3GateRunner = createV3GateRunner({
     }
   },
   notifyTerminal: async (binding, runId, outcome) => {
-    if (await v3ProgressCardManager.finalize(runId)) return;
+    const projected = await v3ProgressCardManager.finalize(runId);
+    // Failure notifications have their own durable send intent and retry UUID.
+    // An uncertain receipt must not trigger an additional untracked fallback.
+    if (projected || outcome.runStatus === 'failed' || outcome.runStatus === 'blocked') return;
     if (!binding) return;
     const msg = outcome.runStatus === 'succeeded'
       ? `✅ v3 workflow \`${runId}\` 跑完了`
