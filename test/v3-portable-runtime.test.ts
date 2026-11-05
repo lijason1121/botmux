@@ -21,6 +21,7 @@ import { createInProcessAttemptLeaseProvider } from '../src/workflows/v3/in-proc
 import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
 import { assertOrCreatePortableRunSnapshot } from '../src/workflows/v3/portable-run-snapshot.js';
 import { runPortableWorkflow } from '../src/workflows/v3/portable-runtime.js';
+import { readAndValidateManifest } from '../src/workflows/v3/manifest.js';
 import type {
   AgentExecutionRequest,
   AgentExecutor,
@@ -96,6 +97,50 @@ function trackedInProcessLeaseProvider(): {
 }
 
 describe('portable workflow runtime', () => {
+  it.each(['checkpoint', 'history', 'tampered', 'cancelled'] as const)('continues an orphan only after close proof with same-input progress: %s', async mode => {
+    const baseDir = mkdtempSync(join(tmpdir(), 'portable-orphan-progress-'));
+    try {
+      const dag = validateDag({ runId: 'orphan-progress', nodes: [{ id: 'work', type: 'goal', goal: 'review candidate' }] });
+      let attempts = 0, previousOutput = '';
+      const received: Array<{ from: string; path: string }> = [];
+      const executeAgent: AgentExecutor = async request => {
+        if (++attempts === 1) {
+          previousOutput = request.outputDir;
+          const { inputHash } = JSON.parse(readFileSync(join(request.attemptDir, 'checkpoint-context.json'), 'utf8'));
+          writeFileSync(join(request.attemptDir, 'pty.log'), 'targeted probe completed; full gate remains');
+          if (mode !== 'history') writeFileSync(join(request.outputDir, 'checkpoint.json'), JSON.stringify({
+            schemaVersion: 1, status: 'fail', summary: 'partial', inputHash,
+            error: { code: 'CHECKPOINT_INCOMPLETE', message: 'work remains', retryable: true },
+            files: [outputFile(request, 'progress.md', 'verified targeted probe', 'markdown')],
+          }));
+          return { status: 'fail', failureReason: 'timeout', failureDetail: 'node timed out after 1800s', manifestPath: request.env.BOTMUX_GOAL_MANIFEST_PATH! };
+        }
+        received.push(...JSON.parse(readFileSync(request.inputsPath, 'utf8')).inputs);
+        return succeed(request, [outputFile(request, 'report.md', 'remaining evidence verified', 'markdown')]);
+      };
+      const provider: AttemptLeaseProvider = {
+        acquire: () => ({}), closeBeforeExecution: () => {}, cleanupSettled: () => {},
+        drainExternallyOwned: () => ({ status: 'closed', finalizeAfterProof: () => {} }),
+      };
+      const deps = { executeAgent, resolveExecutionProfile: () => profile(baseDir), attemptLeaseProvider: provider,
+        validateManifest: async (filename: string, outputDir: string) => {
+          try { return { ok: true, manifest: await readAndValidateManifest(filename, outputDir) }; }
+          catch (error) { return { ok: false, problems: [String(error)] }; }
+        } };
+      expect(await runPortableWorkflow(dag, deps, { baseDir })).toMatchObject({ runStatus: 'blocked' });
+      const journal = join(baseDir, dag.runId, 'journal.ndjson');
+      // Simulate loss of the process after progress, before its close/outcome
+      // records: all retained records were produced by the real runtime.
+      const records = readJournal(journal).filter(event => !['nodeBlocked', 'runBlocked'].includes(event.type));
+      writeFileSync(journal, records.map(event => JSON.stringify(event)).join('\n') + '\n');
+      if (mode === 'tampered') writeFileSync(join(previousOutput, 'progress.md'), 'changed');
+      if (mode === 'cancelled') appendEvent(journal, { type: 'runCancelRequested', cancelRequestId: 'user-stop', by: 'user' });
+      expect(await runPortableWorkflow(dag, deps, { baseDir })).toMatchObject({ runStatus: mode === 'cancelled' ? 'cancelled' : 'succeeded' });
+      expect(attempts).toBe(mode === 'cancelled' ? 1 : 2);
+      expect(received.filter(input => input.from === 'checkpoint')).toHaveLength(mode === 'checkpoint' ? 1 : 0);
+      expect(received.filter(input => input.from === 'attempt-history')).toHaveLength(mode === 'history' || mode === 'tampered' ? 1 : 0);
+    } finally { rmSync(baseDir, { recursive: true, force: true }); }
+  });
   it('fails closed for leases not acquired by this provider instance', () => {
     const provider = createInProcessAttemptLeaseProvider();
     const binding = {

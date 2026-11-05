@@ -102,6 +102,31 @@ async function fixture(mode: 'new' | 'review' | 'continue' = 'new', changed = tr
 }
 
 describe('fixed development-review mechanical stages', () => {
+  it('keeps private diagnostic paths out of both the published review and approval', async () => {
+    const f = await fixture('review');
+    const review = json(f.reviews.correctness!);
+    review.decision = 'changes_requested';
+    review.findings = [
+      { blocking: true, location: '/home/private/.botmux/v3-runs/run/build.log', impact: 'Build failed', evidence: 'See C:\\Users\\private\\run\\build.log and /tmp/check.log' },
+      { blocking: false, location: f.ctx.worktree + '/value.txt:1', impact: 'Duplicate', evidence: 'src/example.ts:4' },
+    ];
+    write(f.reviews.correctness!, review);
+    const delivered = await f.delivery(), plan = json(delivered.plan);
+    for (const text of [plan.commentBody, plan.approvalSummary]) {
+      expect(text).not.toMatch(/\/home\/|v3-runs\/|C:\\Users|\/tmp\/|private/);
+      expect(text).toContain('build.log'); expect(text).toContain('value.txt:1');
+      expect(text).toContain('Build failed'); expect(text).toContain('src/example.ts:4');
+    }
+    expect(json(f.reviews.correctness!).findings[0].location).toContain('/home/private');
+  });
+
+  it('blocks inconsistent review evidence at the gate instead of scheduling another full review round', async () => {
+    const f = await fixture('review');
+    const review = json(f.reviews.correctness!); review.decision = 'blocked'; write(f.reviews.correctness!, review);
+    expect(await f.tool('stage', ['--expected-resources-sha', DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256], f.gated, f.gateInputs)).toMatchObject({ code: 0 });
+    expect(json(join(f.gated, 'result.json')).passed).toBe(false);
+    expect(json(join(dirname(f.gated), 'manifest.json'))).toMatchObject({ status: 'fail', error: { code: 'REVIEW_EVIDENCE_INCOMPLETE', retryable: true } });
+  });
   it('materializes the exact frozen tools from the compact authored bootstrap', () => {
     const root = mkdtempSync(join(tmpdir(), 'dev-rev-bootstrap-')); roots.push(root);
     const preset = createDevelopmentReviewPreset({ developer: 'cli_dev', correctness: 'cli_check', regression: 'cli_regression' });
