@@ -27,6 +27,7 @@ import { basename, dirname, join } from 'node:path';
 import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { readJournal } from '../../workflows/v3/journal.js';
+import type { StoredEvent } from '../../workflows/v3/journal.js';
 import { tryLoadEffectiveV3Dag } from '../../workflows/v3/dag-revision.js';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 import { projectV3Progress, type V3ProgressView } from '../../workflows/v3/progress-projection.js';
@@ -52,6 +53,8 @@ export interface V3ProgressCardSidecar {
   delivery: DeliveryState;
   messageId?: string;
   createdAt: string;
+  /** Opted in while live, so upgrading does not announce historical failures. */
+  failureNotifications?: boolean;
   lastProjection?: {
     journalEventCount: number;
     cardSha256: string;
@@ -99,7 +102,12 @@ export class V3ProgressCardManager {
   /** Start a polling observer and schedule an immediate best-effort refresh. */
   observe(runId: string): void {
     if (!isValidRunId(runId) || this.observers.has(runId)) return;
+    this.attachObserver(runId);
     void this.refresh(runId, { allowCreate: true });
+  }
+
+  private attachObserver(runId: string): void {
+    if (!isValidRunId(runId) || this.observers.has(runId)) return;
     const timer = setInterval(() => {
       void this.refresh(runId, { allowCreate: true });
     }, this.deps.pollIntervalMs ?? 2_000);
@@ -107,16 +115,15 @@ export class V3ProgressCardManager {
     this.observers.set(runId, timer);
   }
 
-  /** Stop polling and persist the latest suspended/terminal projection. */
+  /** Persist the boundary; retain polling until pending delivery settles. */
   stopAndRefresh(runId: string): Promise<boolean> {
-    this.stop(runId);
+    this.attachObserver(runId);
     return this.refresh(runId, { allowCreate: true });
   }
 
   /** Terminal refresh. Returns true only when one active card represents it. */
   finalize(runId: string): Promise<boolean> {
-    this.stop(runId);
-    return this.refresh(runId, { allowCreate: true });
+    return this.stopAndRefresh(runId);
   }
 
   stop(runId: string): void {
@@ -157,9 +164,11 @@ export class V3ProgressCardManager {
         const hasSidecar = existsSync(join(runDir, V3_PROGRESS_SIDECAR));
         if (terminal && !hasSidecar) continue;
         if (terminal) {
-          await this.refresh(runId, { allowCreate: false });
+          if (!await this.refresh(runId, { allowCreate: false }) &&
+            (await readSidecar(join(runDir, 'lark-failure-notice.json'), runId))?.delivery === 'pending') this.attachObserver(runId);
         } else if (suspended) {
-          await this.refresh(runId, { allowCreate: true });
+          if (!await this.refresh(runId, { allowCreate: true }) &&
+            (await readSidecar(join(runDir, 'lark-failure-notice.json'), runId))?.delivery === 'pending') this.attachObserver(runId);
         } else await this.refresh(runId, { allowCreate: true });
       } catch (err) {
         this.deps.onError?.(runId, err);
@@ -226,8 +235,8 @@ export class V3ProgressCardManager {
 
       // A terminal action owns the card from this point on. Check it before
       // reading/rendering progress so no older observer can overwrite it.
-      if (sidecar?.delivery === 'frozen' || sidecar?.delivery === 'freeze_pending') return true;
-      if (sidecar?.delivery === 'withdrawn' || sidecar?.delivery === 'uncertain') return false;
+      if (sidecar?.delivery === 'frozen' || sidecar?.delivery === 'freeze_pending') { this.stop(runId); return true; }
+      if (sidecar?.delivery === 'withdrawn' || sidecar?.delivery === 'uncertain') { this.stop(runId); return false; }
 
       // Re-read every projection input *after* taking the cross-process card
       // lock. Otherwise daemon A can build running, daemon B PATCH succeeded,
@@ -261,15 +270,13 @@ export class V3ProgressCardManager {
         ...(loaded.spec ? { spec: loaded.spec } : {}),
         events,
       });
-      if (
+      const settled =
         view.status === 'waiting' ||
         view.status === 'blocked' ||
         view.status === 'succeeded' ||
         view.status === 'failed' ||
-        view.status === 'cancelled'
-      ) {
-        this.stop(runId);
-      }
+        view.status === 'cancelled';
+      const finish = () => { if (settled) this.stop(runId); return true; };
       const cardJson = this.deps.buildCard(view, loaded);
       // Parse once before transport: never persist/checkpoint malformed card JSON.
       JSON.parse(cardJson);
@@ -286,14 +293,24 @@ export class V3ProgressCardManager {
           deliveryUuid: expectedUuid,
           delivery: 'pending',
           createdAt: now.toISOString(),
+          failureNotifications: true,
         };
         await writeSidecar(sidecarPath, sidecar);
       }
+
+      if (!sidecar.failureNotifications && (options.allowCreate || view.status === 'running')) {
+        sidecar = { ...sidecar, failureNotifications: true };
+        await writeSidecar(sidecarPath, sidecar);
+      }
+      // A PATCH creates no notification. Persist a separate, deduplicated send
+      // intent before transport, recoverable on cold attach even after terminal.
+      if (sidecar.failureNotifications) await this.notifyFailure(runDir, loaded, view, events, target, now);
 
       if (sidecar.delivery === 'pending') {
         if (now.getTime() - Date.parse(sidecar.createdAt) >= LARK_DEDUPE_WINDOW_MS) {
           sidecar = { ...sidecar, delivery: 'uncertain' };
           await writeSidecar(sidecarPath, sidecar);
+          this.stop(runId);
           return false;
         }
         try {
@@ -308,7 +325,7 @@ export class V3ProgressCardManager {
             lastProjection: projectionCheckpoint(events.length, cardSha256, now),
           };
           await writeSidecar(sidecarPath, sidecar);
-          return true;
+          return finish();
         } catch (err) {
           if (isWithdrawnError(err)) {
             await writeSidecar(sidecarPath, { ...sidecar, delivery: 'withdrawn' });
@@ -319,7 +336,7 @@ export class V3ProgressCardManager {
       }
 
       assertMessageId(sidecar.messageId);
-      if (sidecar.lastProjection?.cardSha256 === cardSha256) return true;
+      if (sidecar.lastProjection?.cardSha256 === cardSha256) return finish();
       try {
         await this.deps.transport.patch(binding.larkAppId, sidecar.messageId!, cardJson);
       } catch (err) {
@@ -333,8 +350,50 @@ export class V3ProgressCardManager {
         ...sidecar,
         lastProjection: projectionCheckpoint(events.length, cardSha256, now),
       });
-      return true;
+      return finish();
     });
+  }
+
+  private async notifyFailure(runDir: string, loaded: LoadedAuthorizedV3Run, view: V3ProgressView,
+    events: StoredEvent[], target: ProgressTarget, now: Date): Promise<void> {
+    if (view.status !== 'failed' && view.status !== 'blocked') return;
+    let boundary = events.length;
+    while (boundary && events[boundary - 1]!.type !== (view.status === 'failed' ? 'runFailed' : 'runBlocked')) boundary--;
+    if (!boundary) return;
+    const binding = loaded.envelope.chatBinding!;
+    const noticePath = join(runDir, 'lark-failure-notice.json');
+    const uuid = sha256(['v3-failure-notice:v1', view.runId, binding.larkAppId, target.kind, target.id, boundary].join('\0')).slice(0, 40);
+    let notice = await readSidecar(noticePath, view.runId);
+    if (notice && notice.lastProjection?.journalEventCount === boundary) {
+      assertSidecarIdentity(notice, view.runId, binding.larkAppId, target, uuid);
+      if (notice.delivery === 'active' || notice.delivery === 'uncertain' || notice.delivery === 'withdrawn') return;
+    } else {
+      notice = { schemaVersion: 1, runId: view.runId, larkAppId: binding.larkAppId, target,
+        deliveryUuid: uuid, delivery: 'pending', createdAt: now.toISOString(),
+        lastProjection: projectionCheckpoint(boundary, sha256(uuid), now) };
+      await writeSidecar(noticePath, notice);
+    }
+    if (now.getTime() - Date.parse(notice.createdAt) >= LARK_DEDUPE_WINDOW_MS) {
+      await writeSidecar(noticePath, { ...notice, delivery: 'uncertain' });
+      this.deps.onError?.(view.runId, new Error('Workflow failure notice delivery is uncertain after provider dedupe expiry'));
+      return;
+    }
+    const owner = /^ou_[A-Za-z0-9_-]+$/.test(binding.ownerOpenId ?? '') ? `<at id="${binding.ownerOpenId}"></at>\n` : '';
+    const text = `${owner}${view.status === 'failed' ? '❌ 工作流失败' : '⏸️ 工作流受阻'}：${view.runId}`
+      + (view.issue?.nodeId ? `\n节点：${view.issue.nodeId}` : '')
+      + (view.issue?.errorCode ? `\n错误码：${view.issue.errorCode}` : '')
+      + (view.status === 'blocked' ? '\n请查看阻塞卡及证据，排除原因后重试当前节点。' : '\n运行已停止；请查看运行详情及失败证据，修复后恢复或重新发起。');
+    const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: text }] } });
+    try {
+      const messageId = target.kind === 'reply'
+        ? await this.deps.transport.reply(binding.larkAppId, target.id, card, uuid)
+        : await this.deps.transport.send(binding.larkAppId, target.id, card, uuid);
+      assertMessageId(messageId);
+      await writeSidecar(noticePath, { ...notice, delivery: 'active', messageId });
+    } catch (error) {
+      if (isWithdrawnError(error)) await writeSidecar(noticePath, { ...notice, delivery: 'withdrawn' });
+      throw error;
+    }
   }
 }
 
@@ -386,12 +445,13 @@ function validateSidecar(raw: unknown, expectedRunId: string): V3ProgressCardSid
   const item = raw as Record<string, unknown>;
   const allowed = new Set([
     'schemaVersion', 'runId', 'larkAppId', 'target', 'deliveryUuid', 'delivery',
-    'messageId', 'createdAt', 'lastProjection',
+    'messageId', 'createdAt', 'lastProjection', 'failureNotifications',
   ]);
   if (Object.keys(item).some((key) => !allowed.has(key))) throw new Error('v3 progress sidecar has unknown fields');
   if (item.schemaVersion !== SIDECAR_SCHEMA_VERSION || item.runId !== expectedRunId) {
     throw new Error('v3 progress sidecar identity/version mismatch');
   }
+  if (item.failureNotifications !== undefined && typeof item.failureNotifications !== 'boolean') throw new Error('invalid failure notification policy');
   if (typeof item.larkAppId !== 'string' || !item.larkAppId) throw new Error('v3 progress sidecar has invalid app');
   if (typeof item.deliveryUuid !== 'string' || item.deliveryUuid.length > 50 || !item.deliveryUuid) {
     throw new Error('v3 progress sidecar has invalid deliveryUuid');

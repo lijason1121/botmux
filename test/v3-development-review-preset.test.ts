@@ -78,7 +78,77 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1, selected = BOTS
 }
 
 describe('authored development-review preset', () => {
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it('switches development to a matching external dependency environment without mutating the original shared target', async () => {
+    const f = fixture();
+    write(join(f.repo, 'package.json'), { dependencies: { fixture: '1.0.0' } });
+    writeFileSync(join(f.repo, 'bun.lock'), 'lock-1'); writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'dependency inputs');
+    mkdirSync(join(f.repo, 'node_modules', 'fixture'), { recursive: true });
+    write(join(f.repo, 'node_modules', 'fixture', 'package.json'), { name: 'fixture', version: '1.0.0' });
+    write(f.preflight, { ...json(f.preflight), dependencyReuseAllowed: true });
+    expect(await f.prepare()).toMatchObject({ code: 0 });
+    const context = join(f.prepared, 'context.json'), implemented = f.out('development-review-loop.i001.implement');
+    write(join(f.worktree, 'package.json'), { dependencies: { fixture: '2.0.0' } });
+    writeFileSync(join(f.worktree, 'bun.lock'), 'lock-2');
+    f.git(f.worktree, 'add', '.'); f.git(f.worktree, 'commit', '-qm', 'update dependency');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], implemented)).toMatchObject({ code: 0 });
+    const args = ['--context', context, '--candidate', join(implemented, 'candidate.json'), '--round', '1'];
+    expect((await f.tool('record', args, implemented)).code).toBe(2);
+    const source = join(f.root, 'external-install'); mkdirSync(join(source, 'node_modules', 'fixture'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), readFileSync(join(f.worktree, 'package.json')));
+    writeFileSync(join(source, 'bun.lock'), 'lock-2');
+    write(join(source, 'node_modules', 'fixture', 'package.json'), { name: 'fixture', version: '2.0.0' });
+    expect(await f.tool('record', [...args, '--dependency-source', source], implemented)).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(implemented, 'validation.json')).checks[0].exitCode).toBe(0);
+    expect(realpathSync(join(f.worktree, 'node_modules'))).toBe(join(source, 'node_modules'));
+    expect(json(join(f.repo, 'node_modules', 'fixture', 'package.json')).version).toBe('1.0.0');
+    expect(readFileSync(join(f.repo, 'bun.lock'), 'utf8')).toBe('lock-1');
+  });
+
+  it.each(['matching', 'stale-code', 'foreign-link', 'missing-link', 'missing-child'] as const)('verifies an independent workspace installation against the full task snapshot: %s', async mode => {
+    const f = fixture(), source = join(f.root, 'external-workspace');
+    write(join(f.repo, 'package.json'), { workspaces: ['packages/*'] });
+    writeFileSync(join(f.repo, 'bun.lock'), 'workspace-lock'); writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
+    mkdirSync(join(f.repo, 'packages', 'a'), { recursive: true });
+    write(join(f.repo, 'packages', 'a', 'package.json'), { name: 'workspace-a', version: '1.0.0', ...(mode === 'missing-child' ? { dependencies: { missing: '1.0.0' } } : {}) });
+    writeFileSync(join(f.repo, 'packages', 'a', 'index.js'), 'export const value = 1;');
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'workspace snapshot');
+    for (const file of f.git(f.repo, 'ls-files').split('\n')) {
+      mkdirSync(dirname(join(source, file)), { recursive: true }); writeFileSync(join(source, file), readFileSync(join(f.repo, file)));
+    }
+    mkdirSync(join(source, 'node_modules'));
+    if (mode !== 'missing-link') symlinkSync(mode === 'foreign-link' ? join(f.repo, 'packages', 'a') : join(source, 'packages', 'a'), join(source, 'node_modules', 'workspace-a'), 'dir');
+    if (mode === 'stale-code') writeFileSync(join(source, 'packages', 'a', 'index.js'), 'export const value = 2;');
+    write(f.preflight, { ...json(f.preflight), dependencyReuseAllowed: true, dependencySourcePath: source });
+    expect((await f.prepare()).code).toBe(mode === 'matching' ? 0 : 2);
+    if (mode !== 'matching') expect(json(join(dirname(f.prepared), 'manifest.json')).error.code).toBe('DEPENDENCY_ENVIRONMENT_NOT_READY');
+  });
+  it.each(['matching', 'missing', 'changed', 'broken'] as const)('prepares usable dependencies before review: %s', async mode => {
+    const f = fixture();
+    write(join(f.repo, 'package.json'), { dependencies: { fixture: '1.0.0' } });
+    writeFileSync(join(f.repo, 'bun.lock'), 'frozen-lock');
+    writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'dependency inputs');
+    if (mode !== 'missing') {
+      mkdirSync(join(f.repo, 'node_modules', 'fixture'), { recursive: true });
+      write(join(f.repo, 'node_modules', 'fixture', 'package.json'), { name: 'fixture', version: '1.0.0' });
+    }
+    if (mode === 'changed') writeFileSync(join(f.repo, 'bun.lock'), 'uninstalled-lock');
+    if (mode === 'broken') rmSync(join(f.repo, 'node_modules', 'fixture'), { recursive: true });
+    write(f.preflight, { ...json(f.preflight), dependencyReuseAllowed: true });
+    const result = await f.prepare();
+    if (mode === 'matching') {
+      expect(result).toMatchObject({ code: 0, stderr: '' });
+      expect(realpathSync(join(f.worktree, 'node_modules'))).toBe(realpathSync(join(f.repo, 'node_modules')));
+      expect(json(join(f.prepared, 'context.json')).dependencies).toMatchObject({ state: 'ready', source: f.repo });
+      expect(await f.prepare()).toMatchObject({ code: 0 });
+    } else {
+      expect(result.code).toBe(2);
+      expect(json(join(dirname(f.prepared), 'manifest.json'))).toMatchObject({ status: 'fail', error: { code: 'DEPENDENCY_ENVIRONMENT_NOT_READY', retryable: true } });
+      expect(existsSync(join(f.prepared, 'context.json'))).toBe(false);
+    }
+  });
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>

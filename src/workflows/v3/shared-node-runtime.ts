@@ -3465,18 +3465,41 @@ export async function runWorkflow(
           if (inputHash) {
             appendEventDurable(journalPath, { type: 'nodeInputsBound', nodeId: node.id, attemptId, inputHash });
             const retry = [...events].reverse().find(e => e.type === 'nodeRetryRequested' && e.nextAttemptId === attemptId);
-            if (retry?.type === 'nodeRetryRequested') {
-              const previous = events.find(e => e.type === 'nodeInputsBound' && e.attemptId === retry.previousAttemptId);
+            // Orphan recovery requeues through nodeAttemptDrained, not the
+            // manual retry event. Only a durably closed attempt of this exact
+            // instance is eligible; never adopt a still-running worker.
+            const orphan = [...events].reverse().find(e => e.type === 'nodeAttemptDrained'
+              && e.reason === 'orphanRecovery' && e.nodeId === node.id && e.instanceId === instanceId);
+            const previousAttemptId = retry?.type === 'nodeRetryRequested' ? retry.previousAttemptId
+              : orphan?.type === 'nodeAttemptDrained' ? orphan.attemptId : undefined;
+            if (previousAttemptId) {
+              const previous = events.find(e => e.type === 'nodeInputsBound' && e.attemptId === previousAttemptId);
               if (previous?.type === 'nodeInputsBound') {
-                const restored = await restoreGoalCheckpoint({ previousOutputDir: join(runDir, retry.previousAttemptId, 'work'),
-                  previousInputHash: previous.inputHash, inputHash, validateManifest: deps.validateManifest });
+                let sourceAttemptId = previousAttemptId;
+                let restored: GoalInputs['inputs'] | undefined;
+                const visited = new Set<string>();
+                // A second crash may happen before the successor saves its own
+                // checkpoint. Follow only recorded, same-input restore links;
+                // revalidate the original bytes instead of losing that progress.
+                while (!visited.has(sourceAttemptId)) {
+                  visited.add(sourceAttemptId);
+                  const bound = events.find(e => e.type === 'nodeInputsBound' && e.nodeId === node.id && e.attemptId === sourceAttemptId);
+                  if (bound?.type !== 'nodeInputsBound' || bound.inputHash !== inputHash) break;
+                  restored = await restoreGoalCheckpoint({ previousOutputDir: join(runDir, sourceAttemptId, 'work'),
+                    previousInputHash: bound.inputHash, inputHash, validateManifest: deps.validateManifest });
+                  if (restored) break;
+                  const inherited = events.find(e => e.type === 'nodeCheckpointRestored' && e.nodeId === node.id
+                    && e.attemptId === sourceAttemptId && e.inputHash === inputHash);
+                  if (inherited?.type !== 'nodeCheckpointRestored') break;
+                  sourceAttemptId = inherited.previousAttemptId;
+                }
                 if (restored) {
                   writeFileSync(inputsPath, JSON.stringify({ ...goalInputs, inputs: [...goalInputs.inputs, ...restored] }, null, 2));
                   appendEventDurable(journalPath, { type: 'nodeCheckpointRestored', nodeId: node.id, attemptId,
-                    previousAttemptId: retry.previousAttemptId, inputHash, fileCount: restored.length });
+                    previousAttemptId: sourceAttemptId, inputHash, fileCount: restored.length });
                 } else {
                   const history = writeAttemptHistory({ runDir, runId: dag.runId, nodeId: node.id,
-                    previousAttemptId: retry.previousAttemptId, attemptDir, inputHash, previousInputHash: previous.inputHash });
+                    previousAttemptId, attemptDir, inputHash, previousInputHash: previous.inputHash });
                   if (history) writeFileSync(inputsPath, JSON.stringify({ ...goalInputs, inputs: [...goalInputs.inputs, history] }, null, 2));
                 }
               }
