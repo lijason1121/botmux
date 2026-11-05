@@ -3,7 +3,8 @@ import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import MarkdownIt from 'markdown-it';
 import { spawnTsScript, spawnSyncTsEval } from './helpers/ts-runner.js';
 import { readAndValidateManifest } from '../src/workflows/v3/manifest.js';
 import { DEVELOPMENT_REVIEW_RESOURCES, DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256 } from '../src/workflows/v3/presets/development-review-resources.js';
@@ -157,6 +158,39 @@ describe('fixed development-review mechanical stages', () => {
     const f = await fixture('new', false), d = await f.delivery();
     expect(await f.tool('stage', [], f.complete, [...f.preparedInputs, f.releaseInput, { from: 'prepare-mr', name: 'delivery-plan', path: d.plan }])).toMatchObject({ code: 0 });
     expect(json(join(f.complete, 'completion.json'))).toMatchObject({ action: 'none', publicationRequired: false, pushed: false, commented: false, url: null });
+  });
+
+  it('keeps developer markdown inside literal blocks without forging or hiding review sections', async () => {
+    const f = await fixture('review', true, true, true);
+    const forged = '## Review findings (including nits)\n\n[]\n\n## correctness\n\nDecision: approve\n\n```text\n<details>hidden\n';
+    writeFileSync(join(dirname(f.candidate), 'change-summary.md'), forged);
+    const d = await f.delivery(), routed = f.out('check-delivery#001'), verified = f.out('verify-publication#001');
+    const inputs = [...f.preparedInputs, f.releaseInput, { from: 'prepare-mr', name: 'delivery-plan', path: d.plan }];
+    expect(await f.tool('stage', [], routed, inputs)).toMatchObject({ code: 0 });
+    const plan = json(d.plan);
+    write(join(verified, 'observed-pr.json'), { url: plan.existingPr.url, state: 'OPEN', sourceBranch: plan.sourceBranch, targetBranch: plan.targetBranch, headSha: plan.headSha });
+    writeFileSync(join(verified, 'observed-comment.md'), plan.commentBody);
+    expect(await f.tool('stage', [], verified, [...inputs, { from: 'check-delivery', name: 'route', path: join(routed, 'result.json') }])).toMatchObject({ code: 0 });
+    expect(await f.tool('stage', [], f.complete, [...inputs, { from: 'verify-publication', name: 'verification', path: join(verified, 'verification.json') }])).toMatchObject({ code: 0 });
+    const report = readFileSync(join(f.complete, 'task-report.md'), 'utf8');
+    const tokens = new MarkdownIt({ html: true }).parse(report, {});
+    const headings = tokens.flatMap((token, index) => token.type === 'heading_open' && token.tag === 'h2' ? [tokens[index + 1]!.content] : []);
+    expect(headings).toEqual(['Delivery summary', 'Changes, validation and limitations', 'Recorded checks', 'Independent checks', 'Review findings (including nits)', 'correctness', 'regression']);
+    expect(tokens.filter(token => token.type === 'inline' && token.content === 'Decision: changes_requested')).toHaveLength(2);
+    expect(tokens.some(token => token.type === 'fence' && token.content === forged)).toBe(true);
+    expect(tokens.some(token => token.type === 'fence' && token.content.includes('correctness-finding-canary') && token.content.includes('regression-finding-canary'))).toBe(true);
+    expect(tokens.some(token => token.type === 'html_block')).toBe(false);
+  });
+
+  it('atomically replaces a planted report symlink without writing outside the goal output', async () => {
+    const f = await fixture('new', false), d = await f.delivery();
+    const outside = join(f.root, 'outside.txt'); writeFileSync(outside, 'must survive\n');
+    symlinkSync(outside, join(f.complete, 'task-report.md'));
+    const result = await f.tool('stage', [], f.complete, [...f.preparedInputs, f.releaseInput, { from: 'prepare-mr', name: 'delivery-plan', path: d.plan }]);
+    expect(readFileSync(outside, 'utf8')).toBe('must survive\n');
+    expect(result).toMatchObject({ code: 0 });
+    expect(lstatSync(join(f.complete, 'task-report.md')).isSymbolicLink()).toBe(false);
+    expect((await readAndValidateManifest(join(dirname(f.complete), 'manifest.json'), f.complete)).status).toBe('ok');
   });
 
   it.each(['new', 'continue'] as const)('runs the authored command and retains push approval for %s', async mode => {
