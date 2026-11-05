@@ -107,12 +107,13 @@ describe('authored development-review preset', () => {
     expect(readFileSync(join(f.repo, 'bun.lock'), 'utf8')).toBe('lock-1');
   });
 
-  it.each(['matching', 'stale-code', 'foreign-link', 'missing-link', 'missing-child'] as const)('verifies an independent workspace installation against the full task snapshot: %s', async mode => {
+  it.each(['matching', 'stale-code', 'foreign-link', 'missing-link', 'missing-child', 'shadowed-child'] as const)('verifies an independent workspace installation against the full task snapshot: %s', async mode => {
     const f = fixture(), source = join(f.root, 'external-workspace');
     write(join(f.repo, 'package.json'), { workspaces: ['packages/*'] });
     writeFileSync(join(f.repo, 'bun.lock'), 'workspace-lock'); writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
     mkdirSync(join(f.repo, 'packages', 'a'), { recursive: true });
-    write(join(f.repo, 'packages', 'a', 'package.json'), { name: 'workspace-a', version: '1.0.0', ...(mode === 'missing-child' ? { dependencies: { missing: '1.0.0' } } : {}) });
+    write(join(f.repo, 'packages', 'a', 'package.json'), { name: 'workspace-a', version: '1.0.0',
+      ...(mode === 'missing-child' ? { dependencies: { missing: '1.0.0' } } : mode === 'shadowed-child' ? { dependencies: { 'workspace-a': '1.0.0' } } : {}) });
     writeFileSync(join(f.repo, 'packages', 'a', 'index.js'), 'export const value = 1;');
     f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'workspace snapshot');
     for (const file of f.git(f.repo, 'ls-files').split('\n')) {
@@ -120,6 +121,12 @@ describe('authored development-review preset', () => {
     }
     mkdirSync(join(source, 'node_modules'));
     if (mode !== 'missing-link') symlinkSync(mode === 'foreign-link' ? join(f.repo, 'packages', 'a') : join(source, 'packages', 'a'), join(source, 'node_modules', 'workspace-a'), 'dir');
+    if (mode === 'shadowed-child') {
+      const foreign = join(f.root, 'foreign-package'); mkdirSync(foreign);
+      write(join(foreign, 'package.json'), { name: 'workspace-a', version: '1.0.0' });
+      mkdirSync(join(source, 'packages', 'a', 'node_modules'));
+      symlinkSync(foreign, join(source, 'packages', 'a', 'node_modules', 'workspace-a'), 'dir');
+    }
     if (mode === 'stale-code') writeFileSync(join(source, 'packages', 'a', 'index.js'), 'export const value = 2;');
     write(f.preflight, { ...json(f.preflight), dependencyReuseAllowed: true, dependencySourcePath: source });
     expect((await f.prepare()).code).toBe(mode === 'matching' ? 0 : 2);
