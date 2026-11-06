@@ -216,7 +216,7 @@ describe('authored development-review preset', () => {
     expect(json(join(dirname(g.prepared), 'manifest.json')).error).toMatchObject({ code: 'DEPENDENCY_ENVIRONMENT_NOT_READY', message: expect.stringContaining('isolated dependency install failed') });
     expect(existsSync(join(g.prepared, 'context.json'))).toBe(false);
   });
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -515,6 +515,75 @@ describe('fixed development-review executable resources', () => {
     write(join(output, 'result.json'), { ...planned2, contextSha256: sha(context), releaseSha256: sha(join(gated, 'release-candidate.json')) });
     expect(await verify()).toMatchObject({ code: 2, stderr: 'delivery plan skipped a required approval\n' });
     expect(json(join(verified, 'verification.json'))).toMatchObject({ verified: true, action: 'comment', url: reviewTarget.url });
+  });
+
+  it.each([['continue', 'record'], ['review', 'record'], ['continue', 'record, SIGTERM trapped'], ['continue', 'independent re-run']] as const)('reports a check stopped by its validation budget as VALIDATION_TIMEOUT, never as a failure to fix or a pass (%s, %s)', async (mode, stoppedIn) => {
+    const f = fixture();
+    f.git(f.repo, 'checkout', '-qb', 'feature/slow');
+    writeFileSync(join(f.repo, 'value.txt'), 'existing PR\n'); f.git(f.repo, 'commit', '-qam', 'existing PR');
+    const headSha = f.git(f.repo, 'rev-parse', 'HEAD');
+    f.git(f.repo, 'checkout', '-q', 'main');
+    f.git(f.repo, 'remote', 'add', 'origin', f.repo); f.git(f.repo, 'update-ref', 'refs/remotes/origin/main', 'main');
+    // A real child that outlives its 1s budget (only once the marker exists): spawnSync stops it with ETIMEDOUT.
+    const slow = join(f.root, 'slow-marker');
+    const atRecord = stoppedIn !== 'independent re-run', trapped = stoppedIn === 'record, SIGTERM trapped';
+    if (atRecord) writeFileSync(slow, '');
+    write(f.params, { params: { ...json(f.params).params, mode,
+      validation_commands: [{ id: 'slow-gate', argv: [process.execPath, '-e', (trapped ? 'process.on("SIGTERM", () => process.exit(0)); ' : '') + 'if (require("fs").existsSync(process.argv[1])) setTimeout(() => {}, 30000)', slow], timeoutSec: 1 }] } });
+    write(f.preflight, { ...json(f.preflight), login: 'me',
+      reviewTarget: { url: 'https://example.invalid/pull/9', author: mode === 'review' ? 'Alice' : 'me', remote: 'origin', sourceBranch: 'feature/slow', targetBranch: 'main', headSha } });
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    const context = join(f.prepared, 'context.json'), resources = join(f.prepared, 'resources.json');
+    const implemented = f.out('development-review-loop.i001.implement'), candidate = join(implemented, 'candidate.json'), validation = join(implemented, 'validation.json');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], implemented)).toMatchObject({ code: 0, stderr: '' });
+    const started = Date.now();
+    const recorded = await f.tool('record', ['--context', context, '--candidate', candidate, '--round', '1'], implemented);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    if (atRecord) {
+      // The producer itself stops the attempt with a stable code; no agent translation needed.
+      expect(recorded.code).toBe(2);
+      expect(recorded.stderr).toContain('VALIDATION_TIMEOUT: slow-gate stopped after its 1s budget');
+      const manifest = await readAndValidateManifest(join(dirname(implemented), 'manifest.json'), implemented);
+      expect(manifest).toMatchObject({ status: 'fail', error: { code: 'VALIDATION_TIMEOUT', retryable: false } });
+      expect(manifest.files.map(file => file.name)).toEqual(expect.arrayContaining(['candidate', 'validation', 'log-slow-gate']));
+      // An agent cannot re-deliver the stopped attempt as ok.
+      const republish = await f.tool('publish', ['--entry', 'candidate', 'json', 'candidate.json', '--entry', 'validation', 'json', 'validation.json'], implemented);
+      expect(republish.code).toBe(2);
+      expect(republish.stderr).toContain('only a VALIDATION_TIMEOUT failure can be delivered');
+      expect(json(join(dirname(implemented), 'manifest.json')).status).toBe('fail');
+    } else {
+      expect(recorded).toMatchObject({ code: 0, stderr: '' });
+    }
+    const check = json(validation).checks[0];
+    if (atRecord) {
+      // The real outcome is kept, and the budget stop is recorded even when the command
+      // caught SIGTERM and exited 0: the timeout, not the exit status, decides.
+      expect(check).toMatchObject({ id: 'slow-gate', timedOut: true, timeoutSec: 1, ...(trapped ? { exitCode: 0, signal: null } : { exitCode: null, signal: 'SIGTERM' }) });
+      expect(readFileSync(join(implemented, check.log.path), 'utf8')).toContain('stopped after its 1s validation budget');
+    } else {
+      expect(check).toMatchObject({ exitCode: 0, signal: null });
+      expect(check).not.toHaveProperty('timedOut');
+      writeFileSync(slow, '');
+    }
+    const summary = join(implemented, 'change-summary.md'); writeFileSync(summary, 'No change; the check ran out of budget.\n');
+    const reviews = (['correctness', 'regression'] as const).map(role => {
+      const filename = join(f.root, role + '.json');
+      write(filename, { ...json(candidate), role, reviewerId: BOTS[role], decision: mode === 'review' ? 'changes_requested' : 'approve',
+        findings: mode === 'review' ? [{ blocking: false, location: 'value.txt:1', impact: 'x', evidence: 'y' }] : [], coverage: ['diff'], evidence: ['ok'],
+        candidateSha256: sha(candidate), validationSha256: sha(validation), contextSha256: sha(context) });
+      return filename;
+    });
+    const gated = f.out('development-review-loop.i001.verify-review-gate');
+    const gate = await f.tool('gate', ['--context', context, '--resources', resources, '--expected-resources-sha', DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256,
+      '--candidate', candidate, '--validation', validation, '--change-summary', summary, '--correctness', reviews[0]!, '--regression', reviews[1]!,
+      '--round', '1', '--out', join(gated, 'result.json')], gated);
+    expect(gate.code).toBe(2);
+    expect(gate.stderr).toContain(atRecord ? 'VALIDATION_TIMEOUT: slow-gate stopped after its 1s budget' : 'VALIDATION_TIMEOUT: independent re-run of slow-gate stopped after its 1s budget');
+    // The evidence stays: not passed, the budget stop named, nothing for the PR author to fix.
+    const result = json(join(gated, 'result.json'));
+    expect(result).toMatchObject({ passed: false, validationFailures: [] });
+    expect(result.reasons).toEqual([expect.stringContaining('VALIDATION_TIMEOUT: ' + (atRecord ? '' : 'independent re-run of ') + 'slow-gate')]);
+    expect(json(join(gated, 'release-candidate.json')).passed).toBe(false);
   });
 
   it('bases a fork PR on its target repository, not on the fork\'s stale copy of the target branch', async () => {
