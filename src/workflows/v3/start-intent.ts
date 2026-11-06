@@ -27,7 +27,14 @@ export function persistV3StartIntent(runId: string, runDir: string): void {
   mkdirSync(runDir, { recursive: true });
   withJournalMutationSync(journalPath, ({ events, append }) => {
     const starts = events.filter((event) => event.type === 'runStarted');
-    if (events.length === 0) {
+    // A recovery run is materialized with a single runRecovered provenance
+    // record before its first start; the runtime treats that as "not started
+    // yet" too, so the start boundary must accept it rather than call it
+    // corruption.
+    const preStartOnly = starts.length === 0
+      && events.filter((event) => event.type === 'runRecovered').length === events.length
+      && events.length <= 1;
+    if (events.length === 0 || preStartOnly) {
       // A torn-only physical tail was durably truncated by the mutation
       // boundary. It contained no committed record, so this remains the one
       // history root rather than appending after corrupt bytes.
