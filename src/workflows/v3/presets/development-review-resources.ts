@@ -546,15 +546,33 @@ function candidate(args) {
   atomic(path.join(output, 'candidate.json'), { schemaVersion: 1, runId: context.runId, repo: context.repo, baseSha: context.baseSha,
     headSha, round, contextSha256: digest(args.context), resourcesSha256: context.resourcesSha256 });
 }
+// A validation budget stop is terminal for the attempt: another round or a retry runs the
+// same frozen budget. Producers record it as a failed Manifest with a stable code.
+function validationTimeout(message) {
+  const error = new Error(message); error.code = 'VALIDATION_TIMEOUT'; return error;
+}
+function timedOutChecks(file) {
+  if (!fs.existsSync(file)) return [];
+  const checks = read(file).checks;
+  return Array.isArray(checks) ? checks.filter(check => object(check) && check.timedOut === true) : [];
+}
+function failForTimeout(error, entries) {
+  publish({ entries, summary: 'Validation stopped by its frozen budget; this is not a code failure or a pass.',
+    error: { code: 'VALIDATION_TIMEOUT', message: error.message, retryable: false } });
+}
 function runChecks(context, output, prefix, dependencies = context.dependencies) {
   checkDependencies(context, dependencies);
   return plan(context.validationCommands).map(command => {
     const startedAtMs = Date.now(), before = git(context.worktree, ['rev-parse', 'HEAD']);
     const result = spawnSync(command.argv[0], command.argv.slice(1), { cwd: context.worktree, encoding: 'utf8', timeout: command.timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024, shell: false });
     const logfile = prefix + command.id + '.log';
-    fs.writeFileSync(path.join(output, logfile), (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : ''), { mode: 0o600 });
+    // A command stopped by its own budget has not failed a check; record that explicitly so
+    // the gate reports an undersized budget instead of a failure there is nothing to fix for.
+    const timedOut = !!result.error && result.error.code === 'ETIMEDOUT';
+    fs.writeFileSync(path.join(output, logfile), (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : '') +
+      (timedOut ? '\n[development-review] stopped after its ' + command.timeoutSec + 's validation budget' : ''), { mode: 0o600 });
     return { id: command.id, argv: command.argv, cwd: context.worktree, startedAtMs, completedAtMs: Date.now(), exitCode: result.status,
-      signal: result.signal, headBefore: before, headAfter: git(context.worktree, ['rev-parse', 'HEAD']),
+      signal: result.signal, ...(timedOut ? { timedOut: true, timeoutSec: command.timeoutSec } : {}), headBefore: before, headAfter: git(context.worktree, ['rev-parse', 'HEAD']),
       log: { path: logfile, sha256: digest(path.join(output, logfile)) } };
   });
 }
@@ -576,10 +594,18 @@ function record(args) {
     round: candidate.round, candidateSha256: digest(args.candidate), contextSha256: digest(args.context), dependencies, checks: runChecks(context, output, '', dependencies) };
   validation.completedAtMs = Date.now();
   atomic(path.join(output, 'validation.json'), validation);
+  const stopped = validation.checks.filter(check => check.timedOut === true);
+  if (stopped.length) {
+    const error = validationTimeout('VALIDATION_TIMEOUT: ' + stopped.map(check => check.id + ' stopped after its ' + check.timeoutSec + 's budget').join('; ') +
+      ' before finishing; the frozen validation budget is smaller than this command needs');
+    failForTimeout(error, [['candidate', 'json', path.relative(output, args.candidate) === 'candidate.json' ? 'candidate.json' : null],
+      ['validation', 'json', 'validation.json'], ...validation.checks.map(check => ['log-' + check.id, 'log', check.log.path])].filter(entry => entry[2]));
+    throw error;
+  }
 }
 function gate(args) {
   ownOutput(args.out, 'result.json');
-  const problems = [], unresolvedFindings = [], validationFailures = [];
+  const problems = [], unresolvedFindings = [], validationFailures = [], budgetStops = [];
   let candidate = {}, mode;
   try {
     const context = read(args.context); candidate = read(args.candidate);
@@ -611,6 +637,11 @@ function gate(args) {
       requireThat(actual.headBefore === candidate.headSha && actual.headAfter === candidate.headSha, 'validation failed or changed HEAD');
       requireThat(Number.isFinite(actual.startedAtMs) && Number.isFinite(actual.completedAtMs) && actual.completedAtMs >= actual.startedAtMs, 'invalid validation timing');
       requireThat(digest(regular(path.dirname(args.validation), actual.log.path)) === actual.log.sha256, 'validation log hash mismatch');
+      // A budget stop says nothing about the code: name it, in every mode, instead of
+      // sending the developer after a failure that does not exist.
+      if (actual.timedOut === true) budgetStops.push('VALIDATION_TIMEOUT: ' + expected.id + ' stopped after its ' + expected.timeoutSec +
+        's budget before finishing; the frozen validation budget is smaller than this command needs');
+      requireThat(actual.timedOut !== true, budgetStops[budgetStops.length - 1]);
       // Reviewing someone else's PR reports failed checks; it cannot repair them.
       if (actual.exitCode !== 0 || actual.signal) {
         requireThat(mode === 'review', 'validation failed or changed HEAD');
@@ -622,6 +653,12 @@ function gate(args) {
     const rerun = runChecks(context, path.dirname(args.out), 'independent-', validation.dependencies);
     atomic(path.join(path.dirname(args.out), 'independent-validation.json'), { schemaVersion: 1, runId: candidate.runId, headSha: candidate.headSha, checks: rerun });
     requireThat(git(context.worktree, ['rev-parse', 'HEAD']) === candidate.headSha, 'independent validation changed HEAD');
+    for (const check of rerun) {
+      if (check.timedOut !== true) continue;
+      budgetStops.push('VALIDATION_TIMEOUT: independent re-run of ' + check.id + ' stopped after its ' + check.timeoutSec +
+        's budget before finishing; the frozen validation budget is smaller than this command needs');
+      requireThat(false, budgetStops[budgetStops.length - 1]);
+    }
     rerun.forEach((check, index) => requireThat(check.exitCode === validation.checks[index].exitCode &&
       (check.signal || null) === (validation.checks[index].signal || null), 'validation record contradicts the independent re-run: ' + check.id));
     const reviews = [read(args.correctness), read(args.regression)];
@@ -665,6 +702,9 @@ function gate(args) {
   fs.writeFileSync(path.join(path.dirname(args.out), 'feedback.md'), !result.passed
     ? 'Gate did not pass:\n' + problems.map(problem => '- ' + problem).join('\n') + '\nFindings to assess and resolve (including nits):\n' + findingsText
     : mode === 'review' ? 'Review gate passed; these findings go to the PR comment:\n' + findingsText : 'Gate passed for this candidate.\n', { mode: 0o600 });
+  // Another round cannot fix an undersized frozen budget: stop the loop with the evidence
+  // above instead of returning a rework result the developer has nothing to act on.
+  if (budgetStops.length) throw validationTimeout(budgetStops[0]);
 }
 function delivery(args) {
   const release = read(args.release), context = read(args.context), draft = read(args.draft);
@@ -891,15 +931,24 @@ function stage(args) {
   const add = (name, kind, filename) => entries.push([name, kind, filename]);
   if (/^development-review-loop\.i[0-9]+\.verify-review-gate$/.test(node)) {
     const prefix = node.slice(0, node.lastIndexOf('.') + 1);
-    gate({ context, resources: input('prepare', 'resources'), 'expected-resources-sha': args['expected-resources-sha'],
-      candidate: input(prefix + 'implement', 'candidate'), validation: input(prefix + 'implement', 'validation'),
-      'change-summary': input(prefix + 'implement', 'change-summary'), correctness: input(prefix + 'review-correctness', 'review'),
-      regression: input(prefix + 'review-regression', 'review'), round: String(runtimeRound()), out: path.join(output, 'result.json') });
-    add('gate-result', 'json', 'result.json'); add('release-candidate', 'json', 'release-candidate.json'); add('feedback', 'markdown', 'feedback.md');
-    if (fs.existsSync(path.join(output, 'independent-validation.json'))) {
-      add('independent-validation', 'json', 'independent-validation.json');
-      for (const check of read(local('independent-validation.json')).checks) { regular(output, check.log.path); add('independent-log-' + check.id, 'log', check.log.path); }
+    const gateProducts = () => {
+      add('gate-result', 'json', 'result.json'); add('release-candidate', 'json', 'release-candidate.json'); add('feedback', 'markdown', 'feedback.md');
+      if (fs.existsSync(path.join(output, 'independent-validation.json'))) {
+        add('independent-validation', 'json', 'independent-validation.json');
+        for (const check of read(local('independent-validation.json')).checks) { regular(output, check.log.path); add('independent-log-' + check.id, 'log', check.log.path); }
+      }
+    };
+    try {
+      gate({ context, resources: input('prepare', 'resources'), 'expected-resources-sha': args['expected-resources-sha'],
+        candidate: input(prefix + 'implement', 'candidate'), validation: input(prefix + 'implement', 'validation'),
+        'change-summary': input(prefix + 'implement', 'change-summary'), correctness: input(prefix + 'review-correctness', 'review'),
+        regression: input(prefix + 'review-regression', 'review'), round: String(runtimeRound()), out: path.join(output, 'result.json') });
+    } catch (error) {
+      // The gate already wrote its not-passed evidence; deliver it as a failed attempt.
+      if (error.code === 'VALIDATION_TIMEOUT') { gateProducts(); failForTimeout(error, entries); }
+      throw error;
     }
+    gateProducts();
     const decision = read(local('result.json'));
     if (decision.mode === 'review' && !decision.passed) {
       publish({ entries, error: { code: 'REVIEW_EVIDENCE_INCOMPLETE', message: decision.reasons.join('; '), retryable: true } });
@@ -946,6 +995,11 @@ function publish(args, checkpoint = false) {
       mime: kind === 'json' ? 'application/json' : kind === 'markdown' ? 'text/markdown' : 'text/plain' });
   }
   requireThat(files.length, 'at least one real product required');
+  // A run stopped by its validation budget can only be delivered as that failure.
+  if (!checkpoint && !(args.error && args.error.code === 'VALIDATION_TIMEOUT')) {
+    const stopped = [...timedOutChecks(path.join(output, 'validation.json')), ...timedOutChecks(path.join(output, 'independent-validation.json'))];
+    requireThat(!stopped.length, 'VALIDATION_TIMEOUT: ' + stopped.map(check => check.id).join(', ') + ' stopped by its validation budget; only a VALIDATION_TIMEOUT failure can be delivered');
+  }
   if (checkpoint) {
     const attempt = process.env.BOTMUX_GOAL_ATTEMPT_DIR;
     requireThat(attempt && path.resolve(output) === path.join(path.resolve(attempt), 'work'), 'checkpoint must use this attempt output');
