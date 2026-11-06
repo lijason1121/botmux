@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createDevelopmentReviewPreset } from '../src/workflows/v3/presets/development-review.js';
@@ -157,7 +157,66 @@ describe('authored development-review preset', () => {
       expect(existsSync(join(f.prepared, 'context.json'))).toBe(false);
     }
   });
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  // Real frozen install (no network: the only dependency is a tracked file: package).
+  const hasBun = spawnSync('bun', ['--version'], { stdio: 'ignore' }).status === 0;
+  function lockedProject(f: ReturnType<typeof fixture>) {
+    mkdirSync(join(f.repo, 'vendor', 'fixture'), { recursive: true });
+    write(join(f.repo, 'vendor', 'fixture', 'package.json'), { name: 'fixture', version: '1.0.0' });
+    // A root lifecycle hook that would fail without the project sources.
+    write(join(f.repo, 'package.json'), { name: 'app', private: true, scripts: { postinstall: 'exit 7', build: 'tsc' },
+      dependencies: { fixture: 'file:./vendor/fixture' } });
+    writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
+    execFileSync('bun', ['install', '--ignore-scripts'], { cwd: f.repo, stdio: 'ignore' });
+    rmSync(join(f.repo, 'node_modules'), { recursive: true, force: true });
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'locked dependency inputs');
+  }
+  it.skipIf(!hasBun).each(['not-approved', 'approved-mismatch', 'hand-made-source'] as const)('installs an isolated run environment from the exact task manifests when reuse is not possible: %s', async mode => {
+    const f = fixture(); lockedProject(f);
+    const handMade = join(f.root, 'hand-made');
+    if (mode === 'hand-made-source') {
+      // The blocked run: a hand-built env with scripts stripped and child manifests missing.
+      mkdirSync(join(handMade, 'node_modules', 'fixture'), { recursive: true });
+      const pkg = json(join(f.repo, 'package.json')); delete pkg.scripts; write(join(handMade, 'package.json'), pkg);
+      writeFileSync(join(handMade, 'bun.lock'), readFileSync(join(f.repo, 'bun.lock')));
+      write(join(handMade, 'node_modules', 'fixture', 'package.json'), { name: 'fixture', version: '1.0.0' });
+    }
+    write(f.preflight, { ...json(f.preflight), ...(mode === 'not-approved' ? { dependencyReuseAllowed: false }
+      : mode === 'approved-mismatch' ? { dependencyReuseAllowed: true } : { dependencyReuseAllowed: false, dependencySourcePath: handMade }) });
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    const dependencies = json(join(f.prepared, 'context.json')).dependencies;
+    expect(dependencies).toMatchObject({ state: 'ready', names: ['fixture'] });
+    expect(dependencies.source.startsWith(join(f.run, 'dependencies') + '/')).toBe(true);
+    if (mode === 'approved-mismatch') expect(dependencies.reuseRejected).toMatch(/node_modules|no such file/);
+    expect(realpathSync(join(f.worktree, 'node_modules'))).toBe(dependencies.modules);
+    expect(json(join(f.worktree, 'node_modules', 'fixture', 'package.json')).version).toBe('1.0.0');
+    // Manifests are byte-identical (scripts restored) and nothing leaked into the repository or worktree.
+    expect(readFileSync(join(dependencies.source, 'package.json'))).toEqual(readFileSync(join(f.repo, 'package.json')));
+    expect(readFileSync(join(dependencies.source, 'bun.lock'))).toEqual(readFileSync(join(f.repo, 'bun.lock')));
+    expect(existsSync(join(f.repo, 'node_modules'))).toBe(false);
+    expect(f.git(f.worktree, 'status', '--porcelain')).toBe('');
+    // A retry reuses the completed environment instead of reinstalling.
+    const log = dependencies.source + '.install.log', before = statSync(log).mtimeMs;
+    rmSync(join(f.prepared, 'context.json'));
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(statSync(log).mtimeMs).toBe(before);
+    expect(readdirSync(join(f.run, 'dependencies')).filter(name => !name.includes('.'))).toHaveLength(1);
+  });
+  it.skipIf(!hasBun)('fails closed instead of installing when repository rules forbid it or the frozen install fails', async () => {
+    const f = fixture(); lockedProject(f);
+    write(f.preflight, { ...json(f.preflight), dependencyReuseAllowed: false, dependencyInstallAllowed: false });
+    expect((await f.prepare()).code).toBe(2);
+    expect(json(join(dirname(f.prepared), 'manifest.json')).error).toMatchObject({ code: 'DEPENDENCY_ENVIRONMENT_NOT_READY', retryable: true });
+    expect(existsSync(join(f.run, 'dependencies'))).toBe(false);
+    // Out-of-date lockfile: frozen install must refuse rather than rewrite it.
+    const g = fixture(); lockedProject(g);
+    write(join(g.repo, 'package.json'), { ...json(join(g.repo, 'package.json')), dependencies: { fixture: 'file:./vendor/fixture', other: 'file:./vendor/fixture' } });
+    g.git(g.repo, 'commit', '-qam', 'stale lockfile');
+    write(g.preflight, { ...json(g.preflight), dependencyReuseAllowed: false });
+    expect((await g.prepare()).code).toBe(2);
+    expect(json(join(dirname(g.prepared), 'manifest.json')).error).toMatchObject({ code: 'DEPENDENCY_ENVIRONMENT_NOT_READY', message: expect.stringContaining('isolated dependency install failed') });
+    expect(existsSync(join(g.prepared, 'context.json'))).toBe(false);
+  });
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -189,6 +248,8 @@ describe('authored development-review preset', () => {
       expect(check({ resolvedRequirement: 'spec text', validationCommands: [] }).ok).toBe(true);
       expect(check({ resolvedRequirement: { text: 'spec text' } }).problems).toEqual(['field "resolvedRequirement" must be of type string']);
       expect(check({ validationCommands: { id: 'test' } }).problems).toEqual(['field "validationCommands" must be of type array']);
+      expect(check({ dependencyReuseAllowed: false, dependencyInstallAllowed: true, dependencySourcePath: '/deps' }).ok).toBe(true);
+      expect(check({ dependencyReuseAllowed: 'false' }).problems).toEqual(['field "dependencyReuseAllowed" must be of type boolean']);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

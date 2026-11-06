@@ -268,21 +268,64 @@ function checkWorkspaceLinks(worktree, source, modules, files) {
     }
   }
 }
-function prepareDependencies(worktree, repository, checked, replaceTaskLink = false) {
+// Root lifecycle hooks belong to the project build, not to dependency install;
+// the isolated environment may hold only manifests. Dependency hooks still run.
+const ROOT_LIFECYCLE = ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare'];
+function installCommand(root) {
+  const has = file => fs.existsSync(path.join(root, file));
+  if (has('bun.lock') || has('bun.lockb')) return ['bun', 'install', '--frozen-lockfile'];
+  if (has('pnpm-lock.yaml')) return ['pnpm', 'install', '--frozen-lockfile'];
+  if (has('package-lock.json') || has('npm-shrinkwrap.json')) return ['npm', 'ci'];
+  if (has('yarn.lock')) return has('.yarnrc.yml') ? ['yarn', 'install', '--immutable'] : ['yarn', 'install', '--frozen-lockfile'];
+  throw new Error('frozen root dependency lockfile required');
+}
+// Build a run-owned environment outside the repository/worktree from the task
+// checkout's exact manifest and lockfile bytes (the whole tracked snapshot for
+// workspaces), using the lockfile without updating it. Never writes the worktree.
+function installIsolatedDependencies(worktree, files, inputsSha256, hasWorkspaces) {
+  const attempt = process.env.BOTMUX_GOAL_ATTEMPT_DIR;
+  requireThat(attempt, 'attempt directory unavailable for an isolated dependency install');
+  const parent = path.join(path.dirname(path.dirname(path.dirname(attempt))), 'dependencies');
+  const copied = hasWorkspaces ? git(worktree, ['ls-files', '-z']).split('\0').filter(Boolean).sort() : files;
+  const key = sha(Buffer.from(JSON.stringify([inputsSha256, hasWorkspaces ? workspaceDigest(worktree, copied) : null]))).slice(7, 39);
+  const root = path.join(parent, key), ready = root + '.ready', log = root + '.install.log';
+  if (fs.existsSync(ready) && fs.existsSync(path.join(root, 'node_modules'))) return root;
+  fs.rmSync(ready, { force: true }); fs.rmSync(root, { recursive: true, force: true });
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  for (const file of copied) {
+    const from = path.join(worktree, file), to = path.join(root, file), stat = fs.lstatSync(from);
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    if (stat.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(from), to);
+    else { requireThat(stat.isFile(), 'workspace snapshot contains an unsupported entry'); fs.copyFileSync(from, to); }
+  }
+  const manifest = path.join(root, 'package.json'), original = fs.readFileSync(manifest), pkg = JSON.parse(original.toString('utf8'));
+  if (object(pkg.scripts)) for (const hook of ROOT_LIFECYCLE) delete pkg.scripts[hook];
+  fs.writeFileSync(manifest, JSON.stringify(pkg, null, 2) + '\n');
+  const [command, ...argv] = installCommand(root);
+  const result = spawnSync(command, argv, { cwd: root, encoding: 'utf8', timeout: 30 * 60 * 1000, maxBuffer: 64 * 1024 * 1024, shell: false, env: { ...process.env, CI: '1' } });
+  fs.writeFileSync(log, [command, ...argv].join(' ') + '\n' + (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : ''), { mode: 0o600 });
+  fs.writeFileSync(manifest, original);
+  requireThat(result.status === 0, 'isolated dependency install failed: ' + [command, ...argv].join(' ') +
+    (result.error ? ' (' + result.error.message + ')' : ' exited ' + result.status) + '; log ' + log);
+  fs.writeFileSync(ready, inputsSha256 + '\n');
+  return root;
+}
+// allowInstall: when the approved source cannot be reused, prepare its own
+// isolated environment instead of trusting a hand-made snapshot.
+function prepareDependencies(worktree, repository, checked, replaceTaskLink = false, allowInstall = false) {
   if (!fs.existsSync(path.join(worktree, 'package.json'))) return { state: 'not-required' };
   const pkg = read(path.join(worktree, 'package.json'));
   const hasWorkspaces = !!pkg.workspaces || fs.existsSync(path.join(worktree, 'pnpm-workspace.yaml'));
   const required = Object.entries({ ...pkg.dependencies, ...pkg.devDependencies }).filter(([, spec]) => !String(spec).startsWith('workspace:'));
   if (!required.length && !hasWorkspaces) return { state: 'not-required' };
-  try {
-    requireThat(checked.dependencyReuseAllowed === true, 'preflight must approve dependency reuse under repository rules');
-    const source = fs.realpathSync(checked.dependencySourcePath || repository), files = dependencyInputs(worktree);
+  const files = dependencyInputs(worktree), names = required.map(([name]) => name);
+  const use = candidate => {
+    const source = fs.realpathSync(candidate);
     requireThat(files.includes('package.json') && files.some(file => /(^|\/)(bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(file)), 'frozen dependency lockfile required');
     const inputsSha256 = dependencyDigest(worktree, files);
     requireThat(dependencyDigest(source, files) === inputsSha256, 'dependency source manifests/lockfiles differ from the task checkout');
     const modules = fs.realpathSync(path.join(source, 'node_modules'));
     requireThat(fs.statSync(modules).isDirectory(), 'dependency source node_modules missing');
-    const names = required.map(([name]) => name);
     checkInstalledPackages(modules, names);
     let workspace;
     if (hasWorkspaces) {
@@ -293,7 +336,20 @@ function prepareDependencies(worktree, repository, checked, replaceTaskLink = fa
       checkWorkspaceLinks(worktree, source, modules, files);
       workspace = { sha256: snapshotSha256 };
     }
-    const target = path.join(worktree, 'node_modules');
+    return { state: 'ready', source, inputsSha256, files, modules, names, ...(workspace ? { workspace } : {}) };
+  };
+  let prepared;
+  try {
+    let reuseError;
+    if (checked.dependencyReuseAllowed === true) {
+      try { prepared = use(checked.dependencySourcePath || repository); } catch (error) { reuseError = error; }
+    }
+    if (!prepared) {
+      requireThat(allowInstall, reuseError ? reuseError.message : 'preflight must approve dependency reuse under repository rules');
+      prepared = use(installIsolatedDependencies(worktree, files, dependencyDigest(worktree, files), hasWorkspaces));
+      if (reuseError) prepared.reuseRejected = reuseError.message;
+    }
+    const { modules } = prepared, target = path.join(worktree, 'node_modules');
     // An explicit record --dependency-source can detach this clean task's
     // dependency link, including one prepared in an earlier development round.
     // Never remove a directory or write into the link's shared target.
@@ -303,7 +359,7 @@ function prepareDependencies(worktree, repository, checked, replaceTaskLink = fa
       requireThat(fs.realpathSync(target) === modules, 'task dependencies already point to a different environment');
     } else fs.symlinkSync(modules, target, process.platform === 'win32' ? 'junction' : 'dir');
     requireThat(!git(worktree, ['status', '--porcelain', '--', 'node_modules']), 'repository rules must ignore the prepared dependency link');
-    return { state: 'ready', source, inputsSha256, files, modules, names, ...(workspace ? { workspace } : {}) };
+    return prepared;
   } catch (error) { dependencyFailure(error.message); }
 }
 function checkDependencies(context, dependencies = context.dependencies) {
@@ -438,7 +494,9 @@ function prepare(args) {
     requireThat(fs.realpathSync(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])) === fs.realpathSync(git(repository, ['rev-parse', '--path-format=absolute', '--git-common-dir'])), 'existing worktree belongs to another repository');
     requireThat(git(worktree, ['branch', '--show-current']) === branch && git(worktree, ['rev-parse', 'HEAD']) === startSha && !git(worktree, ['status', '--porcelain']), 'existing worktree is not this pristine preparation');
   }
-  const dependencies = prepareDependencies(worktree, repository, checked);
+  // Preflight only reports reuse; it must not hand-build environments. An explicit
+  // dependencyInstallAllowed:false (repository rules forbid installing) fails closed.
+  const dependencies = prepareDependencies(worktree, repository, checked, false, checked.dependencyInstallAllowed !== false);
   const manifest = { preset: 'development-review', version: 1, files: [{ path: 'tools.mjs', sha256: digest(self) }] };
   atomic(path.join(output, 'resources.json'), manifest);
   const context = { schemaVersion: 1, runId: checked.runId, mode, repo: repository, worktree, branch, targetBranch,
