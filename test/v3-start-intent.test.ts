@@ -100,6 +100,33 @@ describe('persistV3StartIntent', () => {
     }
   }, 20_000);
 
+  it('starts a recovery run whose journal only holds its runRecovered provenance', () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-start-intent-recovered-'));
+    try {
+      const runDir = join(base, 'recover-run');
+      const journalPath = join(runDir, 'journal.ndjson');
+      const recovered = {
+        type: 'runRecovered' as const, sourceRunId: 'src', sourceAttemptId: 'n/attempts/001',
+        sourceJournalSha256: 'sha256:x', previousRoles: {}, roles: {},
+      };
+      appendEvent(journalPath, recovered);
+      persistV3StartIntent('recover-run', runDir);
+      persistV3StartIntent('recover-run', runDir);
+      expect(readJournal(journalPath)).toMatchObject([
+        { type: 'runRecovered', sourceRunId: 'src' },
+        { type: 'runStarted', runId: 'recover-run' },
+      ]);
+
+      // Anything beyond that single provenance record is still corruption.
+      const twiceDir = join(base, 'twice');
+      appendEvent(join(twiceDir, 'journal.ndjson'), recovered);
+      appendEvent(join(twiceDir, 'journal.ndjson'), recovered);
+      expect(() => persistV3StartIntent('twice', twiceDir)).toThrow(/journal identity mismatch/);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('rejects mismatched identity but repairs a torn-only cold-start journal', () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-start-intent-bad-'));
     try {
