@@ -47,6 +47,19 @@ function git(cwd, args) {
 const MODES = ['new', 'review', 'continue'];
 const COMMIT = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const REMOTE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+// host + owner/repo of a Git remote URL (https, ssh:// or scp-like); null when unrecognized.
+function repositoryIdentity(url) {
+  const text = String(url).trim();
+  const match = /^(?:https?|ssh|git):\/\/(?:[^@/]+@)?([^/:]+)(?::[0-9]+)?\/(.+)$/i.exec(text) || /^(?:[^@/]+@)?([^/:]+):(?!\/)(.+)$/.exec(text);
+  if (!match) return null;
+  const repo = match[2].replace(/\/+$/, '').replace(/\.git$/i, '');
+  return repo.split('/').length >= 2 ? { host: match[1].toLowerCase(), path: repo.toLowerCase() } : null;
+}
+// host + owner/repo of a GitHub pull request or GitLab merge request URL; null otherwise.
+function pullRequestRepository(url) {
+  const match = /^https:\/\/([^/]+)\/(.+?)\/(?:pull|-\/merge_requests)\/[0-9]+(?:[/?#].*)?$/i.exec(String(url));
+  return match ? { host: match[1].toLowerCase(), path: match[2].toLowerCase() } : null;
+}
 // The live remote branch head, or null when the branch does not exist.
 function remoteHead(repo, remote, branch) {
   requireThat(typeof remote === 'string' && REMOTE.test(remote), 'configured remote name required');
@@ -430,9 +443,22 @@ function prepare(args) {
     git(repository, ['check-ref-format', '--branch', reviewTarget.targetBranch]);
     requireThat(checked.targetBranch === reviewTarget.targetBranch, 'preflight target mismatch');
     git(repository, ['remote', 'get-url', reviewTarget.remote]);
+    // A fork PR's head lives on the fork, but its target branch lives on the base
+    // repository: the baseline must come from the remote of the PR's target
+    // repository. Preflight names it baseRemote when it differs from remote.
+    const baseRemote = reviewTarget.baseRemote === undefined ? reviewTarget.remote : reviewTarget.baseRemote;
+    requireThat(typeof baseRemote === 'string' && REMOTE.test(baseRemote), 'review target base remote must be a configured remote name');
+    const baseRemoteRepository = repositoryIdentity(git(repository, ['remote', 'get-url', baseRemote]));
+    const prRepository = pullRequestRepository(reviewTarget.url);
+    // Same host, different repository: the remote is a fork (or another project), and
+    // its target branch is not the PR base. Fail instead of reviewing a wrong range.
+    requireThat(!baseRemoteRepository || !prRepository || baseRemoteRepository.host !== prRepository.host ||
+      baseRemoteRepository.path === prRepository.path,
+      'PR_BASE_REMOTE_MISMATCH: remote ' + baseRemote + ' is ' + baseRemoteRepository?.host + '/' + baseRemoteRepository?.path +
+      ' but the PR targets ' + prRepository?.host + '/' + prRepository?.path + '; name the target repository remote as reviewTarget.baseRemote');
     targetBranch = reviewTarget.targetBranch;
     // Preflight fetched both refs; from here on the local objects are the baseline.
-    const targetTip = git(repository, ['rev-parse', '--verify', '--end-of-options', 'refs/remotes/' + reviewTarget.remote + '/' + targetBranch + '^{commit}']);
+    const targetTip = git(repository, ['rev-parse', '--verify', '--end-of-options', 'refs/remotes/' + baseRemote + '/' + targetBranch + '^{commit}']);
     startSha = git(repository, ['rev-parse', '--verify', '--end-of-options', reviewTarget.headSha + '^{commit}']);
     requireThat(startSha === reviewTarget.headSha, 'review target head is not a full commit id');
     // A PR may lag its target branch: review and develop against the merge base.

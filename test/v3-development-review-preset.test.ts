@@ -216,7 +216,7 @@ describe('authored development-review preset', () => {
     expect(json(join(dirname(g.prepared), 'manifest.json')).error).toMatchObject({ code: 'DEPENDENCY_ENVIRONMENT_NOT_READY', message: expect.stringContaining('isolated dependency install failed') });
     expect(existsSync(join(g.prepared, 'context.json'))).toBe(false);
   });
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -515,6 +515,65 @@ describe('fixed development-review executable resources', () => {
     write(join(output, 'result.json'), { ...planned2, contextSha256: sha(context), releaseSha256: sha(join(gated, 'release-candidate.json')) });
     expect(await verify()).toMatchObject({ code: 2, stderr: 'delivery plan skipped a required approval\n' });
     expect(json(join(verified, 'verification.json'))).toMatchObject({ verified: true, action: 'comment', url: reviewTarget.url });
+  });
+
+  it('bases a fork PR on its target repository, not on the fork\'s stale copy of the target branch', async () => {
+    // A fork PR: the head lives on the fork, the target branch on the base repository.
+    // The fork's own main is stale, so its merge base would widen the reviewed range.
+    const setup = () => {
+      const f = fixture(), origin = join(f.root, 'origin.git'), fork = join(f.root, 'fork.git');
+      f.git(f.root, 'init', '-q', '--bare', origin); f.git(f.root, 'init', '-q', '--bare', fork);
+      f.git(f.repo, 'remote', 'add', 'origin', origin); f.git(f.repo, 'remote', 'add', 'fork', fork);
+      const staleBase = f.git(f.repo, 'rev-parse', 'HEAD');
+      f.git(f.repo, 'push', '-q', 'fork', 'main');
+      writeFileSync(join(f.repo, 'value.txt'), 'target moved on\n'); f.git(f.repo, 'commit', '-qam', 'target branch progress');
+      const prBase = f.git(f.repo, 'rev-parse', 'HEAD');
+      f.git(f.repo, 'push', '-q', 'origin', 'main');
+      f.git(f.repo, 'checkout', '-qb', 'feature/fork');
+      writeFileSync(join(f.repo, 'value.txt'), 'fork PR\n'); f.git(f.repo, 'commit', '-qam', 'fork PR');
+      const headSha = f.git(f.repo, 'rev-parse', 'HEAD');
+      f.git(f.repo, 'push', '-q', 'fork', 'feature/fork'); f.git(f.repo, 'checkout', '-q', 'main');
+      f.git(f.repo, 'fetch', '-q', 'origin'); f.git(f.repo, 'fetch', '-q', 'fork');
+      // Only the URLs identify the repositories; refs are already local and prepare does not fetch.
+      f.git(f.repo, 'remote', 'set-url', 'origin', 'https://github.com/acme/project.git');
+      f.git(f.repo, 'remote', 'set-url', 'fork', 'git@github.com:someone/project.git');
+      expect(f.git(f.repo, 'merge-base', 'refs/remotes/fork/main', headSha)).toBe(staleBase);
+      write(f.params, { params: { ...json(f.params).params, mode: 'continue' } });
+      const reviewTarget = { url: 'https://github.com/acme/project/pull/7', author: 'someone', remote: 'fork', sourceBranch: 'feature/fork', targetBranch: 'main', headSha };
+      return { f, staleBase, prBase, headSha, reviewTarget };
+    };
+
+    const named = setup();
+    write(named.f.preflight, { ...json(named.f.preflight), reviewTarget: { ...named.reviewTarget, baseRemote: 'origin' }, login: 'someone' });
+    expect(await named.f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(named.f.prepared, 'context.json'))).toMatchObject({ baseSha: named.prBase, startSha: named.headSha });
+
+    // Without baseRemote the fork would be the baseline: refuse instead of widening the range.
+    const unnamed = setup();
+    write(unnamed.f.preflight, { ...json(unnamed.f.preflight), reviewTarget: unnamed.reviewTarget, login: 'someone' });
+    const refused = await unnamed.f.prepare();
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain('PR_BASE_REMOTE_MISMATCH');
+    expect(existsSync(join(unnamed.f.prepared, 'context.json'))).toBe(false);
+    expect(existsSync(unnamed.f.worktree)).toBe(false);
+
+    // A baseRemote that is itself a fork is refused the same way.
+    const wrongBase = setup();
+    write(wrongBase.f.preflight, { ...json(wrongBase.f.preflight), reviewTarget: { ...wrongBase.reviewTarget, baseRemote: 'fork' }, login: 'someone' });
+    expect((await wrongBase.f.prepare()).stderr).toContain('PR_BASE_REMOTE_MISMATCH');
+
+    // A same-repository PR keeps the old single-remote contract.
+    const sameRepo = setup();
+    write(sameRepo.f.preflight, { ...json(sameRepo.f.preflight), reviewTarget: { ...sameRepo.reviewTarget, remote: 'origin' }, login: 'someone' });
+    expect(await sameRepo.f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(sameRepo.f.prepared, 'context.json')).baseSha).toBe(sameRepo.prBase);
+
+    // A remote on another host (a mirror) is not second-guessed.
+    const mirror = setup();
+    mirror.f.git(mirror.f.repo, 'remote', 'set-url', 'origin', 'https://mirror.example.invalid/acme/project.git');
+    write(mirror.f.preflight, { ...json(mirror.f.preflight), reviewTarget: { ...mirror.reviewTarget, baseRemote: 'origin' }, login: 'someone' });
+    expect(await mirror.f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(mirror.f.prepared, 'context.json')).baseSha).toBe(mirror.prBase);
   });
 
   it('continues an existing PR: plans an update, pushes only the approved commit without force, and verifies the remote', async () => {
