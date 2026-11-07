@@ -211,6 +211,7 @@ function pinnedRoleDefinition(loaded: LoadedAuthorizedV3Run): LoadedSavedWorkflo
 export function buildSavedWorkflowRevisionBaseline(
   loaded: LoadedAuthorizedV3Run,
   opts: BuildSavedWorkflowRevisionBaselineOptions = {},
+  originalDag: V3Dag = loaded.dag,
 ): BuiltSavedWorkflowRevisionBaseline {
   if (!loaded.spec) throw new Error('cannot save workflow: source run has no validated spec.json');
   if (loaded.botSnapshots === undefined) {
@@ -223,6 +224,7 @@ export function buildSavedWorkflowRevisionBaseline(
     snapshots,
     sourceRunId: loaded.envelope.runId,
     roleDefinition: pinnedRoleDefinition(loaded),
+    originalDag,
   }, opts);
 }
 
@@ -232,7 +234,7 @@ export function buildSavedWorkflowRevisionBaseline(
  * run (§5.1). Pure: no path or journal IO.
  */
 export function buildSavedWorkflowRevisionFromFlow(
-  flow: { dag: V3Dag; spec: Spec; snapshots: ReadonlyMap<string, BotSnapshot>; sourceRunId?: string; roleDefinition?: LoadedSavedWorkflowRevision['payload'] },
+  flow: { dag: V3Dag; spec: Spec; snapshots: ReadonlyMap<string, BotSnapshot>; sourceRunId?: string; roleDefinition?: LoadedSavedWorkflowRevision['payload']; originalDag?: V3Dag },
   opts: BuildSavedWorkflowRevisionBaselineOptions = {},
 ): BuiltSavedWorkflowRevisionBaseline {
   const hasLegacySelector = (nodes: V3Dag['nodes']): boolean => nodes.some((node) =>
@@ -250,10 +252,14 @@ export function buildSavedWorkflowRevisionFromFlow(
   const roleDefinition = flow.roleDefinition;
   if (roleDefinition) {
     const templates = savedWorkflowGoalPaths(roleDefinition.dagTemplate.nodes);
+    const originals = flow.originalDag && savedWorkflowGoalPaths(flow.originalDag.nodes);
     for (const [path, node] of savedWorkflowGoalPaths(normalizedNodes)) {
       const template = templates.get(path);
-      if (!template) throw new Error(`cannot save role workflow: source goal ${path} is absent from pinned definition`);
-      node.goal = template.goal;
+      if (!template) continue;
+      const original = originals?.get(path);
+      // Restoring a template must not undo a user-approved runtime revision.
+      if (!originals || node.goal === original?.goal) node.goal = template.goal;
+      if (originals && node.override?.systemPromptAppend !== original?.override?.systemPromptAppend) continue;
       const { systemPromptAppend: _rendered, ...other } = node.override ?? {};
       const text = template.override?.systemPromptAppend;
       if (text !== undefined) node.override = { ...other, systemPromptAppend: text };
@@ -326,7 +332,7 @@ export function compileSavedWorkflowFromRun(
           effective.botAdditions,
         )),
       };
-  const built = buildSavedWorkflowRevisionBaseline(source, opts);
+  const built = buildSavedWorkflowRevisionBaseline(source, opts, loaded.dag);
   const { lintWarnings } = built;
   if (lintWarnings.length > 0 && opts.acknowledgeUnsafeLiterals !== true) {
     throw new SavedWorkflowUnsafeLiteralError(lintWarnings);
@@ -438,6 +444,7 @@ export function compileDashboardSavedWorkflowFromRun(
     snapshots: scope,
     sourceRunId: loaded.envelope.runId,
     roleDefinition: pinnedRoleDefinition(loaded),
+    originalDag: loaded.dag,
   }, opts);
   if (built.lintWarnings.length > 0 && opts.acknowledgeUnsafeLiterals !== true) {
     throw new SavedWorkflowUnsafeLiteralError(built.lintWarnings);
@@ -479,16 +486,58 @@ export function compileDashboardSavedWorkflowFromRun(
 
 /** The DAG and spec a revision runs as under `runId` — exactly what
  *  {@link materializeSavedWorkflowRun} writes. */
-export function savedWorkflowRunFlow(revision: LoadedSavedWorkflowRevision, runId: string): { dag: V3Dag; spec: Spec } {
+export function savedWorkflowRunFlow(
+  revision: LoadedSavedWorkflowRevision, runId: string, bots: BotConfig[] = [], roleSelections?: Record<string, string>,
+): { dag: V3Dag; spec: Spec; resolvedRoles?: ResolvedSavedWorkflowRoles } {
+  assertSavedWorkflowTemplateBindings(
+    revision.payload.dagTemplate,
+    revision.payload.inputs,
+    revision.payload.contextRefs,
+    revision.payload.roles,
+  );
+
+  const roles = validateSavedWorkflowRoles(revision.payload.roles, revision.payload.dagTemplate.nodes);
+  const resolvedRoles = resolveSavedWorkflowRoles(roles, roleSelections, bots);
+  const execution = revision.payload.execution;
+  // Keep legacy all-distinct policies intact; each additional group is also
+  // enforced, so sharing unconstrained roles cannot bypass another constraint.
+  for (const group of [...(execution?.distinctRoles ? [execution.distinctRoles] : []), ...(execution?.distinctRoleGroups ?? [])]) {
+    const selected = group.map(name => resolvedRoles[name]?.bot);
+    if (selected.some(bot => !bot) || new Set(selected).size !== selected.length) {
+      throw new Error('Workflow execution requires distinct bots for independent roles');
+    }
+  }
+  if (roles) assertSavedWorkflowSpecTemplateBindings(revision.payload.specTemplate,
+    revision.payload.inputs, revision.payload.contextRefs, roles);
+
+  const nodes = cloneNodes(revision.payload.dagTemplate.nodes);
+  if (roles) {
+    const goals = savedWorkflowGoalPaths(nodes);
+    for (const role of Object.values(resolvedRoles)) {
+      for (const path of role.nodes) goals.get(path)!.bot = role.bot;
+    }
+    const summary = `Workflow role bindings (host-frozen):\n${savedWorkflowRoleSummary(resolvedRoles)}`;
+    for (const node of goals.values()) {
+      node.goal = renderSavedWorkflowRoleText(node.goal!, resolvedRoles);
+      const instructions = node.override?.systemPromptAppend;
+      node.override = { ...node.override, systemPromptAppend:
+        `${instructions ? `${renderSavedWorkflowRoleText(instructions, resolvedRoles)}\n\n` : ''}${summary}` };
+    }
+  }
   const dag = validateDag({
     ...(revision.payload.dagTemplate.schemaVersion !== undefined
       ? { schemaVersion: revision.payload.dagTemplate.schemaVersion }
       : {}),
     runId,
-    nodes: cloneNodes(revision.payload.dagTemplate.nodes),
+    nodes,
   });
-  const spec = validateSpec({ ...revision.payload.specTemplate, runId });
-  return { dag, spec };
+  // Only strings already admitted by the narrative-field validator are rendered.
+  const renderSpec = (value: unknown): unknown => typeof value === 'string'
+    ? renderSavedWorkflowRoleText(value, resolvedRoles)
+    : Array.isArray(value) ? value.map(renderSpec)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, renderSpec(v)])) : value;
+  const spec = validateSpec({ ...(roles ? renderSpec(revision.payload.specTemplate) as object : revision.payload.specTemplate), runId });
+  return { dag, spec, ...(roles ? { resolvedRoles } : {}) };
 }
 
 /** Parameters → typed values, by the same rules as `/workflow run`. Refuses
@@ -641,13 +690,14 @@ export function commitSavedWorkflowRunInPlace(input: CommitSavedWorkflowRunInPla
     input.revision.payload.dagTemplate,
     input.revision.payload.inputs,
     input.revision.payload.contextRefs,
+    input.revision.payload.roles,
   );
   const resolvedParams = resolveSavedWorkflowRunParams(input.revision, input.rawParams);
   const resolvedContext = resolveContext(input.revision.payload.contextRefs, {
     chatBinding: input.chatBinding,
     initiatorOpenId: input.initiator.openId,
   });
-  const { dag, spec } = savedWorkflowRunFlow(input.revision, runId);
+  const { dag, spec, resolvedRoles } = savedWorkflowRunFlow(input.revision, runId, input.bots);
   // The prepared files are what was shown (and, for a draft-born revision,
   // confirmed): exactly the revision's flow, byte-pinned.
   for (const [file, value, sha] of [
@@ -660,7 +710,12 @@ export function commitSavedWorkflowRunInPlace(input: CommitSavedWorkflowRunInPla
     if (JSON.stringify(onDisk) !== JSON.stringify(value)) throw new Error(`${file} is not this revision's flow`);
   }
   const botSnapshots = freezeDagBotSnapshots(dag, input.bots, { defaultSelector: input.chatBinding.larkAppId });
+  const workingDirectory = savedWorkflowWorkingDirectory(input.revision, resolvedParams);
+  if (workingDirectory !== undefined) {
+    for (const [selector, snapshot] of botSnapshots) botSnapshots.set(selector, { ...snapshot, workingDir: workingDirectory });
+  }
   const now = input.now ?? new Date();
+  if (resolvedRoles) writeJson0600(join(runDir, 'roles.resolved.json'), resolvedRoles);
   writeJson0600(join(runDir, 'bots.snapshot.json'), serializeFrozenBotSnapshots(botSnapshots));
   writeJson0600(join(runDir, 'params.resolved.json'), { params: resolvedParams, context: resolvedContext });
   writeJson0600(join(runDir, 'definition.snapshot.json'), {
@@ -691,6 +746,7 @@ export function commitSavedWorkflowRunInPlace(input: CommitSavedWorkflowRunInPla
       botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
       resolvedParams: artifactRef(runDir, 'params.resolved.json'),
       definitionSnapshot: artifactRef(runDir, 'definition.snapshot.json'),
+      ...(resolvedRoles ? { resolvedRoles: artifactRef(runDir, 'roles.resolved.json') } : {}),
     },
   });
   return publishRunEnvelopeOnce(runDir, envelope).envelope as V3SavedDefinitionRunEnvelope;
@@ -780,6 +836,19 @@ function writeJson0600(path: string, value: unknown): void {
   atomicWriteFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
 }
 
+function savedWorkflowWorkingDirectory(revision: LoadedSavedWorkflowRevision, resolvedParams: Record<string, unknown>): string | undefined {
+  let workingDirectory: string | undefined;
+  if (revision.payload.execution?.workingDirectoryParam !== undefined) {
+    const requested = resolvedParams[revision.payload.execution.workingDirectoryParam];
+    if (typeof requested !== 'string' || !requested.trim() || requested.includes('\0')) {
+      throw new Error('Workflow execution workspace requires a non-empty directory input');
+    }
+    workingDirectory = realpathSync(requested);
+    if (!statSync(workingDirectory).isDirectory()) throw new Error('Workflow execution workspace must be a directory');
+  }
+  return workingDirectory;
+}
+
 /** Published revision → fresh immutable v3 run directory. */
 export function materializeSavedWorkflowRun(
   input: MaterializeSavedWorkflowRunInput,
@@ -810,27 +879,6 @@ export function materializeSavedWorkflowRun(
       throw new Error('Only the Saved Workflow owner may select execution roles');
     }
   }
-  assertSavedWorkflowTemplateBindings(
-    input.revision.payload.dagTemplate,
-    input.revision.payload.inputs,
-    input.revision.payload.contextRefs,
-    input.revision.payload.roles,
-  );
-
-  const roles = validateSavedWorkflowRoles(input.revision.payload.roles, input.revision.payload.dagTemplate.nodes);
-  const resolvedRoles = resolveSavedWorkflowRoles(roles, input.roleSelections, input.bots);
-  const execution = input.revision.payload.execution;
-  // Keep legacy all-distinct policies intact; each additional group is also
-  // enforced, so sharing unconstrained roles cannot bypass another constraint.
-  for (const group of [...(execution?.distinctRoles ? [execution.distinctRoles] : []), ...(execution?.distinctRoleGroups ?? [])]) {
-    const selected = group.map(name => resolvedRoles[name]?.bot);
-    if (selected.some(bot => !bot) || new Set(selected).size !== selected.length) {
-      throw new Error('Workflow execution requires distinct bots for independent roles');
-    }
-  }
-  if (roles) assertSavedWorkflowSpecTemplateBindings(input.revision.payload.specTemplate,
-    input.revision.payload.inputs, input.revision.payload.contextRefs, roles);
-
   const now = input.now ?? new Date();
   const runId = input.runId ?? mintV3RunId(input.metadata.displayName, now);
   if (!isValidRunId(runId)) throw new Error(`invalid Saved Workflow runId: ${JSON.stringify(runId)}`);
@@ -856,42 +904,8 @@ export function materializeSavedWorkflowRun(
     input.rawParams ?? {},
   );
   const resolvedContext = resolveContext(input.revision.payload.contextRefs, input.context);
-  let workingDirectory: string | undefined;
-  if (execution?.workingDirectoryParam !== undefined) {
-    const requested = resolvedParams[execution.workingDirectoryParam];
-    if (typeof requested !== 'string' || !requested.trim() || requested.includes('\0')) {
-      throw new Error('Workflow execution workspace requires a non-empty directory input');
-    }
-    workingDirectory = realpathSync(requested);
-    if (!statSync(workingDirectory).isDirectory()) throw new Error('Workflow execution workspace must be a directory');
-  }
-  const nodes = cloneNodes(input.revision.payload.dagTemplate.nodes);
-  if (roles) {
-    const goals = savedWorkflowGoalPaths(nodes);
-    for (const role of Object.values(resolvedRoles)) {
-      for (const path of role.nodes) goals.get(path)!.bot = role.bot;
-    }
-    const summary = `Workflow role bindings (host-frozen):\n${savedWorkflowRoleSummary(resolvedRoles)}`;
-    for (const node of goals.values()) {
-      node.goal = renderSavedWorkflowRoleText(node.goal!, resolvedRoles);
-      const instructions = node.override?.systemPromptAppend;
-      node.override = { ...node.override, systemPromptAppend:
-        `${instructions ? `${renderSavedWorkflowRoleText(instructions, resolvedRoles)}\n\n` : ''}${summary}` };
-    }
-  }
-  const dag = validateDag({
-    ...(input.revision.payload.dagTemplate.schemaVersion !== undefined
-      ? { schemaVersion: input.revision.payload.dagTemplate.schemaVersion }
-      : {}),
-    runId,
-    nodes,
-  });
-  // Only strings already admitted by the narrative-field validator are rendered.
-  const renderSpec = (value: unknown): unknown => typeof value === 'string'
-    ? renderSavedWorkflowRoleText(value, resolvedRoles)
-    : Array.isArray(value) ? value.map(renderSpec)
-    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, renderSpec(v)])) : value;
-  const spec = validateSpec({ ...(roles ? renderSpec(input.revision.payload.specTemplate) as object : input.revision.payload.specTemplate), runId });
+  const workingDirectory = savedWorkflowWorkingDirectory(input.revision, resolvedParams);
+  const { dag, spec, resolvedRoles } = savedWorkflowRunFlow(input.revision, runId, input.bots, input.roleSelections);
   const botSnapshots = freezeDagBotSnapshots(dag, input.bots, input.nodeExecutor === 'bot'
     ? { defaultSelector: input.context?.chatBinding?.larkAppId }
     : {});
@@ -926,7 +940,7 @@ export function materializeSavedWorkflowRun(
         params: resolvedParams,
         context: resolvedContext,
       });
-      if (roles) writeJson0600(join(stagedRunDir, 'roles.resolved.json'), resolvedRoles);
+      if (resolvedRoles) writeJson0600(join(stagedRunDir, 'roles.resolved.json'), resolvedRoles);
       writeJson0600(join(stagedRunDir, 'definition.snapshot.json'), {
         schemaVersion: 1,
         workflowId: input.metadata.workflowId,
@@ -944,7 +958,7 @@ export function materializeSavedWorkflowRun(
         botSnapshots: artifactRef(stagedRunDir, 'bots.snapshot.json'),
         resolvedParams: artifactRef(stagedRunDir, 'params.resolved.json'),
         definitionSnapshot: artifactRef(stagedRunDir, 'definition.snapshot.json'),
-        ...(roles ? { resolvedRoles: artifactRef(stagedRunDir, 'roles.resolved.json') } : {}),
+        ...(resolvedRoles ? { resolvedRoles: artifactRef(stagedRunDir, 'roles.resolved.json') } : {}),
       };
       const envelope = makeSavedDefinitionRunEnvelope({
         runId,
@@ -979,7 +993,7 @@ export function materializeSavedWorkflowRun(
         resolvedParams,
         resolvedContext,
         botSnapshots,
-        ...(roles ? { resolvedRoles } : {}),
+        ...(resolvedRoles ? { resolvedRoles } : {}),
         envelope,
       };
     } catch (err) {
