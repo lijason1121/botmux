@@ -1712,7 +1712,7 @@ export class WorkflowDraftService {
     });
     let record: WorkflowDraftRecord;
     try {
-      const { dag, spec } = savedWorkflowRunFlow(prepared.revision, runId);
+      const { dag, spec } = savedWorkflowRunFlow(prepared.revision, runId, bots);
       // Every node's bot must still be configured here (checked again live
       // at 拉群开始): fail now, not at the end of a launch.
       freezeDagBotSnapshots(dag, bots, { defaultSelector: this.deps.appId });
