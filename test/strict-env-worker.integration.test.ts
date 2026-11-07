@@ -2,11 +2,11 @@ import { describe, it, expect, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, cpSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findMissingAskEnv } from '../src/core/ask-args.js';
-import { inheritBotEnv } from '../src/core/env-policy.js';
+import { buildBotWorkerEnv } from '../src/core/env-policy.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 let realTmux: string | undefined;
@@ -27,7 +27,7 @@ if (realTmux) cases.push({ cliId: 'claude-code', scope: 'chat', restore: true })
  * Returns null on timeout so the caller fails with diagnostics instead of
  * hanging.
  */
-function waitForJsonReport(path: string, timeoutMs: number): Record<string, unknown> | null {
+async function waitForJsonReport(path: string, timeoutMs: number): Promise<Record<string, unknown> | null> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
@@ -37,7 +37,8 @@ function waitForJsonReport(path: string, timeoutMs: number): Record<string, unkn
       // Not created yet / empty truncate window / partially written JSON — keep polling.
     }
     if (Date.now() >= deadline) return null;
-    spawnSync('sleep', ['0.05']);
+    // Let IPC, worker exit and diagnostic streams run while the CLI starts.
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
 }
 
@@ -82,7 +83,7 @@ console.log('Ready >'); setTimeout(() => {}, 30000);
     writeFileSync(bots, JSON.stringify([{ larkAppId: 'app_probe', larkAppSecret: '', apiOnly: true, cliId }]));
     // The command shim redirects -S, while the boot guard also scans the
     // configured socket label. Keep both away from the host's live server.
-    const env = { ...inheritBotEnv(process.env, { mode: 'strict' }), HOME: dir, SESSION_DATA_DIR: join(dir, 'data'),
+    const env = { ...buildBotWorkerEnv(process.env, { mode: 'strict' }), HOME: dir, SESSION_DATA_DIR: join(dir, 'data'),
       BOTMUX_TMUX_SOCKET: `strict-env-${sessionId}`,
       BOTS_CONFIG: bots, BOTMUX_NO_CLAIM: '1', HOUSEHOLD_API_CREDENTIAL: 'household-sentinel', FINANCE_SERVICE_SECRET: 'finance-sentinel', UNLISTED_CLOUD_CREDENTIAL: 'host-sentinel', SIBLING_AUTH: 'sibling-sentinel', HTTPS_PROXY: 'proxy-sentinel' };
     if (restore) {
@@ -103,7 +104,7 @@ console.log('Ready >'); setTimeout(() => {}, 30000);
         envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] }, env: { MODEL_AUTH: 'bot-sentinel', OPENAI_API_KEY: 'own-model-auth' },
         ...(cliId === 'codex' ? { codexAuthSync: 'isolated' } : {}),
         loadedBotsConfigPath: bots, loadedBotsConfigProvenance: 'loaded', promptInjection: 'none' });
-      const reportJson = waitForJsonReport(report, 20000);
+      const reportJson = await waitForJsonReport(report, 20000);
       expect(reportJson, diagnostics).not.toBeNull();
       const { askEnv, ...checks } = reportJson as { askEnv: NodeJS.ProcessEnv } & Record<string, unknown>;
       expect(findMissingAskEnv(askEnv)).toBeNull();
