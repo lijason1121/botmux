@@ -255,9 +255,11 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
 
     const promptSubmitted = () => events().some(e => e.kind === 'submit' && e.text === FIRST_PROMPT);
     if (scenario.hook) {
-      await waitFor(() => heldNotices(run).length > 0, 60_000, 'the held-message notice');
-      // A few seconds for an (unwanted) automatic answer to show up.
-      await new Promise(r => setTimeout(r, 4_000));
+      // A late hook first produces the generic hold notice. Wait for the
+      // actual dialog notice before the person acts; a fixed delay after the
+      // first notice can answer before the worker has observed the dialog.
+      await waitFor(() => heldNotices(run).some(m => noticeKey(m.message)
+        === 'worker.startup_command_dialog_pending'), 60_000, 'the hook-dialog notice');
       expect(events().filter(e => e.kind === 'accept' || e.kind === 'cancel' || e.kind === 'dialog-key'), logs.join('')).toEqual([]);
       expect(promptSubmitted(), logs.join('')).toBe(false);
       run.personAt = Date.now();

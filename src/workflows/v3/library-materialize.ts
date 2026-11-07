@@ -904,8 +904,8 @@ export function materializeSavedWorkflowRun(
     input.rawParams ?? {},
   );
   const resolvedContext = resolveContext(input.revision.payload.contextRefs, input.context);
-  const workingDirectory = savedWorkflowWorkingDirectory(input.revision, resolvedParams);
   const { dag, spec, resolvedRoles } = savedWorkflowRunFlow(input.revision, runId, input.bots, input.roleSelections);
+  const workingDirectory = savedWorkflowWorkingDirectory(input.revision, resolvedParams);
   const botSnapshots = freezeDagBotSnapshots(dag, input.bots, input.nodeExecutor === 'bot'
     ? { defaultSelector: input.context?.chatBinding?.larkAppId }
     : {});
