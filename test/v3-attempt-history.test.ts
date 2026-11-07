@@ -1,3 +1,4 @@
+import './helpers/require-fenced-data-dir.js';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
