@@ -31,6 +31,12 @@ export interface V3ProgressCardOptions {
    * messages carry. Absent = the card is exactly what it always was.
    */
   workflowEntry?: WorkflowSidebarEntryLink;
+  /**
+   * Render clock for elapsed durations. Only statuses the card manager keeps
+   * polling use it, so a settled card never shows a frozen "elapsed" value.
+   * Absent = journal times only (deterministic output).
+   */
+  now?: Date;
 }
 
 /**
@@ -62,6 +68,10 @@ export function v3RunWorkflowEntry(
 }
 
 const MAX_INLINE_IDS = 5;
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1_000;
+/** Statuses whose card the manager keeps re-rendering on its polling tick. */
+const LIVE_STATUSES: ReadonlySet<V3ProgressView['status']> = new Set(['starting', 'running', 'cancelling']);
+const TERMINAL_STATUSES: ReadonlySet<V3ProgressView['status']> = new Set(['succeeded', 'failed', 'cancelled']);
 
 export function v3ProgressRunDetailUrl(runId: string): string {
   return buildV3RunDetailUrl(runId, { host: config.dashboard.externalHost, port: config.dashboard.port });
@@ -86,6 +96,7 @@ export function buildV3ProgressCard(
       })
     : null;
   const source = sourceLabel(view.source);
+  const now = options.now && LIVE_STATUSES.has(view.status) ? options.now.getTime() : undefined;
   const elements: Array<Record<string, unknown>> = [
     {
       tag: 'div',
@@ -113,12 +124,12 @@ export function buildV3ProgressCard(
     },
     {
       tag: 'note',
-      elements: [{ tag: 'plain_text', content: `更新时间：${formatUpdatedAt(view.updatedAt)}` }],
+      elements: [{ tag: 'plain_text', content: timeNote(view, now) }],
     },
   ];
 
   if (view.currentNodeIds.length > 0) {
-    appendSection(elements, '🏃 当前节点', formatIdList(view.currentNodeIds));
+    appendSection(elements, '🏃 当前节点', formatCurrentNodes(view, now));
   }
 
   if (view.waitingNodeIds.length > 0) {
@@ -356,12 +367,80 @@ function formatIdList(ids: readonly string[]): string {
   return `${visible.join('、')}${remaining > 0 ? ` 等 ${ids.length} 个` : ''}`;
 }
 
-function formatUpdatedAt(iso: string): string {
-  // Projection emits an ISO timestamp.  Keep it timezone-explicit and avoid
-  // host-locale output so PATCHes/tests are deterministic across machines.
-  return escapePlainText(
-    iso.replace('T', ' ').replace(/\.\d{3}Z$/, 'Z'),
-  );
+function timeNote(view: V3ProgressView, now: number | undefined): string {
+  const startedAt = view.timing?.startedAt;
+  const started = startedAt ? Date.parse(startedAt) : NaN;
+  if (!startedAt || !Number.isFinite(started)) return `更新时间：${formatBeijing(view.updatedAt)}（北京时间）`;
+  const parts = [`开始 ${formatBeijing(startedAt)}`];
+  const finishedAt = view.timing?.finishedAt;
+  const finished = finishedAt ? Date.parse(finishedAt) : NaN;
+  if (finishedAt && Number.isFinite(finished) && TERMINAL_STATUSES.has(view.status)) {
+    parts.push(`结束 ${formatBeijing(finishedAt)}`, `总耗时 ${formatElapsed(finished - started)}`);
+  } else if (now !== undefined) {
+    parts.push(`已运行 ${formatElapsed(now - started)}`, `刷新于 ${formatBeijing(new Date(now).toISOString(), 'time')}`);
+  } else {
+    parts.push(`更新于 ${formatBeijing(view.updatedAt)}`);
+  }
+  return `${parts.join(' · ')}（北京时间）`;
+}
+
+function formatCurrentNodes(view: V3ProgressView, now: number | undefined): string {
+  const active = view.timing?.active ?? [];
+  if (active.length === 0) return formatIdList(view.currentNodeIds);
+  const lines = view.currentNodeIds.flatMap((nodeId) => {
+    const entries = active.filter((entry) => entry.nodeId === nodeId);
+    return entries.length > 0 ? entries.map((entry) => formatActiveNode(entry, now)) : [escapeMd(nodeId)];
+  });
+  const visible = lines.slice(0, MAX_INLINE_IDS);
+  return `${visible.join('\n')}${lines.length > visible.length ? `\n等 ${lines.length} 个` : ''}`;
+}
+
+function formatActiveNode(
+  entry: NonNullable<V3ProgressView['timing']>['active'][number],
+  now: number | undefined,
+): string {
+  const parts = [escapeMd(entry.bodyNodeId ? `${entry.nodeId}/${entry.bodyNodeId}` : entry.nodeId)];
+  if (entry.attempt && entry.attempt > 1) parts.push(`第 ${entry.attempt} 次尝试`);
+  parts.push(`${formatBeijing(entry.startedAt, 'time')} 开始`);
+  const started = Date.parse(entry.startedAt);
+  const elapsed = now !== undefined && Number.isFinite(started) ? `已运行 ${formatElapsed(now - started)}` : undefined;
+  const limit = entry.timeoutSec ? `上限 ${formatLimit(entry.timeoutSec)}` : undefined;
+  const budget = [elapsed, limit].filter(Boolean).join(' / ');
+  if (budget) parts.push(budget);
+  return parts.join(' · ');
+}
+
+/**
+ * Asia/Shanghai has no DST, so a fixed offset keeps PATCHes/tests identical
+ * across host time zones and locales.
+ */
+function formatBeijing(iso: string, precision: 'minute' | 'time' = 'minute'): string {
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return escapePlainText(iso);
+  const local = new Date(ms + BEIJING_OFFSET_MS).toISOString();
+  return precision === 'time' ? local.slice(11, 16) : `${local.slice(5, 10)} ${local.slice(11, 16)}`;
+}
+
+/** Whole minutes, so a live card changes at most once a minute. */
+function formatElapsed(ms: number): string {
+  const minutes = Math.floor(Math.max(0, ms) / 60_000);
+  if (minutes < 1) return '不到 1 分钟';
+  const days = Math.floor(minutes / 1_440);
+  const hours = Math.floor((minutes % 1_440) / 60);
+  const rest = minutes % 60;
+  if (days > 0) return `${days} 天${hours > 0 ? ` ${hours} 小时` : ''}`;
+  if (hours > 0) return `${hours} 小时${rest > 0 ? ` ${rest} 分钟` : ''}`;
+  return `${rest} 分钟`;
+}
+
+function formatLimit(seconds: number): string {
+  const total = Math.max(1, Math.round(seconds));
+  const parts = [
+    [Math.floor(total / 3_600), '小时'],
+    [Math.floor((total % 3_600) / 60), '分钟'],
+    [total % 60, '秒'],
+  ] as const;
+  return parts.filter(([value]) => value > 0).map(([value, unit]) => `${value} ${unit}`).join(' ');
 }
 
 function sanitizePlainTitle(value: string | undefined): string | undefined {

@@ -81,7 +81,8 @@ export interface V3ProgressCardTransport {
 export interface V3ProgressCardManagerDeps {
   baseDir: string;
   transport: V3ProgressCardTransport;
-  buildCard(view: V3ProgressView, loaded: LoadedAuthorizedV3Run): string;
+  /** `now` is the refresh clock; a live card may render elapsed time from it. */
+  buildCard(view: V3ProgressView, loaded: LoadedAuthorizedV3Run, now: Date): string;
   onError?: (runId: string, error: unknown) => void;
   now?: () => Date;
   pollIntervalMs?: number;
@@ -277,11 +278,11 @@ export class V3ProgressCardManager {
         view.status === 'failed' ||
         view.status === 'cancelled';
       const finish = () => { if (settled) this.stop(runId); return true; };
-      const cardJson = this.deps.buildCard(view, loaded);
+      const now = (this.deps.now ?? (() => new Date()))();
+      const cardJson = this.deps.buildCard(view, loaded, now);
       // Parse once before transport: never persist/checkpoint malformed card JSON.
       JSON.parse(cardJson);
       const cardSha256 = sha256(cardJson);
-      const now = (this.deps.now ?? (() => new Date()))();
 
       if (!sidecar) {
         if (!options.allowCreate) return false;
