@@ -27,7 +27,7 @@ function fixture(objectFormat = 'sha1', selected = BOTS) {
   writeFileSync(join(root, 'gitconfig'), '');
   const env = { ...process.env, GIT_CONFIG_COUNT: '0', GIT_CONFIG_GLOBAL: join(root, 'gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' };
-  const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-C', cwd, ...args], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-C', cwd, ...args], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }).trim();
   git(repo, 'init', '-q', '-b', 'main', '--object-format=' + objectFormat);
   writeFileSync(join(repo, 'value.txt'), 'before\n'); git(repo, 'add', 'value.txt'); git(repo, 'commit', '-qm', 'fixture base');
   write(join(run, 'run.json'), { runId }); // Local script fixture; no success journal or real Workflow is created.
@@ -107,7 +107,7 @@ describe('authored development-review preset', () => {
     expect(readFileSync(join(f.repo, 'bun.lock'), 'utf8')).toBe('lock-1');
   });
 
-  it.each(['matching', 'stale-code', 'foreign-link', 'missing-link', 'missing-child', 'shadowed-child'] as const)('verifies an independent workspace installation against the full task snapshot: %s', async mode => {
+  it.each(['matching', 'large-snapshot', 'stale-code', 'foreign-link', 'missing-link', 'missing-child', 'shadowed-child'] as const)('verifies an independent workspace installation against the full task snapshot: %s', async mode => {
     const f = fixture(), source = join(f.root, 'external-workspace');
     write(join(f.repo, 'package.json'), { workspaces: ['packages/*'] });
     writeFileSync(join(f.repo, 'bun.lock'), 'workspace-lock'); writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
@@ -115,6 +115,12 @@ describe('authored development-review preset', () => {
     write(join(f.repo, 'packages', 'a', 'package.json'), { name: 'workspace-a', version: '1.0.0',
       ...(mode === 'missing-child' ? { dependencies: { missing: '1.0.0' } } : mode === 'shadowed-child' ? { dependencies: { 'workspace-a': '1.0.0' } } : {}) });
     writeFileSync(join(f.repo, 'packages', 'a', 'index.js'), 'export const value = 1;');
+    if (mode === 'large-snapshot') {
+      // More than 1 MiB of tracked paths, like a large monorepo.
+      const deep = join(f.repo, 'assets', ...Array.from({ length: 16 }, (_, i) => String(i).padEnd(200, 'd')));
+      mkdirSync(deep, { recursive: true });
+      for (let i = 0; i < 340; i++) writeFileSync(join(deep, String(i).padEnd(100, 'f')), '');
+    }
     f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'workspace snapshot');
     for (const file of f.git(f.repo, 'ls-files').split('\n')) {
       mkdirSync(dirname(join(source, file)), { recursive: true }); writeFileSync(join(source, file), readFileSync(join(f.repo, file)));
@@ -128,9 +134,11 @@ describe('authored development-review preset', () => {
       symlinkSync(foreign, join(source, 'packages', 'a', 'node_modules', 'workspace-a'), 'dir');
     }
     if (mode === 'stale-code') writeFileSync(join(source, 'packages', 'a', 'index.js'), 'export const value = 2;');
-    write(f.preflight, { ...json(f.preflight), dependencyReuseAllowed: true, dependencySourcePath: source });
-    expect((await f.prepare()).code).toBe(mode === 'matching' ? 0 : 2);
-    if (mode !== 'matching') expect(json(join(dirname(f.prepared), 'manifest.json')).error.code).toBe('DEPENDENCY_ENVIRONMENT_NOT_READY');
+    write(f.preflight, { ...json(f.preflight), dependencyReuseAllowed: true, dependencySourcePath: source, dependencyWorktreeInstallAllowed: false });
+    // pnpm links most workspace packages only into their dependents, never at the root.
+    const ready = mode === 'matching' || mode === 'large-snapshot' || mode === 'missing-link';
+    expect((await f.prepare()).code).toBe(ready ? 0 : 2);
+    if (!ready) expect(json(join(dirname(f.prepared), 'manifest.json')).error.code).toBe('DEPENDENCY_ENVIRONMENT_NOT_READY');
   });
   it.each(['matching', 'missing', 'changed', 'broken'] as const)('prepares usable dependencies before review: %s', async mode => {
     const f = fixture();
@@ -213,10 +221,46 @@ describe('authored development-review preset', () => {
     g.git(g.repo, 'commit', '-qam', 'stale lockfile');
     write(g.preflight, { ...json(g.preflight), dependencyReuseAllowed: false });
     expect((await g.prepare()).code).toBe(2);
-    expect(json(join(dirname(g.prepared), 'manifest.json')).error).toMatchObject({ code: 'DEPENDENCY_ENVIRONMENT_NOT_READY', message: expect.stringContaining('isolated dependency install failed') });
+    expect(json(join(dirname(g.prepared), 'manifest.json')).error).toMatchObject({ code: 'DEPENDENCY_ENVIRONMENT_NOT_READY', message: expect.stringContaining('dependency install failed') });
     expect(existsSync(join(g.prepared, 'context.json'))).toBe(false);
   });
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  const hasPnpm = spawnSync('pnpm', ['--version'], { cwd: tmpdir(), stdio: 'ignore' }).status === 0;
+  function pnpmWorkspace(f: ReturnType<typeof fixture>) {
+    // A root lifecycle hook that would fail the install if it ran.
+    write(join(f.repo, 'package.json'), { name: 'mono', private: true, scripts: { postinstall: 'exit 7' } });
+    writeFileSync(join(f.repo, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n');
+    mkdirSync(join(f.repo, 'packages', 'a'), { recursive: true }); mkdirSync(join(f.repo, 'packages', 'b'));
+    write(join(f.repo, 'packages', 'a', 'package.json'), { name: 'workspace-a', version: '1.0.0', main: 'index.js' });
+    writeFileSync(join(f.repo, 'packages', 'a', 'index.js'), 'module.exports = 1;\n');
+    write(join(f.repo, 'packages', 'b', 'package.json'), { name: 'workspace-b', version: '1.0.0', dependencies: { 'workspace-a': 'workspace:*' } });
+    writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
+    execFileSync('pnpm', ['install', '--lockfile-only', '--ignore-scripts'], { cwd: f.repo, stdio: 'ignore' });
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'pnpm workspace');
+  }
+  it.skipIf(!hasPnpm)('installs a workspace repository inside the task worktree from its frozen lockfile and follows workspace changes', async () => {
+    const f = fixture(); pnpmWorkspace(f);
+    const manifest = readFileSync(join(f.repo, 'package.json'));
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    const context = join(f.prepared, 'context.json');
+    expect(json(context).dependencies).toMatchObject({ state: 'ready', mode: 'worktree', source: f.worktree, modules: join(f.worktree, 'node_modules') });
+    expect(realpathSync(join(f.worktree, 'packages', 'b', 'node_modules', 'workspace-a'))).toBe(join(f.worktree, 'packages', 'a'));
+    expect(readFileSync(join(f.worktree, 'package.json'))).toEqual(manifest);
+    expect(f.git(f.worktree, 'status', '--porcelain')).toBe('');
+    expect(existsSync(join(f.repo, 'node_modules'))).toBe(false);
+    // Workspace code changes keep the environment; a new workspace package is linked by record.
+    writeFileSync(join(f.worktree, 'packages', 'a', 'index.js'), 'module.exports = 2;\n');
+    mkdirSync(join(f.worktree, 'packages', 'c'));
+    write(join(f.worktree, 'packages', 'c', 'package.json'), { name: 'workspace-c', version: '1.0.0', dependencies: { 'workspace-a': 'workspace:*' } });
+    execFileSync('pnpm', ['install', '--lockfile-only', '--ignore-scripts'], { cwd: f.worktree, stdio: 'ignore' });
+    f.git(f.worktree, 'add', '.'); f.git(f.worktree, 'commit', '-qm', 'workspace change');
+    const implemented = f.out('development-review-loop.i001.implement');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], implemented)).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', context, '--candidate', join(implemented, 'candidate.json'), '--round', '1'], implemented)).toMatchObject({ code: 0, stderr: '' });
+    expect(realpathSync(join(f.worktree, 'packages', 'c', 'node_modules', 'workspace-a'))).toBe(join(f.worktree, 'packages', 'a'));
+    expect(json(join(implemented, 'validation.json')).checks[0].exitCode).toBe(0);
+    expect(f.git(f.worktree, 'status', '--porcelain')).toBe('');
+  });
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -248,7 +292,7 @@ describe('authored development-review preset', () => {
       expect(check({ resolvedRequirement: 'spec text', validationCommands: [] }).ok).toBe(true);
       expect(check({ resolvedRequirement: { text: 'spec text' } }).problems).toEqual(['field "resolvedRequirement" must be of type string']);
       expect(check({ validationCommands: { id: 'test' } }).problems).toEqual(['field "validationCommands" must be of type array']);
-      expect(check({ dependencyReuseAllowed: false, dependencyInstallAllowed: true, dependencySourcePath: '/deps' }).ok).toBe(true);
+      expect(check({ dependencyReuseAllowed: false, dependencyInstallAllowed: true, dependencyWorktreeInstallAllowed: false, dependencySourcePath: '/deps' }).ok).toBe(true);
       expect(check({ dependencyReuseAllowed: 'false' }).problems).toEqual(['field "dependencyReuseAllowed" must be of type boolean']);
     } finally {
       rmSync(dir, { recursive: true, force: true });

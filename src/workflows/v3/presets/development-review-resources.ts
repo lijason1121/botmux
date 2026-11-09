@@ -40,7 +40,7 @@ function regular(root, relative) {
 }
 const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
 function git(cwd, args) {
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env: gitEnv });
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env: gitEnv, maxBuffer: 256 * 1024 * 1024 });
   requireThat(!result.error && result.status === 0, 'git command failed: ' + args[0]);
   return result.stdout.trim();
 }
@@ -269,8 +269,10 @@ function checkWorkspaceLinks(worktree, source, modules, files) {
     packages.set(name, directory);
   }
   for (const [name, directory] of packages) {
+    // pnpm links a workspace package only into its dependents' node_modules;
+    // a root link, when present, must still point into the snapshot.
     const installed = path.join(modules, name);
-    requireThat(fs.realpathSync(installed) === fs.realpathSync(path.join(source, directory)), 'workspace link points outside the matching snapshot');
+    if (fs.lstatSync(installed, { throwIfNoEntry: false })) requireThat(fs.realpathSync(installed) === fs.realpathSync(path.join(source, directory)), 'workspace link points outside the matching snapshot');
     const child = read(path.join(worktree, directory, 'package.json'));
     for (const dependency of Object.keys({ ...child.dependencies, ...child.devDependencies })) {
       requireThat(/^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/.test(dependency), 'invalid workspace dependency name');
@@ -292,16 +294,52 @@ function installCommand(root) {
   if (has('yarn.lock')) return has('.yarnrc.yml') ? ['yarn', 'install', '--immutable'] : ['yarn', 'install', '--frozen-lockfile'];
   throw new Error('frozen root dependency lockfile required');
 }
+// Runs the frozen install in root with the root lifecycle hooks removed, then
+// restores the manifest bytes.
+function frozenInstall(root, log) {
+  const manifest = path.join(root, 'package.json'), original = fs.readFileSync(manifest), pkg = JSON.parse(original.toString('utf8'));
+  if (object(pkg.scripts)) for (const hook of ROOT_LIFECYCLE) delete pkg.scripts[hook];
+  const [command, ...argv] = installCommand(root);
+  let result;
+  try {
+    fs.writeFileSync(manifest, JSON.stringify(pkg, null, 2) + '\n');
+    result = spawnSync(command, argv, { cwd: root, encoding: 'utf8', timeout: 30 * 60 * 1000, maxBuffer: 64 * 1024 * 1024, shell: false, env: { ...process.env, CI: '1' } });
+  } finally { fs.writeFileSync(manifest, original); }
+  fs.mkdirSync(path.dirname(log), { recursive: true });
+  fs.writeFileSync(log, [command, ...argv].join(' ') + '\n' + (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : ''), { mode: 0o600 });
+  requireThat(result.status === 0, 'dependency install failed: ' + [command, ...argv].join(' ') +
+    (result.error ? ' (' + result.error.message + ')' : ' exited ' + result.status) + '; log ' + log);
+}
+function runDependencyDir() {
+  const attempt = process.env.BOTMUX_GOAL_ATTEMPT_DIR;
+  requireThat(attempt, 'attempt directory unavailable for a dependency install');
+  return path.join(path.dirname(path.dirname(path.dirname(attempt))), 'dependencies');
+}
+// Workspace links must resolve to the task's own package directories, which an
+// out-of-tree snapshot cannot give (pnpm keeps each package's dependencies in
+// that package's node_modules). Install into the task-owned worktree instead,
+// never through a link into another environment.
+function installWorktreeDependencies(worktree, files, names) {
+  requireThat(files.includes('package.json') && files.some(file => /(^|\/)(bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(file)), 'frozen dependency lockfile required');
+  const inputsSha256 = dependencyDigest(worktree, files), target = path.join(worktree, 'node_modules');
+  const existing = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (existing?.isSymbolicLink()) fs.unlinkSync(target);
+  else requireThat(!existing || existing.isDirectory(), 'task node_modules is not a directory');
+  frozenInstall(worktree, path.join(runDependencyDir(), 'worktree-' + inputsSha256.slice(7, 39) + '.install.log'));
+  requireThat(!git(worktree, ['status', '--porcelain']), 'dependency install changed the task checkout; repository rules must ignore node_modules');
+  requireThat(fs.lstatSync(target).isDirectory(), 'dependency install produced no node_modules');
+  const modules = fs.realpathSync(target);
+  checkInstalledPackages(modules, names);
+  return { state: 'ready', mode: 'worktree', source: fs.realpathSync(worktree), inputsSha256, files, modules, names };
+}
 // Build a run-owned environment outside the repository/worktree from the task
 // checkout's exact manifest and lockfile bytes (the whole tracked snapshot for
 // workspaces), using the lockfile without updating it. Never writes the worktree.
 function installIsolatedDependencies(worktree, files, inputsSha256, hasWorkspaces) {
-  const attempt = process.env.BOTMUX_GOAL_ATTEMPT_DIR;
-  requireThat(attempt, 'attempt directory unavailable for an isolated dependency install');
-  const parent = path.join(path.dirname(path.dirname(path.dirname(attempt))), 'dependencies');
+  const parent = runDependencyDir();
   const copied = hasWorkspaces ? git(worktree, ['ls-files', '-z']).split('\0').filter(Boolean).sort() : files;
   const key = sha(Buffer.from(JSON.stringify([inputsSha256, hasWorkspaces ? workspaceDigest(worktree, copied) : null]))).slice(7, 39);
-  const root = path.join(parent, key), ready = root + '.ready', log = root + '.install.log';
+  const root = path.join(parent, key), ready = root + '.ready';
   if (fs.existsSync(ready) && fs.existsSync(path.join(root, 'node_modules'))) return root;
   fs.rmSync(ready, { force: true }); fs.rmSync(root, { recursive: true, force: true });
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -311,15 +349,7 @@ function installIsolatedDependencies(worktree, files, inputsSha256, hasWorkspace
     if (stat.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(from), to);
     else { requireThat(stat.isFile(), 'workspace snapshot contains an unsupported entry'); fs.copyFileSync(from, to); }
   }
-  const manifest = path.join(root, 'package.json'), original = fs.readFileSync(manifest), pkg = JSON.parse(original.toString('utf8'));
-  if (object(pkg.scripts)) for (const hook of ROOT_LIFECYCLE) delete pkg.scripts[hook];
-  fs.writeFileSync(manifest, JSON.stringify(pkg, null, 2) + '\n');
-  const [command, ...argv] = installCommand(root);
-  const result = spawnSync(command, argv, { cwd: root, encoding: 'utf8', timeout: 30 * 60 * 1000, maxBuffer: 64 * 1024 * 1024, shell: false, env: { ...process.env, CI: '1' } });
-  fs.writeFileSync(log, [command, ...argv].join(' ') + '\n' + (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : ''), { mode: 0o600 });
-  fs.writeFileSync(manifest, original);
-  requireThat(result.status === 0, 'isolated dependency install failed: ' + [command, ...argv].join(' ') +
-    (result.error ? ' (' + result.error.message + ')' : ' exited ' + result.status) + '; log ' + log);
+  frozenInstall(root, root + '.install.log');
   fs.writeFileSync(ready, inputsSha256 + '\n');
   return root;
 }
@@ -332,6 +362,9 @@ function prepareDependencies(worktree, repository, checked, replaceTaskLink = fa
   const required = Object.entries({ ...pkg.dependencies, ...pkg.devDependencies }).filter(([, spec]) => !String(spec).startsWith('workspace:'));
   if (!required.length && !hasWorkspaces) return { state: 'not-required' };
   const files = dependencyInputs(worktree), names = required.map(([name]) => name);
+  if (hasWorkspaces && allowInstall && checked.dependencyWorktreeInstallAllowed !== false) {
+    try { return installWorktreeDependencies(worktree, files, names); } catch (error) { dependencyFailure(error.message); }
+  }
   const use = candidate => {
     const source = fs.realpathSync(candidate);
     requireThat(files.includes('package.json') && files.some(file => /(^|\/)(bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(file)), 'frozen dependency lockfile required');
@@ -386,6 +419,16 @@ function checkDependencies(context, dependencies = context.dependencies) {
     return;
   }
   const { source, files, inputsSha256, modules } = dependencies;
+  if (dependencies.mode === 'worktree') {
+    try {
+      const target = path.join(context.worktree, 'node_modules');
+      requireThat(dependencyDigest(context.worktree, dependencyInputs(context.worktree)) === inputsSha256 && source === fs.realpathSync(context.worktree),
+        'dependency inputs changed; record reinstalls them in the task worktree');
+      requireThat(fs.lstatSync(target).isDirectory() && fs.realpathSync(target) === modules, 'prepared dependencies are unavailable');
+      checkInstalledPackages(modules, dependencies.names);
+    } catch (error) { dependencyFailure(error.message); }
+    return;
+  }
   try {
     requireThat(dependencyDigest(context.worktree, dependencyInputs(context.worktree)) === inputsSha256 && dependencyDigest(source, files) === inputsSha256,
       'dependency inputs changed; prepare a matching isolated environment before validation');
@@ -585,7 +628,12 @@ function record(args) {
   requireThat(candidate.contextSha256 === digest(args.context) && candidate.resourcesSha256 === context.resourcesSha256, 'candidate context/resource mismatch');
   requireThat(git(context.worktree, ['rev-parse', 'HEAD']) === candidate.headSha && !git(context.worktree, ['status', '--porcelain']), 'candidate must be the clean live HEAD');
   let dependencies = context.dependencies;
-  if (args['dependency-source']) {
+  if (dependencies?.mode === 'worktree') {
+    if (dependencyDigest(context.worktree, dependencyInputs(context.worktree)) !== dependencies.inputsSha256) {
+      requireThat(context.mode !== 'review', 'review mode must use its prepared dependencies');
+      dependencies = prepareDependencies(context.worktree, context.repo, {}, false, true);
+    }
+  } else if (args['dependency-source']) {
     requireThat(context.mode !== 'review', 'review mode must use its prepared dependencies');
     dependencies = prepareDependencies(context.worktree, context.repo,
       { dependencyReuseAllowed: true, dependencySourcePath: args['dependency-source'] }, true);
