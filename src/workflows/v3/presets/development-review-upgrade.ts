@@ -26,6 +26,7 @@ const PREVIOUS_DRAFT_SHA256 = new Set([
   '770561eb84b3e92536af5f34678e3dfa51370c57409f9aadde65e6bb14150aad',
   'e95604d9156e9e3f63e4b6a891ef2af6ce970f2d228b7014d8cbda6c110eb60c',
   'a668beae9f55c6119a3e5994d1e9e7cffec53bae4c589bd9cf20839372ef4510',
+  'ef05b0e203a22569b6b3be882a6febf5b9cdfe48ef83066b67122c87783641ba',
 ]);
 
 export function upgradeDevelopmentReviewPreset(draft: SavedWorkflowRevisionDraft): SavedWorkflowRevisionDraft | undefined {
