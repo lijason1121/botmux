@@ -679,4 +679,69 @@ describe('projectV3Progress', () => {
     const view = projectV3Progress({ envelope: envelope(), dag: dag(), events });
     expect(view.terminal).toBeUndefined();
   });
+  it('projects journal times for the run and the current attempt of running work, with goal budgets', () => {
+    const t0 = Date.parse('2026-11-09T06:00:00.000Z');
+    const timedDag = validateDag({
+      runId: 'progress-run',
+      nodes: [
+        { id: 'research', type: 'goal', goal: 'research', depends: [], inputs: [] },
+        {
+          id: 'repair',
+          type: 'loop',
+          depends: [],
+          inputs: [],
+          maxIterations: 2,
+          body: {
+            nodes: [
+              { id: 'code', type: 'goal', goal: 'code', depends: [], inputs: [], timeoutSec: 14_400 },
+              { id: 'test', type: 'goal', goal: 'test', depends: ['code'], inputs: [], resultSchema: { type: 'object', properties: { passed: { type: 'boolean' } }, required: ['passed'] } },
+            ],
+          },
+          exit: { node: 'test', when: { path: 'result.passed', equals: true } },
+          feedback: [],
+          output: { from: 'code' },
+        },
+      ],
+    });
+    const events: StoredEvent[] = [
+      at(t0, { type: 'runStarted', runId: 'progress-run' }),
+      at(t0 + 1_000, { type: 'nodeDispatched', nodeId: 'research', instanceId: 'research#001', attemptId: 'research#001/attempts/001' }),
+      at(t0 + 60_000, { type: 'nodeBlocked', nodeId: 'research', instanceId: 'research#001', attemptId: 'research#001/attempts/001', errorClass: 'timeout', message: '/root/private' }),
+      at(t0 + 61_000, { type: 'runBlocked', blockedNodeId: 'research' }),
+      at(t0 + 600_000, { type: 'nodeRetryRequested', nodeId: 'research', instanceId: 'research#001', previousAttemptId: 'research#001/attempts/001', nextAttemptId: 'research#001/attempts/002', reason: 'blockedRetry' }),
+      at(t0 + 601_000, { type: 'nodeDispatched', nodeId: 'research', instanceId: 'research#001', attemptId: 'research#001/attempts/002' }),
+      at(t0 + 602_000, { type: 'loopStarted', loopId: 'repair' }),
+      at(t0 + 603_000, { type: 'loopIterationStarted', loopId: 'repair', iteration: 1 }),
+      at(t0 + 604_000, { type: 'nodeDispatched', nodeId: 'repair.i001.code', attemptId: 'repair.i001.code/attempts/001', loop: { loopId: 'repair', iteration: 1, bodyNodeId: 'code' } }),
+    ];
+
+    const running = projectV3Progress({ envelope: envelope(), dag: timedDag, events });
+    expect(running.timing).toEqual({
+      startedAt: '2026-11-09T06:00:00.000Z',
+      active: [
+        { nodeId: 'research', startedAt: '2026-11-09T06:10:01.000Z', attempt: 2, timeoutSec: 1_800 },
+        { nodeId: 'repair', bodyNodeId: 'code', startedAt: '2026-11-09T06:10:04.000Z', attempt: 1, timeoutSec: 14_400 },
+      ],
+    });
+    expect(JSON.stringify(running.timing)).not.toContain('private');
+
+    const finished = projectV3Progress({
+      envelope: envelope(),
+      dag: timedDag,
+      events: [
+        ...events,
+        at(t0 + 700_000, { type: 'runCancelRequested', cancelRequestId: 'c1', by: 'ou_owner', reason: 'stop' }),
+        at(t0 + 701_000, { type: 'nodeCancelled', nodeId: 'research', instanceId: 'research#001', attemptId: 'research#001/attempts/002', cancelRequestId: 'c1', reason: 'runCancelled' }),
+        at(t0 + 701_000, { type: 'nodeCancelled', nodeId: 'repair.i001.code', attemptId: 'repair.i001.code/attempts/001', cancelRequestId: 'c1', reason: 'runCancelled' }),
+        at(t0 + 701_000, { type: 'nodeCancelled', nodeId: 'repair', cancelRequestId: 'c1', reason: 'runCancelled' }),
+        at(t0 + 5_520_000, { type: 'runCancelled', by: 'ou_owner', cancelRequestId: 'c1' }),
+      ],
+    });
+    expect(finished.status).toBe('cancelled');
+    expect(finished.timing).toEqual({
+      startedAt: '2026-11-09T06:00:00.000Z',
+      finishedAt: '2026-11-09T07:32:00.000Z',
+      active: [],
+    });
+  });
 });

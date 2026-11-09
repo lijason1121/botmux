@@ -94,6 +94,26 @@ function manager(tx: V3ProgressCardTransport, now = new Date('2026-07-11T00:05:0
 }
 
 describe('V3ProgressCardManager', () => {
+  it('renders with the refresh clock so a running card can advance elapsed time between journal events', async () => {
+    seedRun('progress-clock');
+    const tx = transport();
+    let clock = new Date('2026-07-11T00:05:00.000Z');
+    const cards = new V3ProgressCardManager({
+      baseDir,
+      transport: tx,
+      now: () => clock,
+      buildCard: (view, _loaded, now) => JSON.stringify({ status: view.status, minute: now.toISOString().slice(0, 16) }),
+    });
+    await cards.refresh('progress-clock', { allowCreate: true });
+    clock = new Date('2026-07-11T00:05:40.000Z');
+    await cards.refresh('progress-clock', { allowCreate: true });
+    expect(tx.patch).not.toHaveBeenCalled();
+    clock = new Date('2026-07-11T00:06:00.000Z');
+    await cards.refresh('progress-clock', { allowCreate: true });
+    expect(tx.patch).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(tx.patch).mock.calls[0]![2]).toContain('00:06');
+  });
+
   it('posts a durable failure notice even when the progress card PATCH succeeds', async () => {
     const runDir = seedRun('progress-failure-notice'), tx = transport(), cards = manager(tx);
     await cards.refresh('progress-failure-notice', { allowCreate: true });

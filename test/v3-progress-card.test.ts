@@ -47,6 +47,52 @@ function allText(card: unknown): string {
 }
 
 describe('buildV3ProgressCard', () => {
+  const timing: NonNullable<V3ProgressView['timing']> = {
+    startedAt: '2026-11-09T06:00:00.000Z',
+    active: [
+      { nodeId: 'collect-data', startedAt: '2026-11-09T06:30:00.000Z', attempt: 2, timeoutSec: 1_800 },
+      { nodeId: 'quality-loop', bodyNodeId: 'review', startedAt: '2026-11-09T07:10:00.000Z', attempt: 1, timeoutSec: 14_400 },
+    ],
+  };
+  const timed = (overrides: Partial<V3ProgressView> = {}) =>
+    baseView({ currentNodeIds: ['collect-data', 'quality-loop'], timing, updatedAt: '2026-11-09T07:10:00.000Z', ...overrides });
+  const render = (view: V3ProgressView, now?: string) => allText(JSON.parse(buildV3ProgressCard(view, {
+    webDetailUrl: 'https://example.test/v3/run',
+    ...(now ? { now: new Date(now) } : {}),
+  })));
+
+  it('running card shows Beijing start time, elapsed run time, and each running node against its budget', () => {
+    const text = render(timed(), '2026-11-09T07:12:30.000Z');
+    expect(text).toContain('开始 11-09 14:00 · 已运行 1 小时 12 分钟 · 刷新于 15:12（北京时间）');
+    expect(text).toContain('collect-data · 第 2 次尝试 · 14:30 开始 · 已运行 42 分钟 / 上限 30 分钟');
+    expect(text).toContain('quality-loop/review · 15:10 开始 · 已运行 2 分钟 / 上限 4 小时');
+    expect(text).not.toContain('更新时间');
+  });
+
+  it('live card changes at most once a minute and is deterministic without a clock', () => {
+    expect(render(timed(), '2026-11-09T07:12:01.000Z')).toBe(render(timed(), '2026-11-09T07:12:59.000Z'));
+    expect(render(timed(), '2026-11-09T07:13:00.000Z')).not.toBe(render(timed(), '2026-11-09T07:12:59.000Z'));
+    const clockless = render(timed());
+    expect(clockless).not.toContain('已运行');
+    expect(clockless).toContain('开始 11-09 14:00 · 更新于 11-09 15:10（北京时间）');
+    expect(clockless).toContain('collect-data · 第 2 次尝试 · 14:30 开始 · 上限 30 分钟');
+  });
+
+  it('settled cards never show elapsed time the manager stops refreshing', () => {
+    const blocked = render(timed({ status: 'blocked' }), '2026-11-09T09:00:00.000Z');
+    expect(blocked).not.toContain('已运行');
+    expect(blocked).not.toContain('刷新于');
+    expect(blocked).toContain('更新于 11-09 15:10');
+
+    const done = render(timed({
+      status: 'succeeded',
+      currentNodeIds: [],
+      timing: { startedAt: timing.startedAt, finishedAt: '2026-11-09T07:38:20.000Z', active: [] },
+    }), '2026-11-09T09:00:00.000Z');
+    expect(done).toContain('开始 11-09 14:00 · 结束 11-09 15:38 · 总耗时 1 小时 38 分钟（北京时间）');
+    expect(done).not.toContain('已运行');
+  });
+
   it('does not render completed execution as green approval when a structured review requires changes', () => {
     const rejected = parse(baseView({ status: 'succeeded', reviews: [{ nodeId: 'review', decision: 'changes_requested' }] }));
     const approved = parse(baseView({ status: 'succeeded', reviews: [{ nodeId: 'review', decision: 'approve' }] }));
@@ -73,7 +119,7 @@ describe('buildV3ProgressCard', () => {
     expect(text).toContain('即兴编排');
     expect(text).toContain('weekly-report-260711-120000-ab12cd34');
     expect(text).toContain('/workflow cancel weekly-report-260711-120000-ab12cd34');
-    expect(text).toContain('更新时间：2026-07-11 12:34:56Z');
+    expect(text).toContain('更新时间：07-11 20:34（北京时间）');
 
     const detail = card.elements.find(
       (element: any) => element.tag === 'action' && element.actions?.[0]?.multi_url,

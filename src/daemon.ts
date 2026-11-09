@@ -7183,7 +7183,7 @@ const v3ProgressCardManager = new V3ProgressCardManager({
       sendMessage(larkAppId, chatId, cardJson, 'interactive', uuid),
     patch: (larkAppId, messageId, cardJson) => updateMessage(larkAppId, messageId, cardJson),
   },
-  buildCard: (view, loaded) => {
+  buildCard: (view, loaded, now) => {
     const binding = loaded.envelope.chatBinding;
     const saveActions =
       view.status === 'succeeded' &&
@@ -7197,6 +7197,7 @@ const v3ProgressCardManager = new V3ProgressCardManager({
     return buildV3ProgressCard(view, {
       ...(saveActions ? { saveActions } : {}),
       ...(workflowEntry ? { workflowEntry } : {}),
+      now,
     });
   },
   onError: (runId, err) => {

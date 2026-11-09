@@ -16,7 +16,15 @@
  *   part of the output type at all.
  */
 
-import { isHostNode, isLoopNode, loopInstanceId, type V3Dag, type V3Node } from './dag.js';
+import {
+  DEFAULT_NODE_TIMEOUT_SEC,
+  isGoalNode,
+  isHostNode,
+  isLoopNode,
+  loopInstanceId,
+  type V3Dag,
+  type V3Node,
+} from './dag.js';
 import type { Spec } from './contract.js';
 import type { StoredEvent, V3ErrorClass } from './journal.js';
 import type { V3NodeStatus } from './orchestrator.js';
@@ -71,6 +79,28 @@ export interface V3ProgressIssue {
   phase?: 'business' | 'hostEffect';
 }
 
+export interface V3ProgressActiveNode {
+  /** Authored outer node id. */
+  nodeId: string;
+  /** Running body node of the outer loop `nodeId`. */
+  bodyNodeId?: string;
+  /** Journal time of the current attempt's dispatch. */
+  startedAt: string;
+  /** 1-based, parsed from the attempt id when it carries a counter. */
+  attempt?: number;
+  /** Wall-clock budget of a goal node; loops and host nodes have none. */
+  timeoutSec?: number;
+}
+
+export interface V3ProgressTiming {
+  /** The single `runStarted` record. */
+  startedAt?: string;
+  /** Terminal run record, present only while the run is terminal. */
+  finishedAt?: string;
+  /** Running work in authored DAG order. */
+  active: V3ProgressActiveNode[];
+}
+
 export interface V3ProgressView {
   runId: string;
   /** Digest-pinned canonical spec title. The card owns display truncation. */
@@ -119,6 +149,9 @@ export interface V3ProgressView {
     /** A proposal waiting for the initiator. */
     pending?: number;
   };
+  /** Journal timestamps and authored budgets only; the card derives elapsed
+   *  time from its own clock. */
+  timing?: V3ProgressTiming;
   /** Last usable journal timestamp, falling back to run.json.createdAt. */
   updatedAt: string;
 }
@@ -196,6 +229,80 @@ function usableEventTimestamp(events: readonly StoredEvent[]): number | undefine
     if (typeof ts === 'number' && Number.isFinite(ts) && ts >= 0 && ts <= MAX_DATE_MS) return ts;
   }
   return undefined;
+}
+
+function eventIso(ts: unknown): string | undefined {
+  return typeof ts === 'number' && Number.isFinite(ts) && ts >= 0 && ts <= MAX_DATE_MS
+    ? new Date(ts).toISOString()
+    : undefined;
+}
+
+function attemptNumber(attemptId: string): number | undefined {
+  const match = /\/attempts\/(\d{1,6})$/.exec(attemptId);
+  const value = match ? Number(match[1]) : 0;
+  return value > 0 ? value : undefined;
+}
+
+function progressTiming(
+  dag: V3Dag,
+  snapshot: ReturnType<typeof materialize>,
+  events: readonly StoredEvent[],
+): V3ProgressTiming | undefined {
+  let startedAt: string | undefined;
+  let finishedAt: string | undefined;
+  const dispatchedAt = new Map<string, string>();
+  for (const event of events) {
+    if (event.type === 'runStarted') startedAt ??= eventIso(event.ts);
+    else if (event.type === 'runSucceeded' || event.type === 'runFailed' || event.type === 'runCancelled') {
+      finishedAt = eventIso(event.ts);
+    } else if (
+      (event.type === 'nodeDispatched' || event.type === 'hostEffectIntent') &&
+      !dispatchedAt.has(event.attemptId)
+    ) {
+      const at = eventIso(event.ts);
+      if (at) dispatchedAt.set(event.attemptId, at);
+    }
+  }
+  const terminal = snapshot.runStatus === 'succeeded' ||
+    snapshot.runStatus === 'failed' ||
+    snapshot.runStatus === 'cancelled';
+
+  const active: V3ProgressActiveNode[] = [];
+  const push = (nodeId: string, key: string, node: V3Node, bodyNodeId?: string): void => {
+    const attemptId = snapshot.attempts.get(key);
+    const at = attemptId ? dispatchedAt.get(attemptId) : undefined;
+    if (!attemptId || !at) return;
+    const attempt = attemptNumber(attemptId);
+    active.push({
+      nodeId,
+      ...(bodyNodeId ? { bodyNodeId } : {}),
+      startedAt: at,
+      ...(attempt ? { attempt } : {}),
+      ...(isGoalNode(node) ? { timeoutSec: node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC } : {}),
+    });
+  };
+  for (const node of dag.nodes) {
+    const state = snapshot.nodes.get(node.id);
+    if (state?.status !== 'running') continue;
+    if (!isLoopNode(node)) {
+      push(node.id, state.effectiveInstanceId ?? node.id, node);
+      continue;
+    }
+    const iteration = snapshot.loops.get(node.id)?.iteration;
+    if (!iteration) continue;
+    for (const body of node.body.nodes) {
+      const id = loopInstanceId(node.id, iteration, body.id);
+      const bodyState = snapshot.nodes.get(id);
+      if (bodyState?.status === 'running') push(node.id, bodyState.effectiveInstanceId ?? id, body, body.id);
+    }
+  }
+
+  if (!startedAt && active.length === 0) return undefined;
+  return {
+    ...(startedAt ? { startedAt } : {}),
+    ...(terminal && finishedAt ? { finishedAt } : {}),
+    active,
+  };
 }
 
 function latestIssue(
@@ -372,6 +479,7 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
   if (issue) issue.phase = issuePhase(issueNode);
   const feishuHostFailed = status === 'failed' && isFeishuHostNode(issueNode);
   const lastTs = usableEventTimestamp(events);
+  const timing = progressTiming(dag, snapshot, events);
   let revision: V3ProgressView['revision'];
   try {
     const history = foldV3Revisions(events);
@@ -408,6 +516,7 @@ export function projectV3Progress(input: V3ProgressProjectionInput): V3ProgressV
       : {}),
     ...(terminal ? { terminal } : {}),
     ...(revision ? { revision } : {}),
+    ...(timing ? { timing } : {}),
     updatedAt: lastTs === undefined ? envelope.createdAt : new Date(lastTs).toISOString(),
   };
 }
