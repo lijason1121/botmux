@@ -404,6 +404,8 @@ vi.mock('../src/services/group-creator.js', () => ({
   })),
 }));
 
+vi.mock('../src/services/group-bot-user-invite.js', () => ({ inviteBotsAsUser: vi.fn() }));
+
 vi.mock('../src/services/p2p-force-topic-store.js', () => ({
   recordP2pForceTopicRoot: vi.fn(),
   isP2pForceTopicRoot: vi.fn(() => false),
@@ -741,6 +743,7 @@ import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotM
 import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
 import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
+import { inviteBotsAsUser } from '../src/services/group-bot-user-invite.js';
 import { registerGroupAutoTitle } from '../src/services/group-auto-title.js';
 import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { t } from '../src/i18n/index.js';
@@ -8861,6 +8864,21 @@ describe('handleCommand', () => {
     const mockedCreate = vi.mocked(createGroupWithBots);
     const mockedListBots = vi.mocked(listChatBotMembers);
     const mockedSend = vi.mocked(sendMessage);
+
+    it('binds restricted bot recovery to the human message sender without a CLI session', async () => {
+      const msg = makeLarkMessage('/g Project', { senderType: 'user', senderId: 'ou_requester' });
+      await handleCommand('/g', ROOT_ID, msg, makeDeps(), LARK_APP_ID);
+      const opts = mockedCreate.mock.calls[0][0];
+      expect(opts.botInviteRequesterOpenId).toBe('ou_requester');
+      await opts.inviteBotsAsUser!('oc_created', ['cli_restricted']);
+      expect(inviteBotsAsUser).toHaveBeenCalledWith({ creatorLarkAppId: LARK_APP_ID,
+        chatId: 'oc_created', targetAppIds: ['cli_restricted'], requesterOpenId: 'ou_requester', requestId: msg.messageId });
+    });
+
+    it.each(['app', 'bot', 'unknown'])('does not attach user recovery for sender type %s', async senderType => {
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project', { senderType } as any), makeDeps(), LARK_APP_ID);
+      expect(mockedCreate.mock.calls[0][0].inviteBotsAsUser).toBeUndefined();
+    });
 
     it('applies opt-in defaults using the deployment registry, even without a source-chat peer', async () => {
       vi.mocked(getBot).mockImplementation(((id: string) => {

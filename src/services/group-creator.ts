@@ -21,7 +21,7 @@
  * tenant-stable ID into the creator app's open_id before transfer.
  */
 import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat, addChatManagers } from './groups-store.js';
-import type { ChatMode } from './groups-store.js';
+import type { BotInviteResult, ChatMode } from './groups-store.js';
 import type { GroupAvatarMode } from './group-creation-options.js';
 import { listChatBotMembers, resolveAllowedUsersWithMap, resolveUnionIdFromOpenIdStrict, sendMessage } from '../im/lark/client.js';
 import { loadBotConfigsCached } from '../bot-registry.js';
@@ -53,6 +53,13 @@ export interface CreateGroupOpts {
    *  it cannot be changed afterwards through this API. */
   chatMode?: ChatMode;
   userOpenIds?: string[];
+  /** Explicitly supplied by an interactive caller. This person must have
+   * joined through userOpenIds before any user-identity invitation is tried. */
+  botInviteRequesterOpenId?: string;
+  /** Opt-in recovery for a bot invitation rejected with 230003. The caller
+   * owns exact-requester authorization; other creation entrypoints never
+   * acquire user credentials merely by using this shared service. */
+  inviteBotsAsUser?: (chatId: string, appIds: string[]) => Promise<BotInviteResult[]>;
   /** Users to add by union_id (tenant-stable) — used to pull bot OWNERS into a
    *  federated group regardless of which bot they paired through (open_id is
    *  app-scoped, union_id is not). Added after the chat is created. */
@@ -103,6 +110,8 @@ export interface CreateGroupResult {
   chatId: string;
   creator: string;
   invalidBotIds: string[];
+  /** Final per-bot failures, including a user recovery attempt when supplied. */
+  botInviteFailures?: BotInviteResult[];
   invalidUserIds: string[];
   /** Owner union_ids Lark could not add to the chat (best-effort). */
   invalidOwnerUnionIds: string[];
@@ -166,6 +175,18 @@ export async function transferGroupOwner(opts: TransferGroupOwnerOpts): Promise<
   return { ownerTransferredTo: null, transferError: tr.error };
 }
 
+/** An omitted, duplicated or pending result cannot authorize downstream work
+ * for a bot whose membership was never confirmed. Ignore unrelated IDs. */
+function invitationResultFor(id: string, results: BotInviteResult[]): BotInviteResult {
+  const matches = results.filter(result => result?.id === id);
+  if (matches.length !== 1) return { id, ok: false, error: 'invite_result_unconfirmed', outcomeUnknown: true };
+  const result = matches[0];
+  return {
+    ...result,
+    ok: result.ok === true && !result.pendingApproval && !result.authorizationRequired && !result.outcomeUnknown,
+  };
+}
+
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
   // Filter creator out of the bot invite list. createChat does this defensively
   // too, but doing it here makes the service contract explicit and keeps
@@ -182,15 +203,44 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     chatMode: opts.chatMode,
   });
   opts.onChatCreated?.(r.chatId);
+  const botInvitations = new Map<string, BotInviteResult>(
+    r.invalidBotIds.map(id => [id, { id, ok: false, error: 'invalid_id' }]),
+  );
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
     const batch = otherBots.slice(i, i + BOT_BATCH);
-    let added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
-    if (added.some(a => !a.ok) && batch.length > 1) {
-      added = [];
-      for (const id of batch) added.push(...await addBotToChat(opts.creatorLarkAppId, r.chatId, [id]));
+    const added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
+    for (const id of batch) {
+      let result = invitationResultFor(id, added);
+      // An accepted approval request or an unknown write outcome must not be
+      // repeated because another member of the batch was explicitly rejected.
+      if (batch.length > 1 && !result.ok && !result.pendingApproval && !result.outcomeUnknown) {
+        result = invitationResultFor(id, await addBotToChat(opts.creatorLarkAppId, r.chatId, [id]));
+      }
+      botInvitations.set(id, result);
     }
-    for (const a of added) if (!a.ok) r.invalidBotIds.push(a.id);
   }
+
+  const requester = opts.botInviteRequesterOpenId;
+  if (opts.inviteBotsAsUser && requester && opts.userOpenIds?.includes(requester)
+    && !r.invalidUserIds.includes(requester)) {
+    const retryIds = [...botInvitations.values()]
+      .filter(result => !result.ok && result.code === 230003 && !result.pendingApproval && !result.outcomeUnknown)
+      .map(result => result.id);
+    if (retryIds.length) {
+      let recovered: BotInviteResult[];
+      try {
+        recovered = await opts.inviteBotsAsUser(r.chatId, [...retryIds]);
+        if (!Array.isArray(recovered)) recovered = [];
+      } catch {
+        // The group already exists. Never rethrow a credential/network error
+        // (which may contain secrets) or imply that callers should recreate it.
+        recovered = retryIds.map(id => ({ id, ok: false, error: 'user_invite_failed', outcomeUnknown: true }));
+      }
+      for (const id of retryIds) botInvitations.set(id, invitationResultFor(id, recovered));
+    }
+  }
+  const botInviteFailures = [...botInvitations.values()].filter(result => !result.ok);
+  r.invalidBotIds = botInviteFailures.map(result => result.id);
 
   const invalidBots = new Set(r.invalidBotIds);
   const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
@@ -483,6 +533,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     chatId: r.chatId,
     creator: opts.creatorLarkAppId,
     invalidBotIds: r.invalidBotIds,
+    ...(botInviteFailures.length ? { botInviteFailures } : {}),
     invalidUserIds: r.invalidUserIds,
     invalidOwnerUnionIds,
     ownerTransferredTo,

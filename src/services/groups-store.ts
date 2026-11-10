@@ -517,14 +517,25 @@ export async function leaveChat(
  * On total failure (network error, non-zero code) every id reports the same
  * error so the caller can present a uniform per-id status.
  */
+export interface BotInviteResult {
+  id: string;
+  ok: boolean;
+  error?: string;
+  code?: number;
+  logId?: string;
+  authorizationRequired?: boolean;
+  pendingApproval?: boolean;
+  outcomeUnknown?: boolean;
+}
+
 export async function addBotToChat(
   proxyLarkAppId: string,
   chatId: string,
   targetLarkAppIds: string[],
-): Promise<{ id: string; ok: boolean; error?: string }[]> {
+): Promise<BotInviteResult[]> {
   if (targetLarkAppIds.length === 0) return [];
   const client = getBotClient(proxyLarkAppId);
-  const out: { id: string; ok: boolean; error?: string }[] = [];
+  const out: BotInviteResult[] = [];
   try {
     const res: any = await (client as any).im.v1.chatMembers.create({
       path: { chat_id: chatId },
@@ -533,16 +544,27 @@ export async function addBotToChat(
     });
     if (res.code !== 0 && res.code !== undefined) {
       const errMsg = `${res.msg ?? 'unknown'} (code: ${res.code})`;
-      for (const id of targetLarkAppIds) out.push({ id, ok: false, error: errMsg });
+      const code = typeof res.code === 'number' ? res.code : undefined;
+      const logId = res.error?.log_id ?? res.log_id;
+      logger.warn(`[groups] bot invite rejected chat=${chatId} code=${code ?? 'unknown'} log_id=${logId ?? '-'} ids=${targetLarkAppIds.join(',')}`);
+      for (const id of targetLarkAppIds) out.push({ id, ok: false, error: errMsg, code, ...(logId ? { logId } : {}) });
       return out;
     }
-    const invalid = new Set<string>(res.data?.invalid_id_list ?? []);
+    const invalid = new Set<string>([...(res.data?.invalid_id_list ?? []), ...(res.data?.not_existed_id_list ?? [])]);
+    const pending = new Set<string>(res.data?.pending_approval_id_list ?? []);
     for (const id of targetLarkAppIds) {
-      out.push(invalid.has(id) ? { id, ok: false, error: 'invalid_id' } : { id, ok: true });
+      out.push(pending.has(id) ? { id, ok: false, error: 'pending_approval', pendingApproval: true }
+        : invalid.has(id) ? { id, ok: false, error: 'invalid_id' } : { id, ok: true });
     }
   } catch (e: any) {
-    const msg = e?.message ?? String(e);
-    for (const id of targetLarkAppIds) out.push({ id, ok: false, error: msg });
+    const body = e?.response?.data;
+    const code = typeof body?.code === 'number' ? body.code : typeof e?.code === 'number' ? e.code : undefined;
+    const logId = body?.error?.log_id ?? body?.log_id;
+    logger.warn(`[groups] bot invite failed chat=${chatId} code=${code ?? 'unknown'} log_id=${logId ?? '-'} ids=${targetLarkAppIds.join(',')}`);
+    const error = code !== undefined ? `${body?.msg ?? 'Bot invitation rejected'} (code: ${code})`
+      : 'Bot invitation result is unknown; check group membership before retrying';
+    for (const id of targetLarkAppIds) out.push({ id, ok: false, error, code,
+      ...(code === undefined ? { outcomeUnknown: true } : {}), ...(logId ? { logId } : {}) });
   }
   return out;
 }

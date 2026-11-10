@@ -108,6 +108,191 @@ describe('createGroupWithBots', () => {
     );
   });
 
+  describe('explicit requester invitation recovery', () => {
+    const THIRD_BOT = 'cli_third_bot';
+    const opts = () => ({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      userOpenIds: [USER_OPEN_ID],
+      botInviteRequesterOpenId: USER_OPEN_ID,
+    });
+
+    beforeEach(() => {
+      mockCreateChat.mockResolvedValue({ chatId: 'oc_recover', invalidBotIds: [], invalidUserIds: [] });
+      mockAddBotToChat.mockImplementation(async (_app: string, _chat: string, ids: string[]) =>
+        ids.map(id => ({ id, ok: false, code: 230003, error: 'bot invitation restricted', logId: 'lark-log' })));
+    });
+
+    it('recovers only restricted bots, reusing the created group before downstream setup', async () => {
+      mockAddBotToChat.mockImplementation(async (_app: string, _chat: string, ids: string[]) =>
+        ids.map(id => id === OTHER_BOT ? { id, ok: false, code: 230003 } : { id, ok: true }));
+      const events: string[] = [];
+      const inviteBotsAsUser = vi.fn(async (_chat: string, ids: string[]) => {
+        events.push('user-invite');
+        return ids.map(id => ({ id, ok: true }));
+      });
+      const ensureBotCollaboration = vi.fn(async () => { events.push('collaboration'); });
+
+      const result = await createGroupWithBots({
+        ...opts(), larkAppIds: [CREATOR, OTHER_BOT, THIRD_BOT],
+        inviteBotsAsUser, ensureBotCollaboration,
+        onChatCreated: () => events.push('created'),
+      });
+
+      expect(mockCreateChat).toHaveBeenCalledTimes(1);
+      expect(inviteBotsAsUser).toHaveBeenCalledExactlyOnceWith('oc_recover', [OTHER_BOT]);
+      expect(result.invalidBotIds).toEqual([]);
+      expect(result.botInviteFailures).toBeUndefined();
+      expect(ensureBotCollaboration).toHaveBeenCalledWith('oc_recover', [CREATOR, OTHER_BOT, THIRD_BOT]);
+      expect(events).toEqual(['created', 'user-invite', 'collaboration']);
+    });
+
+    it.each(['pendingApproval', 'outcomeUnknown'] as const)(
+      'does not repeat accepted or uncertain bot invitations: %s', async status => {
+        mockAddBotToChat.mockImplementation(async (_app: string, _chat: string, ids: string[]) =>
+          ids.map(id => ({ id, ok: false, [status]: true })));
+        const inviteBotsAsUser = vi.fn();
+        const result = await createGroupWithBots({
+          ...opts(), larkAppIds: [CREATOR, OTHER_BOT, THIRD_BOT], inviteBotsAsUser,
+        });
+        expect(mockCreateChat).toHaveBeenCalledTimes(1);
+        expect(mockAddBotToChat).toHaveBeenCalledExactlyOnceWith(CREATOR, 'oc_recover', [OTHER_BOT, THIRD_BOT]);
+        expect(inviteBotsAsUser).not.toHaveBeenCalled();
+        expect(result.chatId).toBe('oc_recover');
+        expect(result.invalidBotIds).toEqual([OTHER_BOT, THIRD_BOT]);
+        expect(result.botInviteFailures).toEqual([
+          { id: OTHER_BOT, ok: false, [status]: true },
+          { id: THIRD_BOT, ok: false, [status]: true },
+        ]);
+      },
+    );
+
+    it('retries only confirmed failures in a batch containing success and pending approval', async () => {
+      const RESTRICTED_BOT = 'cli_restricted';
+      mockAddBotToChat.mockImplementation(async (_app: string, _chat: string, ids: string[]) =>
+        ids.map(id => id === OTHER_BOT ? { id, ok: true }
+          : id === THIRD_BOT ? { id, ok: false, pendingApproval: true }
+            : { id, ok: false, code: 230003 }));
+      const inviteBotsAsUser = vi.fn(async (_chat: string, ids: string[]) => ids.map(id => ({ id, ok: true })));
+      const result = await createGroupWithBots({
+        ...opts(), larkAppIds: [CREATOR, OTHER_BOT, THIRD_BOT, RESTRICTED_BOT], inviteBotsAsUser,
+      });
+      expect(mockAddBotToChat.mock.calls).toEqual([
+        [CREATOR, 'oc_recover', [OTHER_BOT, THIRD_BOT, RESTRICTED_BOT]],
+        [CREATOR, 'oc_recover', [RESTRICTED_BOT]],
+      ]);
+      expect(inviteBotsAsUser).toHaveBeenCalledExactlyOnceWith('oc_recover', [RESTRICTED_BOT]);
+      expect(result.invalidBotIds).toEqual([THIRD_BOT]);
+      expect(result.botInviteFailures).toEqual([{ id: THIRD_BOT, ok: false, pendingApproval: true }]);
+    });
+
+    it.each([undefined, 99991672, 230001])('does not retry unrelated or unclassified errors as a user: %s', async code => {
+      mockAddBotToChat.mockResolvedValue([{ id: OTHER_BOT, ok: false, code, error: 'unclassified 230003 text' }]);
+      const inviteBotsAsUser = vi.fn();
+      const result = await createGroupWithBots({ ...opts(), inviteBotsAsUser });
+      expect(inviteBotsAsUser).not.toHaveBeenCalled();
+      expect(result.invalidBotIds).toEqual([OTHER_BOT]);
+      expect(result.botInviteFailures?.[0]).toMatchObject({ id: OTHER_BOT, code });
+    });
+
+    it('keeps ordinary creation callers bot-only and preserves failure diagnostics', async () => {
+      const result = await createGroupWithBots(opts());
+      expect(mockCreateChat).toHaveBeenCalledTimes(1);
+      expect(mockAddBotToChat).toHaveBeenCalledTimes(1);
+      expect(result.botInviteFailures).toEqual([
+        { id: OTHER_BOT, ok: false, code: 230003, error: 'bot invitation restricted', logId: 'lark-log' },
+      ]);
+    });
+
+    it.each(['missing-requester', 'not-invited', 'rejected'])(
+      'does not acquire requester credentials when membership was not established: %s', async mode => {
+        const inviteBotsAsUser = vi.fn();
+        if (mode === 'rejected') {
+          mockCreateChat.mockResolvedValue({ chatId: 'oc_recover', invalidBotIds: [], invalidUserIds: [USER_OPEN_ID] });
+        }
+        const result = await createGroupWithBots({
+          ...opts(), inviteBotsAsUser,
+          ...(mode === 'missing-requester' ? { botInviteRequesterOpenId: undefined } : {}),
+          ...(mode === 'not-invited' ? { userOpenIds: ['ou_someone_else'] } : {}),
+        });
+        expect(inviteBotsAsUser).not.toHaveBeenCalled();
+        expect(result.chatId).toBe('oc_recover');
+        expect(result.invalidBotIds).toEqual([OTHER_BOT]);
+      },
+    );
+
+    it('preserves partial user failures and gives downstream work only confirmed members', async () => {
+      const inviteBotsAsUser = vi.fn(async () => [
+        { id: OTHER_BOT, ok: true },
+        { id: THIRD_BOT, ok: false, code: 99991679, error: 'scope missing', authorizationRequired: true },
+      ]);
+      const ensureBotCollaboration = vi.fn(async () => {});
+      const result = await createGroupWithBots({
+        ...opts(), larkAppIds: [CREATOR, OTHER_BOT, THIRD_BOT], inviteBotsAsUser, ensureBotCollaboration,
+      });
+      expect(inviteBotsAsUser).toHaveBeenCalledExactlyOnceWith('oc_recover', [OTHER_BOT, THIRD_BOT]);
+      expect(result.invalidBotIds).toEqual([THIRD_BOT]);
+      expect(result.botInviteFailures).toEqual([
+        { id: THIRD_BOT, ok: false, code: 99991679, error: 'scope missing', authorizationRequired: true },
+      ]);
+      expect(ensureBotCollaboration).toHaveBeenCalledWith('oc_recover', [CREATOR, OTHER_BOT]);
+    });
+
+    it('keeps the created group and completes ownership transfer after a callback throws', async () => {
+      const secret = 'sensitive-token-that-must-not-escape';
+      const inviteBotsAsUser = vi.fn(async () => { throw new Error(secret); });
+      mockTransferChatOwner.mockResolvedValue({ ok: true });
+      const result = await createGroupWithBots({ ...opts(), inviteBotsAsUser, transferOwnerTo: USER_OPEN_ID });
+      expect(mockCreateChat).toHaveBeenCalledTimes(1);
+      expect(inviteBotsAsUser).toHaveBeenCalledTimes(1);
+      expect(result.chatId).toBe('oc_recover');
+      expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
+      expect(result.invalidBotIds).toEqual([OTHER_BOT]);
+      expect(JSON.stringify(result)).not.toContain(secret);
+      expect(result.botInviteFailures?.[0].error).toBeDefined();
+      expect(result.botInviteFailures?.[0].outcomeUnknown).toBe(true);
+    });
+
+    it.each(['omitted', 'duplicate', 'not-an-array'])('rejects unconfirmed recovery results: %s', async mode => {
+      const inviteBotsAsUser = vi.fn(async () => mode === 'omitted'
+        ? [{ id: 'cli_unrequested', ok: true }]
+        : mode === 'duplicate'
+          ? [{ id: OTHER_BOT, ok: true }, { id: OTHER_BOT, ok: false }]
+          : undefined as any);
+      const ensureBotCollaboration = vi.fn(async () => {});
+      const result = await createGroupWithBots({ ...opts(), inviteBotsAsUser, ensureBotCollaboration });
+      expect(result.invalidBotIds).toEqual([OTHER_BOT]);
+      expect(ensureBotCollaboration).toHaveBeenCalledWith('oc_recover', [CREATOR]);
+      expect(result.botInviteFailures?.[0].ok).toBe(false);
+      expect(result.botInviteFailures?.[0].outcomeUnknown).toBe(true);
+    });
+
+    it('waits for recovery before binding and role bootstrap, excluding pending approvals', async () => {
+      const inviteBotsAsUser = vi.fn(async () => [
+        { id: OTHER_BOT, ok: true },
+        { id: THIRD_BOT, ok: true, pendingApproval: true },
+      ]);
+      mockListChatBotMembers.mockResolvedValue([
+        { larkAppId: OTHER_BOT, openId: 'ou_other', mentionable: true },
+        { larkAppId: THIRD_BOT, openId: 'ou_pending', mentionable: true },
+      ]);
+      mockReadRoleProfileEntry.mockReturnValue('creator role');
+      mockBindOncall.mockResolvedValue({ ok: true });
+      mockSendMessage.mockResolvedValue('om_bootstrap');
+      const result = await createGroupWithBots({
+        ...opts(), larkAppIds: [CREATOR, OTHER_BOT, THIRD_BOT], inviteBotsAsUser,
+        roleProfileId: 'collab-main', bindWorkingDir: '/repo',
+      });
+      expect(result.invalidBotIds).toEqual([THIRD_BOT]);
+      expect(result.botInviteFailures).toEqual([{ id: THIRD_BOT, ok: false, pendingApproval: true }]);
+      expect(result.oncallBindings.map(binding => binding.larkAppId)).toEqual([CREATOR, OTHER_BOT]);
+      expect(mockWriteRoleFile).toHaveBeenCalledWith(CREATOR, 'oc_recover', 'creator role');
+      expect(mockSendMessage).toHaveBeenCalledExactlyOnceWith(
+        CREATOR, 'oc_recover', '<at user_id="ou_other"></at> /role profile apply collab-main --quiet', 'text',
+      );
+    });
+  });
+
   it('invites teammates before waiting for optional personal tagging', async () => {
     let release!: () => void;
     mockCreateChat.mockResolvedValue({ chatId: 'oc_pending_tag', invalidBotIds: [], invalidUserIds: [] });

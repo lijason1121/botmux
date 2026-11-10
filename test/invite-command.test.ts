@@ -15,7 +15,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 const replyMock = vi.fn(async () => 'om_reply');
 const rosterMock = vi.fn(async (_app: string, _chat: string) => [] as any[]);
 const addBotMock = vi.fn(async (_app: string, _chat: string, ids: string[]) =>
-  ids.map(id => ({ id, ok: true })) as { id: string; ok: boolean; error?: string }[]);
+  ids.map(id => ({ id, ok: true })) as import('../src/services/groups-store.js').BotInviteResult[]);
+const userInviteMock = vi.fn();
+vi.mock('../src/services/group-bot-user-invite.js', () => ({ inviteBotsAsUser: (...args: any[]) => userInviteMock(...args) }));
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return {
@@ -80,6 +82,7 @@ beforeEach(() => {
   replyMock.mockClear();
   rosterMock.mockClear();
   addBotMock.mockClear();
+  userInviteMock.mockReset();
   rosterMock.mockImplementation(async () => []);
   addBotMock.mockImplementation(async (_a, _c, ids: string[]) => ids.map(id => ({ id, ok: true })));
   const bot = registerBot({ larkAppId: 'b1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [OWNER] });
@@ -115,6 +118,46 @@ describe('parseInviteArgs', () => {
     const r = parseInviteArgs('/invite @张 三 --app cli_a', [{ name: '张 三' }]);
     expect(r.appIds).toEqual(['cli_a']);
     expect(r.leftover).toBe('');
+  });
+});
+
+describe('restricted bot invitation recovery', () => {
+  it.each(['pendingApproval', 'outcomeUnknown'] as const)('does not resubmit %s writes', async state => {
+    addBotMock.mockImplementation(async (_app, _chat, ids) => ids.map(id => ({ id, ok: false, [state]: true })));
+    await tryHandleInviteCommand('b1', inviteMessage({ text: '@_user_1 /invite --app cli_a --app cli_b',
+      mentions: [{ key: '@_user_1', id: { open_id: ME }, name: 'Claude' }] }), OWNER);
+    expect(addBotMock).toHaveBeenCalledTimes(1);
+    expect(userInviteMock).not.toHaveBeenCalled();
+  });
+
+  it('uses the current requester only for bots rejected with 230003', async () => {
+    addBotMock.mockImplementation(async (_app, _chat, ids) => ids.map(id => ({
+      id, ok: false, code: id === 'cli_restricted' ? 230003 : 99991672, error: 'rejected',
+    })));
+    userInviteMock.mockResolvedValue([{ id: 'cli_restricted', ok: true }]);
+    const msg = inviteMessage({ text: '@_user_1 /invite --app cli_restricted --app cli_other',
+      mentions: [{ key: '@_user_1', id: { open_id: ME }, name: 'Claude' }] });
+    await tryHandleInviteCommand('b1', msg, OWNER);
+    expect(userInviteMock).toHaveBeenCalledExactlyOnceWith({ creatorLarkAppId: 'b1', chatId: 'oc_1',
+      targetAppIds: ['cli_restricted'], requesterOpenId: OWNER, requestId: 'om_inv' });
+    const reply = replyMock.mock.calls.at(-1)?.[2] as string;
+    expect(reply).toContain('cli_restricted');
+    expect(reply).toContain('99991672');
+  });
+
+  it('does not use user credentials for ordinary invitation errors', async () => {
+    addBotMock.mockResolvedValue([{ id: 'cli_other', ok: false, code: 99991672, error: 'permission denied' }]);
+    await tryHandleInviteCommand('b1', inviteMessage({ text: '@_user_1 /invite --app cli_other' }), OWNER);
+    expect(userInviteMock).not.toHaveBeenCalled();
+  });
+
+  it('does not expose thrown authorization errors or claim success', async () => {
+    addBotMock.mockResolvedValue([{ id: 'cli_restricted', ok: false, code: 230003, error: 'restricted' }]);
+    userInviteMock.mockRejectedValue(new Error('secret-token-value'));
+    await tryHandleInviteCommand('b1', inviteMessage({ text: '@_user_1 /invite --app cli_restricted' }), OWNER);
+    const reply = replyMock.mock.calls.at(-1)?.[2] as string;
+    expect(reply).not.toContain('secret-token-value');
+    expect(reply).toContain('230003');
   });
 });
 

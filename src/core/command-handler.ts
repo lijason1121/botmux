@@ -5813,6 +5813,7 @@ export async function handleCommand(
         try {
           const { createGroupWithBots } = await import('../services/group-creator.js');
           const { registerGroupAutoTitle } = await import('../services/group-auto-title.js');
+          const { inviteBotsAsUser } = await import('../services/group-bot-user-invite.js');
           // Settles when createGroupWithBots returns or throws, i.e. after its
           // initial avatar; a fast AI title waits on it before re-rendering.
           let settleDecorations!: () => void;
@@ -5825,6 +5826,13 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
             roleProfileId,
+            ...(message.senderType === 'user' && isUsableOpenId(senderOpenId) ? {
+              botInviteRequesterOpenId: senderOpenId,
+              inviteBotsAsUser: (chatId: string, targetAppIds: string[]) => inviteBotsAsUser({
+                creatorLarkAppId: creatorAppId, chatId, targetAppIds,
+                requesterOpenId: senderOpenId, requestId: message.messageId,
+              }),
+            } : {}),
             ...((groupArgs.tag || decorations.avatar) ? {
               customization: { tag: groupArgs.tag, avatar: decorations.avatar, userOpenId: senderOpenId },
             } : {}),
@@ -5870,6 +5878,18 @@ export async function handleCommand(
           }
           if (result.invalidBotIds.length > 0) {
             hints.push(t('cmd.group.warn_bots_rejected', { bots: result.invalidBotIds.map(nameOf).join('、') }, loc));
+            for (const failure of result.botInviteFailures ?? []) {
+              hints.push(t('cmd.invite.failed_item', {
+                name: nameOf(failure.id),
+                reason: `${failure.error ?? 'unknown'}${failure.code !== undefined ? ` (${failure.code})` : ''}`,
+              }, loc));
+            }
+            if (result.botInviteFailures?.some(failure => failure.authorizationRequired)) {
+              hints.push(t('cmd.group.invite_auth_required', undefined, loc));
+            }
+            hints.push(t('cmd.group.invite_retry', {
+              command: `/invite ${result.invalidBotIds.map(id => `--app ${id}`).join(' ')}`,
+            }, loc));
           }
           if (roleProfileId) {
             if (result.roleProfileBootstrapError) {

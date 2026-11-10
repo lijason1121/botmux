@@ -29,7 +29,7 @@ import { isBotAdmin } from './grant-owner.js';
 import { config } from '../../config.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
-import { addBotToChat } from '../../services/groups-store.js';
+import { addBotToChat, type BotInviteResult } from '../../services/groups-store.js';
 import { fetchTeamBotDirectory, hasAnyTeamDirectorySource } from '../../services/team-bot-directory.js';
 import type { TeamBotMatch } from '../../services/team-bot-directory.js';
 import { listChatBotMembers, replyMessage } from './client.js';
@@ -98,14 +98,18 @@ export function parseInviteArgs(text: string, mentions: any[]): ParsedInviteArgs
 
 /** 批量拉人；整批全失败且 >1 个时回退逐个拉（镜像 group-creator 的批处理回退）。 */
 async function addBotsResilient(larkAppId: string, chatId: string, ids: string[]) {
-  let results: { id: string; ok: boolean; error?: string }[] = [];
+  let results: BotInviteResult[] = [];
   for (let i = 0; i < ids.length; i += INVITE_BATCH_SIZE) {
     const batch = ids.slice(i, i + INVITE_BATCH_SIZE);
     let r = await addBotToChat(larkAppId, chatId, batch);
-    if (batch.length > 1 && r.every(x => !x.ok)) {
-      // 整批失败可能是单个坏 id 拖累全批 → 逐个隔离重试，让好 id 落进去。
+    if (batch.length > 1 && r.some(x => !x.ok && !x.pendingApproval && !x.outcomeUnknown)) {
+      // Isolate definite failures without repeating accepted or ambiguous writes.
       const perId: typeof r = [];
-      for (const id of batch) perId.push(...await addBotToChat(larkAppId, chatId, [id]));
+      for (const result of r) {
+        if (!result.ok && !result.pendingApproval && !result.outcomeUnknown) {
+          perId.push(...await addBotToChat(larkAppId, chatId, [result.id]));
+        } else perId.push(result);
+      }
       r = perId;
     }
     results.push(...r);
@@ -274,11 +278,30 @@ export async function tryHandleInviteCommand(
 
   const added: string[] = [];
   const failed: string[] = [];
+  let needsAuthorization = false;
   if (toInvite.length > 0) {
-    const results = await addBotsResilient(larkAppId, chatId, toInvite);
+    let results = await addBotsResilient(larkAppId, chatId, toInvite);
+    const restricted = results.filter(r => !r.ok && r.code === 230003 && !r.pendingApproval && !r.outcomeUnknown).map(r => r.id);
+    if (restricted.length > 0) {
+      // The helper verifies the exact human requester; bot/admin credentials
+      // never fall back to an arbitrary configured owner's authorization.
+      const { inviteBotsAsUser } = await import('../../services/group-bot-user-invite.js');
+      try {
+        const recovered = await inviteBotsAsUser({
+          creatorLarkAppId: larkAppId, chatId, targetAppIds: restricted,
+          requesterOpenId: senderOpenId, requestId: messageId,
+        });
+        const byId = new Map(recovered.map(r => [r.id, r]));
+        results = results.map(r => restricted.includes(r.id) ? byId.get(r.id) ?? r : r);
+      } catch {
+        logger.warn(`[invite:${larkAppId}] user invitation failed chat=${chatId}`);
+      }
+    }
     for (const r of results) {
       if (r.ok) added.push(nameOf(r.id));
-      else failed.push(t('cmd.invite.failed_item', { name: nameOf(r.id), reason: r.error ?? 'unknown' }, loc));
+      else failed.push(t('cmd.invite.failed_item', { name: nameOf(r.id),
+        reason: `${r.error ?? 'unknown'}${r.code !== undefined ? ` (${r.code})` : ''}` }, loc));
+      if (r.authorizationRequired) needsAuthorization = true;
     }
   }
 
@@ -288,6 +311,7 @@ export async function tryHandleInviteCommand(
   if (unresolved.length) sections.push(t('cmd.invite.unresolved', { names: [...new Set(unresolved)].join('、') }, loc));
   if (ambiguous.length) sections.push(...ambiguous);
   if (failed.length) sections.push(...failed);
+  if (needsAuthorization) sections.push(t('cmd.group.invite_auth_required', undefined, loc));
   const body = sections.join('\n') || t('cmd.invite.usage', undefined, loc);
   await replyMessage(larkAppId, messageId,
     toInvite.length > 0 || already.length > 0 ? t('cmd.invite.header', undefined, loc) + '\n' + body : body,

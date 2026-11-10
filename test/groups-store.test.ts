@@ -12,6 +12,7 @@ const chatCreateStub = vi.fn();
 const chatUpdateStub = vi.fn();
 // chat.link mocks the share-link fetch.
 const chatLinkStub = vi.fn();
+const chatMembersCreateStub = vi.fn();
 let chatListItems: Array<Record<string, unknown>>;
 
 // Mock bot-registry's getBotClient — that's where groups-store imports from.
@@ -47,10 +48,7 @@ vi.mock('../src/bot-registry.js', () => ({
           link: chatLinkStub,
         },
         chatMembers: {
-          create: vi.fn().mockResolvedValue({
-            code: 0,
-            data: { invalid_id_list: ['cli_X'] },
-          }),
+          create: chatMembersCreateStub,
         },
         chatManagers: {
           addManagers: chatManagersAddStub,
@@ -78,6 +76,7 @@ describe('groups-store wrappers', () => {
     chatCreateStub.mockClear();
     chatUpdateStub.mockClear();
     chatLinkStub.mockReset();
+    chatMembersCreateStub.mockReset().mockResolvedValue({ code: 0, data: { invalid_id_list: ['cli_X'] } });
     chatManagersAddStub.mockReset();
     chatListItems = [{
       chat_id: 'c1',
@@ -217,6 +216,35 @@ describe('groups-store wrappers', () => {
 
   it('addBotToChat with empty list returns empty', async () => {
     expect(await addBotToChat('appA', 'c1', [])).toEqual([]);
+  });
+
+  it('preserves the bot invitation restriction code and request ID', async () => {
+    chatMembersCreateStub.mockResolvedValueOnce({
+      code: 230003, msg: 'Bot is not allowed to be invited by other app.', error: { log_id: 'trace123' },
+    });
+    expect(await addBotToChat('appA', 'c1', ['cli_Y'])).toEqual([
+      expect.objectContaining({ id: 'cli_Y', ok: false, code: 230003, logId: 'trace123' }),
+    ]);
+  });
+
+  it('extracts a structured restriction from an HTTP rejection without guessing from text', async () => {
+    chatMembersCreateStub.mockRejectedValueOnce({ message: 'HTTP 400', response: { data: { code: 230003 } } });
+    expect(await addBotToChat('appA', 'c1', ['cli_Y'])).toEqual([
+      expect.objectContaining({ id: 'cli_Y', ok: false, code: 230003 }),
+    ]);
+    chatMembersCreateStub.mockRejectedValueOnce(new Error('network failure mentioning 230003'));
+    expect((await addBotToChat('appA', 'c1', ['cli_Y']))[0].code).toBeUndefined();
+  });
+
+  it('does not count nonexistent or pending bots as joined', async () => {
+    chatMembersCreateStub.mockResolvedValueOnce({ code: 0, data: {
+      not_existed_id_list: ['cli_X'], pending_approval_id_list: ['cli_Y'],
+    } });
+    expect(await addBotToChat('appA', 'c1', ['cli_X', 'cli_Y', 'cli_Z'])).toEqual([
+      { id: 'cli_X', ok: false, error: 'invalid_id' },
+      { id: 'cli_Y', ok: false, error: 'pending_approval', pendingApproval: true },
+      { id: 'cli_Z', ok: true },
+    ]);
   });
 
   it('createChat returns chatId and forwards bot list (excluding creator)', async () => {
