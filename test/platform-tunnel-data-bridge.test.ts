@@ -412,14 +412,14 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
     // read and 575MB RSS on Bun. With the gate it stops after a few MB.
     const OFFER = 64 * 1024 * 1024;
     const block = Buffer.alloc(256 * 1024, 0xab);
-    let readFromDashboard = 0;
+    let offered = 0;
 
     // Dashboard stand-in: floods as fast as the bridge will read.
     const srv = createServer((s) => {
       s.on('error', () => { /* peer teardown is normal */ });
       const pump = (): void => {
-        while (readFromDashboard < OFFER) {
-          readFromDashboard += block.length;
+        while (offered < OFFER) {
+          offered += block.length;
           if (!s.write(block)) { s.once('drain', pump); return; }
         }
       };
@@ -441,12 +441,35 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
     const winner = new WebSocket(`ws://127.0.0.1:${platformPort}`, { perMessageDeflate: false });
     sockets.push(winner);
     await new Promise<void>((r, rej) => { winner.on('open', () => r()); winner.on('error', rej); });
+    // write() also counts the sender/runtime/kernel queues. Those can exceed
+    // 32MB even when the bridge has read only 4MB, so observe its actual sends.
+    let forwarded = 0;
+    let probes = 0;
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    const send = winner.send.bind(winner);
+    winner.send = ((data: Buffer, ...rest: unknown[]) => {
+      forwarded += data.length;
+      if (forwarded >= OFFER / 2) settle();
+      return (send as (...args: unknown[]) => void)(data, ...rest);
+    }) as typeof winner.send;
+    const ping = winner.ping.bind(winner);
+    winner.ping = ((...args: unknown[]) => {
+      const result = (ping as (...args: unknown[]) => void)(...args);
+      if (++probes >= 3) settle();
+      return result;
+    }) as typeof winner.ping;
     bridgeDataChannel(winner, tcpPort);
 
-    await new Promise<void>((r) => setTimeout(r, 3_000));
+    // Observe repeated attempts to confirm delivery to the stalled peer, or
+    // fail immediately if the bridge consumes the offer despite the missing ACKs.
+    await settled;
     // A working gate stops within a few multiples of the 4MB watermark. Without one
     // the bridge swallows the entire 64MB offer.
-    expect(readFromDashboard).toBeLessThan(OFFER / 2);
+    expect(forwarded).toBeGreaterThan(0);
+    expect(forwarded).toBeLessThan(OFFER / 2);
+    expect(probes).toBeGreaterThanOrEqual(3);
+    expect(winner.readyState).toBe(WebSocket.OPEN);
   }, 30_000);
 
   it('reassembles a fragmented ws payload instead of dropping all but the first piece', async () => {
