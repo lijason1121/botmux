@@ -406,10 +406,13 @@ export class SessionController {
       if (existing.length === 1) context.scope.execution = existing[0].ref;
       else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
     }
-    // Physical screen status is a runtime observation, not an execution claim:
-    // keep proven runtime-bound attribution, but drop unproven/unbound turn
-    // scopes instead of rejecting the current runtime's idle/working frame.
-    if (message.type === 'screen_update' && context.scope.runtime && context.scope.execution
+    // Physical screen status and prompt readiness are runtime observations, not
+    // execution claims: keep proven runtime-bound attribution, but drop
+    // unproven/unbound turn scopes instead of rejecting the current runtime's
+    // frame. A workflow worker carries its queued goal execution from init, so
+    // rejecting its first prompt_ready would leave the runtime never ready and
+    // the goal never dispatched.
+    if ((message.type === 'screen_update' || message.type === 'prompt_ready') && context.scope.runtime && context.scope.execution
       && !sameRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime)) {
       delete context.scope.execution;
     }

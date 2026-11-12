@@ -364,6 +364,19 @@ describe('v3 ephemeral pool', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('dispatches the goal when prompt_ready still carries the queued goal execution from init', async () => {
+    const worker = new ScriptedWorker({ stampInitExecution: true });
+    const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js', quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret' }).runNode(request());
+    await worker.waitForInit();
+    expect(worker.init.sessionCommand?.execution).toBeDefined();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    await waitFor(() => worker.rawInputs.length === 1);
+    worker.emitExit(0);
+    await running;
+  });
+
   it('resolves the env of a node bot hosted by another daemon from live bots.json', async () => {
     // The daemon wiring injects no resolveBot, and each fleet daemon registers
     // only its own bot: cli_app is absent from this process's registry.
@@ -1625,9 +1638,15 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   private initResolve?: () => void;
   private initPromise = new Promise<void>((resolve) => { this.initResolve = resolve; });
 
-  constructor(opts: { autoReadyAfterInit?: boolean } = {}) {
+  /** Like the real worker: the execution sent with init stays in the event
+   *  scope, so pre-goal events (prompt_ready) carry the still-queued goal. */
+  private readonly stampInitExecution: boolean;
+  private initExecution?: any;
+
+  constructor(opts: { autoReadyAfterInit?: boolean; stampInitExecution?: boolean } = {}) {
     super();
     this.autoReadyAfterInit = opts.autoReadyAfterInit ?? false;
+    this.stampInitExecution = opts.stampInitExecution ?? false;
   }
 
   send(msg: unknown): void {
@@ -1638,7 +1657,9 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
       if (contract) {
         this.contractScope = new WorkerSessionEventScope(contract.session, contract.worker);
         const binding = this.contractScope.beginRuntime();
-        this.contractScope.enterRuntime(binding);
+        this.initExecution = this.stampInitExecution ? (msg as any).sessionCommand?.execution : undefined;
+        if (this.initExecution) this.contractScope.rememberExecution(this.initExecution, binding);
+        this.contractScope.enterRuntime(binding, this.initExecution);
         this.emitMessage({ type: 'runtime_binding_started', bindingId: binding.bindingId });
         this.emitMessage({ type: 'runtime_binding', bindingId: binding.bindingId, identity: { backend: 'tmux', physicalId: 'fake-worker', proof: 'opaque' } });
       }
@@ -1666,7 +1687,8 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
 
   emitMessage(msg: unknown): void {
     const binding = this.contractScope?.currentBinding();
-    this.emit('message', binding && this.contractScope ? { ...(msg as any), sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
+    this.emit('message', binding && this.contractScope ? { ...(msg as any), sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime,
+      ...(this.initExecution ? { execution: this.initExecution } : {}) }) } : msg);
   }
 
   emitExit(code: number | null): void {
