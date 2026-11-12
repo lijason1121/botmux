@@ -364,6 +364,22 @@ describe('v3 ephemeral pool', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('resolves the env of a node bot hosted by another daemon from live bots.json', async () => {
+    // The daemon wiring injects no resolveBot, and each fleet daemon registers
+    // only its own bot: cli_app is absent from this process's registry.
+    const botsPath = join(dir, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+      env: { MODEL_AUTH: 'bots-json-sentinel' } }]));
+    vi.stubEnv('BOTS_CONFIG', botsPath);
+    const worker = new ScriptedWorker();
+    const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js', quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret' }).runNode(request());
+    await worker.waitForInit();
+    expect(worker.init.env?.MODEL_AUTH === 'bots-json-sentinel').toBe(true);
+    worker.emitExit(1);
+    await running;
+  });
+
   it('persists the explicit default instance and replays it into the existing PTY worker after config changes', async () => {
     const home = join(dir, 'codex-a');
     mkdirSync(home, { mode: 0o700 });

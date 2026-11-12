@@ -15,7 +15,7 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { getBot } from '../../bot-registry.js';
+import { getBot, loadBotConfigsCached } from '../../bot-registry.js';
 import { statSync, writeFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { BoundedLogFile } from '../../utils/bounded-log-file.js';
@@ -79,7 +79,7 @@ export interface EphemeralPoolDeps {
   resolveLarkAppSecret(larkAppId: string): string | undefined | Promise<string | undefined>;
   /** Resolve the live bot config at spawn time so env values (session-env
    *  layers, core/session-env.ts) are never persisted in snapshots. Defaults
-   *  to the daemon's bot registry. */
+   *  to defaultResolveBot (this daemon's registry, then live bots.json). */
   resolveBot?: (larkAppId: string) => SessionEnvBotInput | undefined;
   factory?: WorkerProcessFactory;
   workerPath?: string;
@@ -89,13 +89,23 @@ export interface EphemeralPoolDeps {
   manifestSettleMs?: number;
 }
 
+/** A fleet daemon registers only the bot it hosts, but a run's nodes may run
+ *  as any configured bot. Without this fallback a node whose bot lives in
+ *  another daemon loses its per-bot env (e.g. provider auth) and its CLI starts
+ *  logged out. Live bots.json is the same source the daemon already uses for
+ *  node Lark secrets; a hosted bot keeps its registered config. */
+function defaultResolveBot(larkAppId: string): SessionEnvBotInput | undefined {
+  try { return getBot(larkAppId).config; } catch { /* hosted by another daemon */ }
+  return loadBotConfigsCached().find(bot => bot.larkAppId === larkAppId);
+}
+
 /** Session env overlay for a workflow worker, from the live bot config. */
 function v3WorkerSessionEnv(
   larkAppId: string,
   resolveBot: EphemeralPoolDeps['resolveBot'],
 ): { env?: Record<string, string>; envUnset?: string[] } {
   let bot: SessionEnvBotInput | undefined;
-  try { bot = resolveBot ? resolveBot(larkAppId) : getBot(larkAppId).config; } catch { bot = undefined; }
+  try { bot = (resolveBot ?? defaultResolveBot)(larkAppId); } catch { bot = undefined; }
   if (!bot) return {};
   // Workflow workers never install the identity wrappers (usesLarkToolBinding).
   const resolved = resolveSessionEnv({ bot, backendType: v3WorkerBackendType(), facts: { unwrapped: true } });
