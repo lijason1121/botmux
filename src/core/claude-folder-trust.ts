@@ -44,4 +44,3 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
     logger.debug(`[claude-trust] seed failed (ignored): ${err}`);
   }
 }
-
