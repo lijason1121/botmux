@@ -387,6 +387,31 @@ describe('runWorkflow — research→summarize 最小闭环', () => {
     } finally { rmSync(base, { recursive: true, force: true }); }
   });
 
+  it('keeps startup blockers manually retryable without automatic replay', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-startup-recovery-'));
+    const dag = validateDag({ runId: 'startup-recovery', nodes: [TWO_NODE.nodes[0]] });
+    let calls = 0;
+    const runNode: RunNode = async req => {
+      calls++;
+      if (calls === 1) return { status: 'fail', manifestPath: join(req.attemptDir, 'manifest.json'), goalNotStarted: true,
+        error: { code: 'CLI_STARTUP_LOGIN', message: 'complete login then retry', retryable: true } };
+      return { status: 'ok', manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'done',
+        files: [product(req.outputDir, 'report.md', '# Report')] }) };
+    };
+    try {
+      const deps = { runNode, validateManifest, resolveBotSnapshot };
+      const first = await runWorkflow(dag, deps, { baseDir: base });
+      expect(first).toMatchObject({ runStatus: 'blocked' });
+      expect(calls).toBe(1);
+      const events = readJournal(join(base, dag.runId, 'journal.ndjson'));
+      expect(events.find(e => e.type === 'nodeBlocked')).toMatchObject({ errorCode: 'CLI_STARTUP_LOGIN' });
+      expect(events.some(e => e.type === 'nodeRetryRequested')).toBe(false);
+      expect(requestV3Retry(base, dag.runId)).toMatchObject({ kind: 'requested' });
+      expect(await runWorkflow(dag, deps, { baseDir: base })).toMatchObject({ runStatus: 'succeeded' });
+      expect(calls).toBe(2);
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
   it('进程失败且无 manifest → nodeFailed 消息以 failureDetail 根因开头', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-rt-detail-'));
     try {

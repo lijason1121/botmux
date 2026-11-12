@@ -25,7 +25,8 @@ import { fileURLToPath } from 'node:url';
 import type { WorkerToDaemon } from '../../types.js';
 import type { BackendType } from '../../adapters/backend/types.js';
 import { config } from '../../config.js';
-import { rawCliExecutable } from '../../adapters/cli/registry.js';
+import { createCliAdapterSync, rawCliExecutable } from '../../adapters/cli/registry.js';
+import { ensureClaudeFolderTrust } from '../../core/claude-folder-trust.js';
 import { spawnWorker } from '../../core/self-spawn.js';
 import {
   expandWorkflowWorkingDir,
@@ -191,6 +192,16 @@ async function runNodeImpl(
   }
 
   const cwd = expandWorkflowWorkingDir(req.botSnapshot.workingDir) ?? process.cwd();
+  try {
+    // Match ordinary chat spawns, including the frozen per-bot Claude profile
+    // and Claude-family variants. Never seed another bot's default profile.
+    const adapter = createCliAdapterSync(req.botSnapshot.cliId, req.botSnapshot.cliPathOverride,
+      { configDir: req.botSnapshot.cliConfigDir });
+    if (adapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, adapter.claudeStateJsonPath);
+  } catch (error) {
+    closeV3ArmedFenceWithoutSpawn(req.attemptDir, armedFence, 'setup_failed');
+    throw error;
+  }
   const backendType = v3WorkerBackendType();
   const startedAtMs = Date.now();
   const deadlineAtMs = startedAtMs + req.timeoutMs;
@@ -415,7 +426,7 @@ async function runNodeImpl(
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
-    let pendingResult: { status: 'ok' | 'fail'; reason: string; detail?: string } | undefined;
+    let pendingResult: { status: 'ok' | 'fail'; reason: string; detail?: string; error?: RunNodeResult['error'] } | undefined;
     let quiesceTimer: NodeJS.Timeout | undefined;
     let sigtermTimer: NodeJS.Timeout | undefined;
     let sigkillTimer: NodeJS.Timeout | undefined;
@@ -514,10 +525,10 @@ async function runNodeImpl(
       worker.send({ type: 'close', ...(controller ? { sessionCommand: { version: 2, runtime: controller.currentRuntime(), operationId: operation?.operationId } } : {}) });
     }
 
-    function finish(status: RunNodeResult['status'], reason: string, detail?: string): void {
+    function finish(status: RunNodeResult['status'], reason: string, detail?: string, error?: RunNodeResult['error']): void {
       if (settled || cancelRequested || pendingResult) return;
       if (status === 'cancelled') return;
-      pendingResult = { status, reason, ...(detail ? { detail } : {}) };
+      pendingResult = { status, reason, ...(detail ? { detail } : {}), ...(error ? { error } : {}) };
       void appendLine(stderrPath(req), `[v3] worker outcome claimed status=${status} reason=${reason}; waiting for worker exit`);
       requestWorkerExit();
     }
@@ -661,6 +672,17 @@ async function runNodeImpl(
         case 'active_runtime':
           observedRuntime = event;
           break;
+        case 'user_notify':
+          // Only authoritative startup detection is fatal. Ordinary notices
+          // (including permission prompts during a running goal) remain UI.
+          if (event.kind === 'cli_startup_blocked' && event.startupBlocker && !goalSent) {
+            const { kind, rule } = event.startupBlocker;
+            const error = { code: `CLI_STARTUP_${kind.toUpperCase()}`, retryable: true,
+              message: `${req.botSnapshot.cliId} 启动受阻：${kind}（${rule}）。请先使用此机器人的 CLI 配置完成初始化，再手动重试 workflow 节点。` };
+            void appendLine(stderrPath(req), `[v3] ${error.code} rule=${rule}: ${event.message}`);
+            finish('fail', 'startup-blocked', error.message, error);
+          }
+          break;
         case 'error':
           void appendLine(stderrPath(req), `[worker] ${event.message}`);
           finish('fail', 'worker-error', event.message);
@@ -735,7 +757,7 @@ async function runNodeImpl(
           ...(reason === 'timeout' ? { failureReason: 'timeout' as const } : {}),
         } : {}),
         ...(runtime ? { runtime } : {}),
-        ...(runtimeError ? { error: runtimeError } : {}),
+        ...((runtimeError ?? pendingResult?.error) ? { error: runtimeError ?? pendingResult?.error } : {}),
       });
     });
 

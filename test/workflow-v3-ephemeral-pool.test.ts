@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -624,7 +624,7 @@ describe('v3 ephemeral pool', () => {
     });
   });
 
-  it('fails a goal-scoped Codex run when the worker reports a different runtime', async () => {
+  it.each([false, true])('fails a mismatched goal-scoped Codex runtime even with startupBlocked=%s', async (startupBlocked) => {
     const worker = new ScriptedWorker();
     const req = request();
     req.botSnapshot.cliId = 'codex';
@@ -648,9 +648,14 @@ describe('v3 ephemeral pool', () => {
     const promise = pool.runNode(req);
     await worker.waitForInit();
     worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
-    worker.emitMessage({ type: 'prompt_ready' });
     worker.emitMessage({ type: 'active_runtime', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
-    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    if (startupBlocked) {
+      worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'login required',
+        startupBlocker: { kind: 'login', rule: 'codex-sign-in' } });
+    } else {
+      worker.emitMessage({ type: 'prompt_ready' });
+      worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    }
     await waitFor(() => worker.kills.includes('SIGTERM'));
     worker.emitExit(0);
 
@@ -1444,6 +1449,108 @@ describe('v3 default worker factory (spawnWorkerFactory) across runtime shapes',
   });
 });
 
+describe('workflow startup preflight and blockers', () => {
+  it('trusts the canonical cwd in the frozen Claude profile before spawning', async () => {
+    const req = request();
+    const cwd = join(dir, 'repo');
+    const alias = join(dir, 'repo-link');
+    const profile = join(dir, 'claude-profile');
+    mkdirSync(cwd);
+    mkdirSync(profile);
+    symlinkSync(cwd, alias);
+    req.botSnapshot.workingDir = alias;
+    req.botSnapshot.cliConfigDir = profile;
+    const stateFile = join(profile, '.claude.json');
+    writeFileSync(stateFile, JSON.stringify({ account: 'preserved', projects: { other: { keep: true } } }));
+    const worker = new ScriptedWorker();
+    let stateAtSpawn: any;
+    const running = createEphemeralPool({
+      factory: { spawn: () => { stateAtSpawn = JSON.parse(readFileSync(stateFile, 'utf8')); return worker; } },
+      resolveLarkAppSecret: () => 'secret',
+    }).runNode(req);
+    await worker.waitForInit();
+    worker.emitExit(1);
+    await running;
+    expect(stateAtSpawn).toEqual({ account: 'preserved', projects: {
+      other: { keep: true }, [realpathSync(cwd)]: { hasTrustDialogAccepted: true },
+    } });
+  });
+
+  it.each(['folder_trust', 'login', 'api_key', 'update', 'terms', 'permission_mode'] as const)(
+    'reports %s before the node deadline and waits for actual worker close', async (kind) => {
+      const req = { ...request(), timeoutMs: 1_800_000 };
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' }).runNode(req);
+      await worker.waitForInit();
+      worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+      let settled = false;
+      void running.then(() => { settled = true; });
+      worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'startup requires intervention',
+        startupBlocker: { kind, rule: `known-${kind}` } });
+      // A spurious readiness edge after failure must never submit the goal.
+      worker.emitMessage({ type: 'prompt_ready' });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const closeRequests = worker.closeRequests;
+      const settledBeforeClose = settled;
+      worker.emit('exit', 0);
+      const settledOnExit = settled;
+      worker.emit('close', 0);
+      const result = await running;
+      expect(closeRequests).toBe(1);
+      expect(worker.rawInputs).toEqual([]);
+      expect(settledBeforeClose).toBe(false);
+      expect(settledOnExit).toBe(false);
+      expect(result).toMatchObject({ status: 'fail', goalNotStarted: true,
+        error: { code: `CLI_STARTUP_${kind.toUpperCase()}`, retryable: true, message: expect.any(String) } });
+    },
+  );
+
+  it('keeps informational notifications and another CLI on the normal success path', async () => {
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    const worker = new ScriptedWorker();
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' }).runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'user_notify', message: 'ordinary status', kind: 'input_not_submitted' });
+    expect(worker.closeRequests).toBe(0);
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    expect(worker.rawInputs).toHaveLength(1);
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'ok' });
+  });
+
+  it('cancellation wins over a claimed startup failure until outer close', async () => {
+    const worker = new ScriptedWorker();
+    const ac = new AbortController();
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' })
+      .runNode({ ...request(), cancelSignal: ac.signal });
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'login required',
+      startupBlocker: { kind: 'login', rule: 'known-login' } });
+    ac.abort('manual-cancel');
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'cancelled', cancelReason: 'manual-cancel' });
+    expect(worker.rawInputs).toEqual([]);
+  });
+
+  it('does not reclassify a running goal from a late startup notification', async () => {
+    const worker = new ScriptedWorker();
+    const running = createEphemeralPool({ factory: factoryFor(worker), resolveLarkAppSecret: () => 'secret' }).runNode(request());
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'user_notify', kind: 'cli_startup_blocked', message: 'stale startup notification',
+      startupBlocker: { kind: 'login', rule: 'known-login' } });
+    const closeRequests = worker.closeRequests;
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'ok' });
+    expect(closeRequests).toBe(0);
+    expect(worker.rawInputs).toHaveLength(1);
+  });
+});
+
 function request(): RunNodeRequest {
   const attemptDir = join(dir, 'research', 'attempts', '001');
   return {
@@ -1494,6 +1601,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly pid = process.pid;
   readonly kills: string[] = [];
   readonly rawInputs: string[] = [];
+  closeRequests = 0;
   readonly autoReadyAfterInit: boolean;
   init: any;
   private contractScope?: WorkerSessionEventScope;
@@ -1507,6 +1615,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   }
 
   send(msg: unknown): void {
+    if ((msg as any)?.type === 'close') this.closeRequests++;
     if ((msg as any)?.type === 'init' && !this.init) {
       this.init = msg;
       const contract = (msg as any).sessionContract;

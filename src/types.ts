@@ -2796,7 +2796,10 @@ export type WorkerToDaemonBase =
          *  the FACT on every demotion; the daemon decides whether to speak
          *  (per-session latch + history gate) and composes the copy. A worker
          *  is reforked on every `/restart`, so it cannot own that latch. */
-        | 'resume_fallback';
+        | 'resume_fallback'
+        /** Authoritative startup dialog before the CLI was ever input-ready. */
+        | 'cli_startup_blocked';
+      startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule'>;
       /** Bounded plain-text bottom of the screen for an input_not_submitted
        *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
        *  the notice as a card with this text; absent = plain text as before. */
