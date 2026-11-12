@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { createDevelopmentReviewPreset } from '../src/workflows/v3/presets/development-review.js';
 import { upgradeDevelopmentReviewPreset } from '../src/workflows/v3/presets/development-review-upgrade.js';
 import { DEVELOPMENT_REVIEW_RESOURCES, DEVELOPMENT_REVIEW_RESOURCE_MANIFEST_SHA256 } from '../src/workflows/v3/presets/development-review-resources.js';
@@ -55,8 +55,7 @@ function fixture(objectFormat = 'sha1', selected = BOTS) {
     prepare: () => tool('prepare', ['--preflight', preflight, '--params', params, '--roles', roles], prepared) };
 }
 
-async function evidenceFixture(objectFormat = 'sha1', round = 1, selected = BOTS) {
-  const f = fixture(objectFormat, selected);
+async function evidenceFixture(objectFormat = 'sha1', round = 1, selected = BOTS, f = fixture(objectFormat, selected)) {
   expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
   const context = join(f.prepared, 'context.json'), resources = join(f.prepared, 'resources.json'), ctx = json(context);
   writeFileSync(join(f.worktree, 'value.txt'), 'after\n'); f.git(f.worktree, 'add', 'value.txt'); f.git(f.worktree, 'commit', '-qm', 'fixture candidate');
@@ -78,6 +77,182 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1, selected = BOTS
 }
 
 describe('authored development-review preset', () => {
+  function pinnedNodeProject(f: ReturnType<typeof fixture>, pinFile = '.nvmrc', workspace = true) {
+    // Executable runtime doubles expose which interpreter reaches lifecycle scripts
+    // and validation subprocesses; they never use a real version-manager home.
+    const node = execFileSync('node', ['-p', 'process.execPath'], { encoding: 'utf8' }).trim();
+    const home = join(f.root, 'runtime-home'), fnm = join(home, 'fnm');
+    const bin = join(fnm, 'node-versions', 'v99.1.0', 'installation', 'bin');
+    mkdirSync(bin, { recursive: true });
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    writeFileSync(join(bin, 'node'), '#!/bin/sh\nif [ "$1" = "-p" ]; then\n  printf "%s\\n" ' +
+      quote(JSON.stringify({ version: 'v99.1.0', execPath: join(bin, 'node') })) + '\nelse\n  export FIXTURE_NODE_VERSION=99.1.0\n  exec ' + quote(node) + ' "$@"\nfi\n', { mode: 0o755 });
+    const manager = join(f.root, 'manager'); mkdirSync(manager);
+    writeFileSync(join(manager, 'pnpm'), `#!/usr/bin/env node
+const fs = require('node:fs');
+if (process.argv.includes('--version')) { console.log('8.15.9'); process.exit(0); }
+if (process.env.FIXTURE_NODE_VERSION !== '99.1.0') { console.error('wrong Node reached dependency lifecycle'); process.exit(31); }
+fs.appendFileSync(${JSON.stringify(join(f.root, 'installs.log'))}, process.env.FIXTURE_NODE_VERSION + '\\n');
+fs.mkdirSync('node_modules/fixture', { recursive: true });
+fs.writeFileSync('node_modules/fixture/package.json', JSON.stringify({ name: 'fixture', version: '1.0.0' }));
+// Frozen installation may reuse existing lifecycle output, as pnpm does for tarballs.
+if (process.argv.includes('--force') || !fs.existsSync('node_modules/fixture/compiled-for.txt'))
+  fs.writeFileSync('node_modules/fixture/compiled-for.txt', process.env.FIXTURE_NODE_VERSION);
+`, { mode: 0o755 });
+    Object.assign(f.env, { HOME: home, FNM_DIR: fnm, NVM_DIR: join(home, 'nvm'),
+      PATH: manager + delimiter + f.env.PATH });
+    write(join(f.repo, 'package.json'), { name: 'pinned', packageManager: 'pnpm@8.15.9', dependencies: { fixture: '1.0.0' } });
+    writeFileSync(join(f.repo, pinFile), 'v99\n');
+    writeFileSync(join(f.repo, 'pnpm-lock.yaml'), 'fixture-lock');
+    if (workspace) writeFileSync(join(f.repo, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n');
+    writeFileSync(join(f.repo, '.gitignore'), 'node_modules\n');
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'pinned runtime');
+    const params = json(f.params);
+    params.params.validation_commands = [{ id: 'runtime', argv: ['node', '-e',
+      'if (process.env.FIXTURE_NODE_VERSION !== "99.1.0") process.exit(32); console.log(process.env.FIXTURE_NODE_VERSION)'], timeoutSec: 10 }];
+    write(f.params, params);
+    return { bin };
+  }
+
+  it.each(['.nvmrc', '.node-version'])('uses the project Node from %s for install, record and the independent gate', async pinFile => {
+    const base = fixture(); pinnedNodeProject(base, pinFile);
+    const f = await evidenceFixture('sha1', 1, BOTS, base);
+    expect(readFileSync(join(f.root, 'installs.log'), 'utf8')).toBe('99.1.0\n');
+    expect(json(f.context).dependencies.runtime.version).toBe('v99.1.0');
+    expect(json(f.validation).checks[0].exitCode).toBe(0);
+    expect(await f.gate()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(f.result).passed).toBe(true);
+    expect(readFileSync(join(f.gated, 'independent-runtime.log'), 'utf8')).toContain('99.1.0');
+  });
+
+  it('keeps Node pins in isolated dependency snapshots and reuses only a matching runtime cache', async () => {
+    const f = fixture(), { bin } = pinnedNodeProject(f, '.nvmrc', false);
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    const first = json(join(f.prepared, 'context.json')).dependencies;
+    expect(readFileSync(join(first.source, '.nvmrc'), 'utf8')).toBe('v99\n');
+    expect(await f.prepare()).toMatchObject({ code: 0 });
+    expect(readFileSync(join(f.root, 'installs.log'), 'utf8')).toBe('99.1.0\n');
+    const updatedBin = bin.replace('v99.1.0', 'v99.2.0');
+    mkdirSync(updatedBin, { recursive: true });
+    // The probe reports a newer installed patch while the lifecycle marker stays
+    // fixed so both successful installs remain observable with the same fixture.
+    const updated = readFileSync(join(bin, 'node'), 'utf8').replaceAll(bin, updatedBin).replace('"version":"v99.1.0"', '"version":"v99.2.0"');
+    writeFileSync(join(updatedBin, 'node'), updated, { mode: 0o755 });
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    const second = json(join(f.prepared, 'context.json')).dependencies;
+    expect(second.runtime.version).toBe('v99.2.0');
+    expect(second.source).not.toBe(first.source);
+    expect(realpathSync(join(f.worktree, 'node_modules'))).toBe(second.modules);
+    expect(existsSync(first.modules)).toBe(true);
+    expect(readFileSync(join(f.root, 'installs.log'), 'utf8')).toBe('99.1.0\n99.1.0\n');
+  });
+
+  it('uses a matching PATH Node without requiring an optional version-manager store', async () => {
+    const f = fixture(), { bin } = pinnedNodeProject(f);
+    Object.assign(f.env, { PATH: bin + delimiter + f.env.PATH, FNM_DIR: join(f.root, 'broken-store') });
+    writeFileSync(join(f.root, 'broken-store'), 'not a directory');
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(f.prepared, 'context.json')).dependencies.runtime.version).toBe('v99.1.0');
+  });
+
+  it('resolves an installed nvm Node and rejects a changed package manager before validation', async () => {
+    const f = fixture(), { bin } = pinnedNodeProject(f);
+    const nvmBin = join(f.root, 'runtime-home', 'nvm', 'versions', 'node', 'v99.1.0', 'bin');
+    mkdirSync(nvmBin, { recursive: true });
+    writeFileSync(join(nvmBin, 'node'), readFileSync(join(bin, 'node'), 'utf8').replaceAll(bin, nvmBin), { mode: 0o755 });
+    rmSync(bin, { recursive: true });
+    expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });
+    const context = join(f.prepared, 'context.json'), output = f.out('development-review-loop.i001.implement');
+    expect(json(context).dependencies.runtime.execPath).toBe(join(nvmBin, 'node'));
+    const manager = join(f.root, 'manager', 'pnpm');
+    writeFileSync(manager, readFileSync(manager, 'utf8').replace("console.log('8.15.9')", "console.log('9.0.0')"));
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], output)).toMatchObject({ code: 0 });
+    const result = await f.tool('record', ['--context', context, '--candidate', join(output, 'candidate.json'), '--round', '1'], output);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('Package manager mismatch');
+    expect(existsSync(join(output, 'validation.json'))).toBe(false);
+  });
+
+  it('rejects an absolute Node validation command that bypasses the prepared project runtime', async () => {
+    const f = fixture(); pinnedNodeProject(f);
+    const params = json(f.params);
+    params.params.validation_commands[0].argv = [execFileSync('node', ['-p', 'process.execPath'], { encoding: 'utf8' }).trim(), '-e', 'process.exit(0)'];
+    write(f.params, params);
+    expect(await f.prepare()).toMatchObject({ code: 0 });
+    const context = join(f.prepared, 'context.json'), output = f.out('development-review-loop.i001.implement');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], output)).toMatchObject({ code: 0 });
+    const result = await f.tool('record', ['--context', context, '--candidate', join(output, 'candidate.json'), '--round', '1'], output);
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('Explicit Node validation command does not match');
+    expect(existsSync(join(output, 'validation.json'))).toBe(false);
+  });
+
+  it.each(['changed', 'legacy'] as const)('rebuilds workspace lifecycle output when its Node runtime is %s', async mode => {
+    const f = fixture(), { bin } = pinnedNodeProject(f);
+    if (mode === 'changed') {
+      writeFileSync(join(f.repo, '.nvmrc'), '99.1\n');
+      f.git(f.repo, 'commit', '-qam', 'pin initial runtime');
+    }
+    const params = json(f.params);
+    params.params.validation_commands[0].argv = ['node', '-e',
+      'const built=require("node:fs").readFileSync("node_modules/fixture/compiled-for.txt","utf8"); if(built!==process.env.FIXTURE_NODE_VERSION) process.exit(19)'];
+    write(f.params, params);
+    if (mode === 'legacy') {
+      f.git(f.repo, 'worktree', 'add', '-b', 'workflow/' + f.runId, f.worktree, 'main');
+      mkdirSync(join(f.worktree, 'node_modules', 'fixture'), { recursive: true });
+      writeFileSync(join(f.worktree, 'node_modules', 'fixture', 'compiled-for.txt'), 'old-node');
+    }
+    expect(await f.prepare()).toMatchObject({ code: 0 });
+    if (mode === 'changed') {
+      const updated = bin.replace('v99.1.0', 'v99.2.0'); mkdirSync(updated, { recursive: true });
+      writeFileSync(join(updated, 'node'), readFileSync(join(bin, 'node'), 'utf8').replaceAll('99.1.0', '99.2.0'), { mode: 0o755 });
+      const manager = join(f.root, 'manager', 'pnpm');
+      writeFileSync(manager, readFileSync(manager, 'utf8').replace("!== '99.1.0'", "!== '99.2.0'"));
+      writeFileSync(join(f.worktree, '.nvmrc'), '99.2\n');
+      f.git(f.worktree, 'commit', '-qam', 'change runtime');
+    }
+    const context = join(f.prepared, 'context.json'), output = f.out('development-review-loop.i001.implement');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], output)).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', context, '--candidate', join(output, 'candidate.json'), '--round', '1'], output)).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(output, 'validation.json')).checks[0].exitCode).toBe(0);
+    if (mode === 'changed') {
+      // A -> B -> A must follow the current installation, not initial context or
+      // the existence of an obsolete stamp for A's manifest.
+      writeFileSync(join(f.worktree, '.nvmrc'), '99.1\n');
+      f.git(f.worktree, 'commit', '-qam', 'restore runtime');
+      const manager = join(f.root, 'manager', 'pnpm');
+      writeFileSync(manager, readFileSync(manager, 'utf8').replace("!== '99.2.0'", "!== '99.1.0'"));
+      expect(await f.tool('candidate', ['--context', context, '--round', '1'], output)).toMatchObject({ code: 0 });
+      expect(await f.tool('record', ['--context', context, '--candidate', join(output, 'candidate.json'), '--round', '1'], output)).toMatchObject({ code: 0, stderr: '' });
+      expect(json(join(output, 'validation.json')).checks[0].exitCode).toBe(0);
+      expect(readFileSync(join(f.worktree, 'node_modules', 'fixture', 'compiled-for.txt'), 'utf8')).toBe('99.1.0');
+    }
+  });
+
+  it.each(['missing', 'conflicting', 'changed-after-prepare'])('rejects an unusable project Node before installation or validation: %s', async mode => {
+    const f = fixture(), { bin } = pinnedNodeProject(f);
+    if (mode === 'missing') rmSync(bin, { recursive: true });
+    if (mode === 'conflicting') {
+      writeFileSync(join(f.repo, '.node-version'), '98\n');
+      f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'conflicting pin');
+    }
+    if (mode === 'changed-after-prepare') {
+      expect(await f.prepare()).toMatchObject({ code: 0 });
+      writeFileSync(join(f.worktree, '.nvmrc'), '98\n');
+      f.git(f.worktree, 'commit', '-qam', 'change runtime');
+      const output = f.out('development-review-loop.i001.implement'), context = join(f.prepared, 'context.json');
+      expect(await f.tool('candidate', ['--context', context, '--round', '1'], output)).toMatchObject({ code: 0 });
+      expect((await f.tool('record', ['--context', context, '--candidate', join(output, 'candidate.json'), '--round', '1'], output)).code).toBe(2);
+      expect(existsSync(join(output, 'validation.json'))).toBe(false);
+      expect(readFileSync(join(f.root, 'installs.log'), 'utf8')).toBe('99.1.0\n');
+    } else {
+      const result = await f.prepare();
+      expect(result.code).toBe(2);
+      expect(result.stderr).toMatch(/Node.*(?:99|98)/);
+      expect(existsSync(join(f.root, 'installs.log'))).toBe(false);
+      expect(json(join(dirname(f.prepared), 'manifest.json')).error.code).toBe('DEPENDENCY_ENVIRONMENT_NOT_READY');
+    }
+  });
   it.each(['intact', 'dangling'] as const)('switches development to a matching external dependency environment without mutating the original shared target: %s', async mode => {
     const f = fixture();
     write(join(f.repo, 'package.json'), { dependencies: { fixture: '1.0.0' } });
@@ -260,7 +435,7 @@ describe('authored development-review preset', () => {
     expect(json(join(implemented, 'validation.json')).checks[0].exitCode).toBe(0);
     expect(f.git(f.worktree, 'status', '--porcelain')).toBe('');
   });
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
