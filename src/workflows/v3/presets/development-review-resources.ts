@@ -227,8 +227,62 @@ function dependencyFailure(message) {
   error.code = 'DEPENDENCY_ENVIRONMENT_NOT_READY';
   throw error;
 }
+// Select a project interpreter without changing the worker/daemon runtime or
+// invoking version-manager shell hooks. Only already installed binaries qualify.
+function projectRuntime(root, preferred) {
+  const env = { ...process.env }, pins = [];
+  for (const file of ['.nvmrc', '.node-version']) {
+    if (!fs.existsSync(path.join(root, file))) continue;
+    const value = fs.readFileSync(regular(root, file), 'utf8').trim();
+    if (!/^v?\d+(?:\.\d+){0,2}$/.test(value)) dependencyFailure('Unsupported Node pin in ' + file + ': ' + value + '; use a numeric installed version');
+    pins.push({ file, value, parts: value.replace(/^v/, '').split('.') });
+  }
+  if (!pins.length) return { env, node: null };
+  const matches = value => /^v\d+\.\d+\.\d+$/.test(value) && pins.every(pin =>
+    pin.parts.every((part, index) => part === value.slice(1).split('.')[index]));
+  const requested = pins.map(pin => pin.file + '=' + pin.value).join(', ');
+  const candidates = [preferred?.execPath, 'node'];
+  const executable = process.platform === 'win32' ? 'node.exe' : 'node';
+  for (const directory of (env.PATH || '').split(path.delimiter).filter(Boolean)) candidates.push(path.join(directory, executable));
+  let observed = 'unavailable';
+  function select(commands) {
+    for (const command of new Set(commands.filter(Boolean))) {
+      const result = spawnSync(command, ['-p', 'JSON.stringify({version:process.version,execPath:process.execPath})'],
+        { cwd: root, env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536, shell: false });
+      if (result.error || result.status !== 0) continue;
+      let node;
+      try { node = JSON.parse(result.stdout.trim()); } catch { continue; }
+      if (command === 'node') observed = node.version;
+      if (!object(node) || typeof node.version !== 'string' || !matches(node.version) || !path.isAbsolute(node.execPath || '')) continue;
+      env.PATH = path.dirname(node.execPath) + path.delimiter + (env.PATH || '');
+      return { env, node: { version: node.version, execPath: node.execPath } };
+    }
+  }
+  const onPath = select(candidates);
+  if (onPath) return onPath;
+  const pathCandidateCount = candidates.length;
+  const home = env.HOME || env.USERPROFILE;
+  const stores = [
+    [env.FNM_DIR || (home && path.join(env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'fnm')), 'node-versions', 'installation', 'bin'],
+    [env.NVM_DIR || (home && path.join(home, '.nvm')), 'versions', 'node'],
+  ];
+  for (const [base, ...parts] of stores) {
+    if (!base) continue;
+    const fnm = parts[0] === 'node-versions', store = path.join(base, ...(fnm ? parts.slice(0, 1) : parts));
+    let versions;
+    try { versions = fs.readdirSync(store); }
+    catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') continue; throw error; }
+    for (const value of versions.filter(matches).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))) {
+      candidates.push(path.join(store, value, ...(fnm ? ['installation', 'bin'] : ['bin']), executable));
+    }
+  }
+  const installed = select(candidates.slice(pathCandidateCount));
+  if (installed) return installed;
+  dependencyFailure('Node runtime unavailable: required ' + requested + '; current PATH Node ' + observed +
+    '. Install the requested Node in the configured fnm/nvm store or expose it on PATH, then retry; no dependencies were installed.');
+}
 function dependencyInputs(worktree) {
-  return git(worktree, ['ls-files', '-z']).split('\0').filter(file => /(^|\/)(package\.json|bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|\.npmrc|\.yarnrc\.yml)$/.test(file)).sort();
+  return git(worktree, ['ls-files', '-z']).split('\0').filter(file => /(^|\/)(package\.json|bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|yarn\.lock|\.npmrc|\.yarnrc\.yml|\.nvmrc|\.node-version)$/.test(file)).sort();
 }
 function dependencyDigest(root, files) { return sha(Buffer.from(JSON.stringify(files.map(file => [file, digest(path.join(root, file))])))); }
 function workspaceDigest(root, files) {
@@ -294,20 +348,44 @@ function installCommand(root) {
   if (has('yarn.lock')) return has('.yarnrc.yml') ? ['yarn', 'install', '--immutable'] : ['yarn', 'install', '--frozen-lockfile'];
   throw new Error('frozen root dependency lockfile required');
 }
+function checkPackageManager(root, runtime, command) {
+  const filename = path.join(root, 'package.json');
+  if (!fs.existsSync(filename)) return;
+  const pkg = read(filename);
+  if (typeof pkg.packageManager !== 'string') return;
+  const pin = /^(npm|pnpm|yarn|bun)@(\d+\.\d+\.\d+)(?:\+sha\d+\..+)?$/.exec(pkg.packageManager);
+  if (!pin || (command && pin[1] !== command)) dependencyFailure('packageManager does not match the frozen lockfile: ' + pkg.packageManager);
+  const actual = spawnSync(pin[1], ['--version'], { cwd: root, env: runtime.env, encoding: 'utf8', timeout: 10000, shell: false });
+  if (actual.error || actual.status !== 0 || actual.stdout.trim() !== pin[2])
+    dependencyFailure('Package manager mismatch: required ' + pkg.packageManager + '; use its installed Corepack shim or matching executable before retrying');
+}
 // Runs the frozen install in root with the root lifecycle hooks removed, then
 // restores the manifest bytes.
-function frozenInstall(root, log) {
+function frozenInstall(root, log, runtime, rebuild = false) {
   const manifest = path.join(root, 'package.json'), original = fs.readFileSync(manifest), pkg = JSON.parse(original.toString('utf8'));
   if (object(pkg.scripts)) for (const hook of ROOT_LIFECYCLE) delete pkg.scripts[hook];
   const [command, ...argv] = installCommand(root);
-  let result;
+  checkPackageManager(root, runtime, command);
+  const steps = [argv];
+  if (rebuild && command === 'yarn' && fs.existsSync(path.join(root, '.yarnrc.yml'))) steps.push(['rebuild']);
+  else if (rebuild && (command === 'pnpm' || command === 'bun' || command === 'yarn')) argv.push('--force');
+  // npm ci already removes the old modules. Other managers can retain native
+  // build output across frozen installs, so an unknown/changed Node needs rebuild.
+  let result, executed;
+  const deadline = Date.now() + 30 * 60 * 1000;
+  const output = runtime.node ? ['Node ' + runtime.node.version + ' (' + runtime.node.execPath + ')'] : [];
   try {
     fs.writeFileSync(manifest, JSON.stringify(pkg, null, 2) + '\n');
-    result = spawnSync(command, argv, { cwd: root, encoding: 'utf8', timeout: 30 * 60 * 1000, maxBuffer: 64 * 1024 * 1024, shell: false, env: { ...process.env, CI: '1' } });
+    for (const args of steps) {
+      executed = [command, ...args].join(' ');
+      result = spawnSync(command, args, { cwd: root, encoding: 'utf8', timeout: Math.max(1, deadline - Date.now()), maxBuffer: 64 * 1024 * 1024, shell: false, env: { ...runtime.env, CI: '1' } });
+      output.push(executed, result.stdout || '', result.stderr || '', result.error ? result.error.message : '');
+      if (result.error || result.status !== 0) break;
+    }
   } finally { fs.writeFileSync(manifest, original); }
   fs.mkdirSync(path.dirname(log), { recursive: true });
-  fs.writeFileSync(log, [command, ...argv].join(' ') + '\n' + (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : ''), { mode: 0o600 });
-  requireThat(result.status === 0, 'dependency install failed: ' + [command, ...argv].join(' ') +
+  fs.writeFileSync(log, output.join('\n'), { mode: 0o600 });
+  requireThat(result.status === 0, 'dependency install failed: ' + executed +
     (result.error ? ' (' + result.error.message + ')' : ' exited ' + result.status) + '; log ' + log);
 }
 function runDependencyDir() {
@@ -315,30 +393,47 @@ function runDependencyDir() {
   requireThat(attempt, 'attempt directory unavailable for a dependency install');
   return path.join(path.dirname(path.dirname(path.dirname(attempt))), 'dependencies');
 }
+function worktreeInstallState(worktree) {
+  const filename = path.join(runDependencyDir(), 'worktree-state-' + sha(Buffer.from(path.resolve(worktree))).slice(7, 39) + '.json');
+  let installed;
+  try { installed = read(filename); } catch { /* Interrupted/legacy installs have no verified current state. */ }
+  return { filename, installed };
+}
+function currentWorktreeInstall(worktree, dependencies) {
+  const { installed } = worktreeInstallState(worktree);
+  return installed?.inputsSha256 === dependencies.inputsSha256 && JSON.stringify(installed.runtime) === JSON.stringify(dependencies.runtime);
+}
 // Workspace links must resolve to the task's own package directories, which an
 // out-of-tree snapshot cannot give (pnpm keeps each package's dependencies in
 // that package's node_modules). Install into the task-owned worktree instead,
 // never through a link into another environment.
-function installWorktreeDependencies(worktree, files, names) {
+function installWorktreeDependencies(worktree, files, names, runtime) {
   requireThat(files.includes('package.json') && files.some(file => /(^|\/)(bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(file)), 'frozen dependency lockfile required');
   const inputsSha256 = dependencyDigest(worktree, files), target = path.join(worktree, 'node_modules');
   const existing = fs.lstatSync(target, { throwIfNoEntry: false });
   if (existing?.isSymbolicLink()) fs.unlinkSync(target);
   else requireThat(!existing || existing.isDirectory(), 'task node_modules is not a directory');
-  frozenInstall(worktree, path.join(runDependencyDir(), 'worktree-' + inputsSha256.slice(7, 39) + '.install.log'));
+  const log = path.join(runDependencyDir(), 'worktree-' + inputsSha256.slice(7, 39) + '.install.log');
+  const { filename: stamp, installed } = worktreeInstallState(worktree);
+  const rebuild = !!runtime.node && !!existing?.isDirectory() && JSON.stringify(installed?.runtime) !== JSON.stringify(runtime.node);
+  // This describes the current modules, not a cache keyed by a past manifest.
+  // Invalidate before mutations so interrupted installs and A -> B -> A retries rebuild.
+  fs.rmSync(stamp, { force: true });
+  frozenInstall(worktree, log, runtime, rebuild);
   requireThat(!git(worktree, ['status', '--porcelain']), 'dependency install changed the task checkout; repository rules must ignore node_modules');
   requireThat(fs.lstatSync(target).isDirectory(), 'dependency install produced no node_modules');
   const modules = fs.realpathSync(target);
   checkInstalledPackages(modules, names);
-  return { state: 'ready', mode: 'worktree', source: fs.realpathSync(worktree), inputsSha256, files, modules, names };
+  atomic(stamp, { inputsSha256, runtime: runtime.node });
+  return { state: 'ready', mode: 'worktree', source: fs.realpathSync(worktree), inputsSha256, files, modules, names, runtime: runtime.node };
 }
 // Build a run-owned environment outside the repository/worktree from the task
 // checkout's exact manifest and lockfile bytes (the whole tracked snapshot for
 // workspaces), using the lockfile without updating it. Never writes the worktree.
-function installIsolatedDependencies(worktree, files, inputsSha256, hasWorkspaces) {
+function installIsolatedDependencies(worktree, files, inputsSha256, hasWorkspaces, runtime) {
   const parent = runDependencyDir();
   const copied = hasWorkspaces ? git(worktree, ['ls-files', '-z']).split('\0').filter(Boolean).sort() : files;
-  const key = sha(Buffer.from(JSON.stringify([inputsSha256, hasWorkspaces ? workspaceDigest(worktree, copied) : null]))).slice(7, 39);
+  const key = sha(Buffer.from(JSON.stringify([inputsSha256, hasWorkspaces ? workspaceDigest(worktree, copied) : null, runtime.node]))).slice(7, 39);
   const root = path.join(parent, key), ready = root + '.ready';
   if (fs.existsSync(ready) && fs.existsSync(path.join(root, 'node_modules'))) return root;
   fs.rmSync(ready, { force: true }); fs.rmSync(root, { recursive: true, force: true });
@@ -349,21 +444,22 @@ function installIsolatedDependencies(worktree, files, inputsSha256, hasWorkspace
     if (stat.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(from), to);
     else { requireThat(stat.isFile(), 'workspace snapshot contains an unsupported entry'); fs.copyFileSync(from, to); }
   }
-  frozenInstall(root, root + '.install.log');
+  frozenInstall(root, root + '.install.log', runtime);
   fs.writeFileSync(ready, inputsSha256 + '\n');
   return root;
 }
 // allowInstall: when the approved source cannot be reused, prepare its own
 // isolated environment instead of trusting a hand-made snapshot.
 function prepareDependencies(worktree, repository, checked, replaceTaskLink = false, allowInstall = false) {
-  if (!fs.existsSync(path.join(worktree, 'package.json'))) return { state: 'not-required' };
+  const runtime = projectRuntime(worktree);
+  if (!fs.existsSync(path.join(worktree, 'package.json'))) return { state: 'not-required', runtime: runtime.node };
   const pkg = read(path.join(worktree, 'package.json'));
   const hasWorkspaces = !!pkg.workspaces || fs.existsSync(path.join(worktree, 'pnpm-workspace.yaml'));
   const required = Object.entries({ ...pkg.dependencies, ...pkg.devDependencies }).filter(([, spec]) => !String(spec).startsWith('workspace:'));
-  if (!required.length && !hasWorkspaces) return { state: 'not-required' };
+  if (!required.length && !hasWorkspaces) return { state: 'not-required', runtime: runtime.node };
   const files = dependencyInputs(worktree), names = required.map(([name]) => name);
   if (hasWorkspaces && allowInstall && checked.dependencyWorktreeInstallAllowed !== false) {
-    try { return installWorktreeDependencies(worktree, files, names); } catch (error) { dependencyFailure(error.message); }
+    try { return installWorktreeDependencies(worktree, files, names, runtime); } catch (error) { dependencyFailure(error.message); }
   }
   const use = candidate => {
     const source = fs.realpathSync(candidate);
@@ -382,24 +478,31 @@ function prepareDependencies(worktree, repository, checked, replaceTaskLink = fa
       checkWorkspaceLinks(worktree, source, modules, files);
       workspace = { sha256: snapshotSha256 };
     }
-    return { state: 'ready', source, inputsSha256, files, modules, names, ...(workspace ? { workspace } : {}) };
+    return { state: 'ready', source, inputsSha256, files, modules, names, runtime: runtime.node, ...(workspace ? { workspace } : {}) };
   };
   let prepared;
   try {
     let reuseError;
-    if (checked.dependencyReuseAllowed === true) {
+    // A foreign node_modules has no evidence of the interpreter that built its
+    // native addons. Pinned projects get a run-owned install keyed by runtime.
+    if (checked.dependencyReuseAllowed === true && !runtime.node) {
       try { prepared = use(checked.dependencySourcePath || repository); } catch (error) { reuseError = error; }
     }
     if (!prepared) {
       requireThat(allowInstall, reuseError ? reuseError.message : 'preflight must approve dependency reuse under repository rules');
-      prepared = use(installIsolatedDependencies(worktree, files, dependencyDigest(worktree, files), hasWorkspaces));
+      prepared = use(installIsolatedDependencies(worktree, files, dependencyDigest(worktree, files), hasWorkspaces, runtime));
       if (reuseError) prepared.reuseRejected = reuseError.message;
     }
     const { modules } = prepared, target = path.join(worktree, 'node_modules');
     // An explicit record --dependency-source can detach this clean task's
     // dependency link, including one prepared in an earlier development round.
     // Never remove a directory or write into the link's shared target.
-    if (replaceTaskLink && fs.lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()
+    const taskLink = fs.lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink();
+    // Runtime changes produce another run-owned cache. A pristine prepare retry
+    // may rebind only its own cache link; the old environment is left untouched.
+    const ownCacheLink = taskLink && allowInstall && /^[a-f0-9]{32}\/node_modules$/.test(
+      path.relative(runDependencyDir(), path.resolve(path.dirname(target), fs.readlinkSync(target))).split(path.sep).join('/'));
+    if ((replaceTaskLink || ownCacheLink) && taskLink
       && (!fs.existsSync(target) || fs.realpathSync(target) !== modules)) fs.unlinkSync(target);
     if (fs.existsSync(target) || fs.lstatSync(target, { throwIfNoEntry: false })) {
       requireThat(fs.realpathSync(target) === modules, 'task dependencies already point to a different environment');
@@ -409,6 +512,10 @@ function prepareDependencies(worktree, repository, checked, replaceTaskLink = fa
   } catch (error) { dependencyFailure(error.message); }
 }
 function checkDependencies(context, dependencies = context.dependencies) {
+  const runtime = projectRuntime(context.worktree, dependencies?.runtime);
+  checkPackageManager(context.worktree, runtime);
+  if (JSON.stringify(runtime.node) !== JSON.stringify(dependencies?.runtime || null))
+    dependencyFailure('Node runtime changed since dependency preparation; prepare dependencies again before validation');
   if (dependencies?.state !== 'ready') {
     if (fs.existsSync(path.join(context.worktree, 'package.json'))) {
       const pkg = read(path.join(context.worktree, 'package.json'));
@@ -416,7 +523,7 @@ function checkDependencies(context, dependencies = context.dependencies) {
         dependencyFailure('prepare a matching dependency source and pass record --dependency-source before validation');
       }
     }
-    return;
+    return runtime;
   }
   const { source, files, inputsSha256, modules } = dependencies;
   if (dependencies.mode === 'worktree') {
@@ -424,10 +531,11 @@ function checkDependencies(context, dependencies = context.dependencies) {
       const target = path.join(context.worktree, 'node_modules');
       requireThat(dependencyDigest(context.worktree, dependencyInputs(context.worktree)) === inputsSha256 && source === fs.realpathSync(context.worktree),
         'dependency inputs changed; record reinstalls them in the task worktree');
+      requireThat(currentWorktreeInstall(context.worktree, dependencies), 'task dependency installation changed; record must prepare it again before validation');
       requireThat(fs.lstatSync(target).isDirectory() && fs.realpathSync(target) === modules, 'prepared dependencies are unavailable');
       checkInstalledPackages(modules, dependencies.names);
     } catch (error) { dependencyFailure(error.message); }
-    return;
+    return runtime;
   }
   try {
     requireThat(dependencyDigest(context.worktree, dependencyInputs(context.worktree)) === inputsSha256 && dependencyDigest(source, files) === inputsSha256,
@@ -444,6 +552,7 @@ function checkDependencies(context, dependencies = context.dependencies) {
       checkWorkspaceLinks(context.worktree, source, modules, dependencyInputs(context.worktree));
     }
   } catch (error) { dependencyFailure(error.message); }
+  return runtime;
 }
 function prepare(args) {
   const output = process.env.BOTMUX_GOAL_OUTPUT_DIR;
@@ -604,10 +713,21 @@ function failForTimeout(error, entries) {
     error: { code: 'VALIDATION_TIMEOUT', message: error.message, retryable: false } });
 }
 function runChecks(context, output, prefix, dependencies = context.dependencies) {
-  checkDependencies(context, dependencies);
+  const runtime = checkDependencies(context, dependencies);
   return plan(context.validationCommands).map(command => {
+    // An explicit interpreter bypasses PATH. Preserve caller argv, but never
+    // certify checks run against a different Node than the installed addons.
+    if (runtime.node && path.isAbsolute(command.argv[0])) {
+      let executable = command.argv[0];
+      try { executable = fs.realpathSync(executable); } catch { /* Normal spawn failure is recorded below. */ }
+      if (/^node(?:\.exe)?$/i.test(path.basename(executable)) || /^node(?:\.exe)?$/i.test(path.basename(command.argv[0]))) {
+        const actual = spawnSync(command.argv[0], ['--version'], { env: runtime.env, encoding: 'utf8', timeout: 10000, shell: false });
+        if (actual.error || actual.status !== 0 || actual.stdout.trim() !== runtime.node.version)
+          dependencyFailure('Explicit Node validation command does not match prepared ' + runtime.node.version + ': ' + command.argv[0]);
+      }
+    }
     const startedAtMs = Date.now(), before = git(context.worktree, ['rev-parse', 'HEAD']);
-    const result = spawnSync(command.argv[0], command.argv.slice(1), { cwd: context.worktree, encoding: 'utf8', timeout: command.timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024, shell: false });
+    const result = spawnSync(command.argv[0], command.argv.slice(1), { cwd: context.worktree, env: runtime.env, encoding: 'utf8', timeout: command.timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024, shell: false });
     const logfile = prefix + command.id + '.log';
     // A command stopped by its own budget has not failed a check; record that explicitly so
     // the gate reports an undersized budget instead of a failure there is nothing to fix for.
@@ -629,7 +749,7 @@ function record(args) {
   requireThat(git(context.worktree, ['rev-parse', 'HEAD']) === candidate.headSha && !git(context.worktree, ['status', '--porcelain']), 'candidate must be the clean live HEAD');
   let dependencies = context.dependencies;
   if (dependencies?.mode === 'worktree') {
-    if (dependencyDigest(context.worktree, dependencyInputs(context.worktree)) !== dependencies.inputsSha256) {
+    if (dependencyDigest(context.worktree, dependencyInputs(context.worktree)) !== dependencies.inputsSha256 || !currentWorktreeInstall(context.worktree, dependencies)) {
       requireThat(context.mode !== 'review', 'review mode must use its prepared dependencies');
       dependencies = prepareDependencies(context.worktree, context.repo, {}, false, true);
     }
