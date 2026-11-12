@@ -326,7 +326,7 @@ export interface RunNodeResult {
   runtime?: RuntimeAttestation;
   /** Precise infrastructure failure. A worker may still leave a valid
    * manifest behind, so this channel takes precedence when status=fail. */
-  error?: { code: string; message: string };
+  error?: { code: string; message: string; /** Explicitly allow human recovery; never authorizes automatic replay. */ retryable?: boolean };
   /** Process failure context used when no valid manifest was written. */
   failureDetail?: string;
   /** True only when the pool proves no goal was sent. A failed IPC send is

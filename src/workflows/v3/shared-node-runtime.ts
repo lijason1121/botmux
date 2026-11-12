@@ -3681,6 +3681,7 @@ export async function runWorkflow(
         }
         const kind = selfReportedFail && retryable === false ? 'failed'
           : failure ? (failure.recoverable ? 'blocked' : 'failed')
+          : result.status === 'fail' && result.error?.retryable === true ? 'blocked'
           : classifyTerminal(errorClass, { selfReportedFail, retryable });
         if (kind === 'blocked') {
           // Runtime human-ask: a self-reported block carrying ASK_HUMAN_ERROR_CODE

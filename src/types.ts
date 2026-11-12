@@ -2764,7 +2764,10 @@ export type WorkerToDaemonBase =
         | 'structured_turn_not_collected'
         /** Claude's own permission dialog seen on screen (claudeActionPrompt). The
          *  daemon drops it while the PermissionRequest hook's card is pending. */
-        | 'claude_permission_prompt';
+        | 'claude_permission_prompt'
+        /** Authoritative startup dialog before the CLI was ever input-ready. */
+        | 'cli_startup_blocked';
+      startupBlocker?: Pick<import('./core/cli-startup-blocker.js').CliStartupBlocker, 'kind' | 'rule'>;
       /** Bounded plain-text bottom of the screen for an input_not_submitted
        *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
        *  the notice as a card with this text; absent = plain text as before. */
