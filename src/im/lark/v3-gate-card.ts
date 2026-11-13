@@ -13,7 +13,7 @@ import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
 import { DEFAULT_HUMAN_GATE_OPTIONS } from '../../workflows/v3/dag.js';
 import { splitV3HostGatePrompt } from '../../workflows/v3/host-bindings.js';
 import { splitV3GateContext } from '../../workflows/v3/gate-context.js';
-import { short, truncate, escapeMd } from './v3-card-common.js';
+import { short, truncate } from './v3-card-common.js';
 
 export const V3_GATE_APPROVE_ACTION = 'v3_gate_approve';
 export const V3_GATE_REJECT_ACTION = 'v3_gate_reject';
@@ -85,14 +85,6 @@ export function buildV3GateCard(input: V3GateCardInput): string {
     : 'blue';
 
   const elements: Array<Record<string, unknown>> = [
-    {
-      tag: 'div',
-      fields: [
-        { is_short: true, text: { tag: 'lark_md', content: `**Run**\n${escapeMd(short(input.runId, 24))}` } },
-        { is_short: true, text: { tag: 'lark_md', content: `**节点**\n${escapeMd(input.nodeId)}` } },
-      ],
-    },
-    { tag: 'hr' },
     {
       tag: 'div',
       text: { tag: 'lark_md', content: '**审批内容**' },
@@ -205,9 +197,20 @@ function publicationContextElements(text: string, sha256?: string): Array<Record
       text: { tag: 'plain_text', content: `${label}\n${value}` },
     })),
   });
+  let prUrl: string | undefined;
+  try {
+    const url = new URL(values[2]!);
+    if (url.protocol === 'https:' && !url.username && !url.password) prUrl = url.href;
+  } catch { /* A new PR has no URL yet; preserve its text without a link. */ }
   return [
     plain(`本次操作：${values[1]}`),
     fields([['仓库', values[0]!], ['PR/MR', values[2]!]]),
+    ...(prUrl ? [{
+      tag: 'action', actions: [{
+        tag: 'button', type: 'default', text: { tag: 'plain_text', content: '打开 PR/MR' },
+        multi_url: { url: prUrl, pc_url: prUrl, android_url: prUrl, ios_url: prUrl },
+      }],
+    }] : []),
     plain(`分支：${values[3]}`),
     fields([['提交（完整 SHA 见明细）', values[5]!.slice(0, 12)], ['推送远端', values[4]!]]),
     ...warnings.map(plain),
