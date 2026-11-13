@@ -190,6 +190,10 @@ describe('v3-gate-card — buildV3GateCard', () => {
     expect(link.multi_url.pc_url).toBe(link.multi_url.url);
     expect(link.multi_url.android_url).toBe(link.multi_url.url);
     expect(link.multi_url.ios_url).toBe(link.multi_url.url);
+    const visibleText = (nodes: any[]): string => nodes.map(node =>
+      node.tag === 'collapsible_panel' ? '' :
+        [node.text?.content ?? '', ...(node.fields ?? []).map((field: any) => field.text?.content ?? '')].join('\n')).join('\n');
+    expect(visibleText(card.elements)).not.toContain(link.multi_url.url);
     expect(JSON.stringify(card)).toContain(`sha256:${'c'.repeat(64)}`);
     expect(buttonValues(card)).toEqual(buttonValues(parse(buildV3GateCard({ ...input, prompt: '批准发布？' }))));
   });
