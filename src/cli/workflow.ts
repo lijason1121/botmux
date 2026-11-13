@@ -148,7 +148,8 @@ Saved Workflow:
   create development-review [名称] --role developer=Bot --role correctness=Bot --role regression=Bot
   save [last|runId] [名称] [--workflow-id <chat-scope-id>]
   run <名称|workflowId> [--param key=value ...] [--param-json key=<json> ...]
-  recover <失败或已取消的开发runId> [--role developer=Bot ...] [--run-id <新runId>]
+  recover <runId> [--publication-only | --role developer=Bot ...] [--run-id <新runId>]
+    --publication-only 仅对已成功发布、收尾失败的开发run做只读核验和报告，不重放发布
   list [--json]
   show <名称|workflowId>
 

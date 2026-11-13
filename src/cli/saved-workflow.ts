@@ -308,13 +308,17 @@ export async function cmdSavedWorkflow(sub: string, args: string[]): Promise<voi
     assertDaemonManagedRunBaseDir(baseDir);
     const { roleSelections } = collectSavedWorkflowRoleArgs(args, 'run');
     const [sourceRunId] = positionals(args, ['--library-dir', '--base-dir', '--run-id', '--role']);
-    if (!sourceRunId) throw new Error('用法: botmux workflow recover <失败或已取消的开发runId> [--role developer=Bot]');
-    const { recoverDevelopmentReviewRun } = await import('../workflows/v3/development-review-recovery.js');
-    const run = await recoverDevelopmentReviewRun({ dataDir, baseDir, sourceRunId, context, bots: loadBotConfigs(),
-      roleSelections, runId: argValue(args, '--run-id') });
+    if (!sourceRunId) throw new Error('用法: botmux workflow recover <runId> [--publication-only | --role developer=Bot]');
+    const publicationOnly = hasFlag(args, '--publication-only');
+    if (publicationOnly && Object.keys(roleSelections ?? {}).length) throw new Error('--publication-only 保留原开发与独立评审角色，不接受 --role');
+    const run = publicationOnly
+      ? await (await import('../workflows/v3/development-review-publication-recovery.js')).recoverDevelopmentReviewPublicationRun({
+        dataDir, baseDir, sourceRunId, context, bots: loadBotConfigs(), runId: argValue(args, '--run-id') })
+      : await (await import('../workflows/v3/development-review-recovery.js')).recoverDevelopmentReviewRun({
+        dataDir, baseDir, sourceRunId, context, bots: loadBotConfigs(), roleSelections, runId: argValue(args, '--run-id') });
     await startMaterializedRun(run.runId, context.actor.larkAppId);
     console.log(JSON.stringify({ runId: run.runId, sourceRunId, resolvedRoles: run.resolvedRoles,
-      notice: '恢复run的启动请求已提交；旧记录保留，审查与发布授权重新绑定。' }, null, 2));
+      notice: publicationOnly ? '只读收尾后继run的启动请求已提交；旧run保持不变，不重放推送或评论。' : '恢复run的启动请求已提交；旧记录保留，审查与发布授权重新绑定。' }, null, 2));
     return;
   }
 
