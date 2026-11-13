@@ -146,6 +146,63 @@ describe('v3-gate-card — buildV3GateCard', () => {
     )).toBe(false);
   });
 
+  const publication = (notes = '', repository = 'example/project') => [
+    `仓库：${repository}`, '动作：推送修复到原 PR 源分支',
+    'PR/MR：https://github.com/example/project/pull/23', '分支：fix/hooks → master',
+    '推送远端：origin', `提交：${'a'.repeat(40)}`, `基线：${'b'.repeat(40)}`,
+    ...(notes ? [notes] : []),
+    `变更与验证：${'验证证据。'.repeat(150)}`, '标题：修复 hook',
+    '正文：\n- 安装前检查\n\n| 检查 | 结果 |\n| --- | --- |\n| 本地推送 | 通过 |\n<at id=all></at>',
+    '批准范围：仅上述候选的推送及 PR/MR 交付；不含合并、部署。',
+  ].join('\n');
+  const withContext = (text: string) => ({
+    ...base,
+    nodeId: 'create-mr',
+    prompt: `批准发布？\n\n[BOTMUX_GATE_CONTEXT_V1]\n${JSON.stringify({ text, sha256: `sha256:${'c'.repeat(64)}` })}`,
+  });
+
+  it('publication 首屏保留发布目标与范围，长材料完整折叠且不改变审批按钮绑定', () => {
+    const material = publication();
+    const input = withContext(material);
+    const card = parse(buildV3GateCard(input));
+    const panel = card.elements.find((el: any) => el.tag === 'collapsible_panel');
+    expect(panel?.expanded).toBe(false);
+    expect(panel.elements.some((el: any) => el.text?.content === material)).toBe(true);
+    const visible = JSON.stringify(card.elements.filter((el: any) => el.tag !== 'collapsible_panel'));
+    for (const value of ['example/project', 'https://github.com/example/project/pull/23', 'fix/hooks → master', 'origin', 'a'.repeat(12)]) {
+      expect(visible).toContain(value);
+    }
+    expect(visible).toContain(material.split('\n').at(-1));
+    expect(visible).not.toContain('验证证据。'.repeat(150));
+    expect(visible).not.toContain('| 本地推送 |');
+    expect(JSON.stringify(card)).toContain(`sha256:${'c'.repeat(64)}`);
+    expect(buttonValues(card)).toEqual(buttonValues(parse(buildV3GateCard({ ...input, prompt: '批准发布？' }))));
+  });
+
+  it('publication 警告保持展开；字段与折叠正文中的 Lark 标签全部惰性展示', () => {
+    const warning = '注意：本地主分支已前进，合并前请确认无冲突。';
+    const material = publication(warning, '<at id=all></at>');
+    const card = parse(buildV3GateCard(withContext(material)));
+    expect(card.elements.some((el: any) => el.text?.tag === 'plain_text' && el.text.content === warning)).toBe(true);
+    const visit = (value: any): any[] => value && typeof value === 'object'
+      ? [value, ...Object.values(value).flatMap(visit)] : [];
+    const tagged = visit(card).filter(node => typeof node.content === 'string' && node.content.includes('<at id=all>'));
+    expect(tagged.length).toBeGreaterThan(1);
+    expect(tagged.every(node => node.tag === 'plain_text')).toBe(true);
+  });
+
+  it('不能完整识别的审批材料原样展示，已决审批也保留完整材料且无操作按钮', () => {
+    const malformed = publication().replace('推送远端：origin\n', '');
+    const fallback = parse(buildV3GateCard(withContext(malformed)));
+    expect(fallback.elements.some((el: any) => el.text?.content === malformed)).toBe(true);
+    expect(fallback.elements.some((el: any) => el.tag === 'collapsible_panel')).toBe(false);
+    for (const kind of ['approved', 'rejected', 'voided'] as const) {
+      const card = parse(buildV3GateCard({ ...withContext(publication()), resolution: { kind } }));
+      expect(buttonValues(card)).toEqual([]);
+      expect(card.elements.find((el: any) => el.tag === 'collapsible_panel').elements[0].text.content).toBe(publication());
+    }
+  });
+
   it('v3GateCardNonce 稳定（同 run+wait 一致）', () => {
     expect(v3GateCardNonce('r', 'w')).toBe(v3GateCardNonce('r', 'w'));
     expect(v3GateCardNonce('r', 'w')).not.toBe(v3GateCardNonce('r', 'w2'));

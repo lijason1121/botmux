@@ -107,8 +107,7 @@ export function buildV3GateCard(input: V3GateCardInput): string {
   ];
 
   if (context.text) {
-    elements.push({ tag: 'div', text: { tag: 'plain_text', content: context.text } });
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: `审批材料摘要：${context.sha256}` }] });
+    elements.push(...publicationContextElements(context.text, context.sha256));
   }
 
   if (input.hostApproval) {
@@ -174,6 +173,55 @@ export function buildV3GateCard(input: V3GateCardInput): string {
     header: { template, title: { tag: 'plain_text', content: title } },
     elements,
   });
+}
+
+/** Older runs already pin a plain-text publication plan. Structure only its
+ * fixed preamble; never infer boundaries inside arbitrary summary/body prose.
+ * Keep the exact complete material in the panel and unknown formats unchanged. */
+function publicationContextElements(text: string, sha256?: string): Array<Record<string, unknown>> {
+  const plain = (content: string): Record<string, unknown> => ({
+    tag: 'div', text: { tag: 'plain_text', content },
+  });
+  const labels = ['仓库', '动作', 'PR/MR', '分支', '推送远端', '提交', '基线'];
+  const digestNote = { tag: 'note', elements: [{ tag: 'plain_text', content: `审批材料摘要：${sha256}` }] };
+  const lines = text.split('\n');
+  const values = lines.slice(0, labels.length).map((line, i) =>
+    line.startsWith(`${labels[i]}：`) ? line.slice(labels[i]!.length + 1) : '');
+  const scope = lines.at(-1)!;
+  const details = lines.slice(labels.length, -1);
+  const warnings: string[] = [];
+  while (details[0]?.startsWith('注意：')) warnings.push(details.shift()!);
+  if (values.length !== labels.length || values.some(value => !value.trim()) ||
+      !/^[a-f0-9]{40}$/.test(values[5]!) || !/^[a-f0-9]{40}$/.test(values[6]!) ||
+      !details[0]?.startsWith('变更与验证：') ||
+      !['批准范围：仅上述候选的推送及 PR/MR 交付；不含合并、部署。',
+        '批准范围：仅上述评论发布；不含合并、部署。'].includes(scope)) return [plain(text), digestNote];
+
+  const fields = (entries: Array<[string, string]>): Record<string, unknown> => ({
+    tag: 'div',
+    fields: entries.map(([label, value]) => ({
+      is_short: true,
+      // Dynamic values remain plain_text, including inside native fields.
+      text: { tag: 'plain_text', content: `${label}\n${value}` },
+    })),
+  });
+  return [
+    plain(`本次操作：${values[1]}`),
+    fields([['仓库', values[0]!], ['PR/MR', values[2]!]]),
+    plain(`分支：${values[3]}`),
+    fields([['提交（完整 SHA 见明细）', values[5]!.slice(0, 12)], ['推送远端', values[4]!]]),
+    ...warnings.map(plain),
+    {
+      tag: 'collapsible_panel', expanded: false,
+      header: {
+        title: { tag: 'plain_text', content: '查看改动、验证与完整发布内容' },
+        icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+        icon_position: 'right', icon_expanded_angle: -180,
+      },
+      elements: [plain(text), digestNote],
+    },
+    plain(scope),
+  ];
 }
 
 function actionValue(
