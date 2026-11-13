@@ -41,6 +41,14 @@ describe('v3-gate-card — buildV3GateCard', () => {
     expect(reject).toMatchObject({ action: V3_GATE_REJECT_ACTION, runId: base.runId, waitId: base.waitId, selected: 'reject' });
   });
 
+  it('不展示冗余的 Run/节点字段，审批回调仍绑定同一个 run 和节点', () => {
+    const card = parse(buildV3GateCard(base));
+    const body = JSON.stringify(card.elements.filter((el: any) => el.tag !== 'action'));
+    expect(body).not.toContain(base.runId);
+    expect(body).not.toContain(base.nodeId);
+    expect(buttonValues(card).every(value => value.runId === base.runId && value.nodeId === base.nodeId)).toBe(true);
+  });
+
   it('custom options：每个 option 渲染按钮，approveOptions 映射 primary/approve action', () => {
     const card = parse(buildV3GateCard({
       ...base,
@@ -175,8 +183,25 @@ describe('v3-gate-card — buildV3GateCard', () => {
     expect(visible).toContain(material.split('\n').at(-1));
     expect(visible).not.toContain('验证证据。'.repeat(150));
     expect(visible).not.toContain('| 本地推送 |');
+    const link = card.elements.flatMap((el: any) => el.actions ?? []).find((a: any) =>
+      a.multi_url?.url === 'https://github.com/example/project/pull/23');
+    expect(link?.tag).toBe('button');
+    expect(link.value).toBeUndefined();
+    expect(link.multi_url.pc_url).toBe(link.multi_url.url);
+    expect(link.multi_url.android_url).toBe(link.multi_url.url);
+    expect(link.multi_url.ios_url).toBe(link.multi_url.url);
     expect(JSON.stringify(card)).toContain(`sha256:${'c'.repeat(64)}`);
     expect(buttonValues(card)).toEqual(buttonValues(parse(buildV3GateCard({ ...input, prompt: '批准发布？' }))));
+  });
+
+  it('只有有效 HTTPS PR/MR 地址生成跳转按钮，新建目标和不安全地址保留原文', () => {
+    for (const destination of ['新建', 'javascript:alert(1)', 'https://user:password@example.invalid/pr/1', 'not a URL']) {
+      const material = publication().replace('https://github.com/example/project/pull/23', destination);
+      const card = parse(buildV3GateCard(withContext(material)));
+      const urls = card.elements.flatMap((el: any) => el.actions ?? []).filter((a: any) => a.multi_url);
+      expect(urls).toHaveLength(1); // Only the existing Web detail link.
+      expect(JSON.stringify(card)).toContain(destination);
+    }
   });
 
   it('publication 警告保持展开；字段与折叠正文中的 Lark 标签全部惰性展示', () => {
