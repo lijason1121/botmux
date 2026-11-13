@@ -204,7 +204,7 @@ function publicationContextElements(text: string, sha256?: string): Array<Record
   } catch { /* A new PR has no URL yet; preserve its text without a link. */ }
   return [
     plain(`本次操作：${values[1]}`),
-    fields([['仓库', values[0]!], ['PR/MR', values[2]!]]),
+    ...(prUrl ? [plain(`仓库：${values[0]}`)] : [fields([['仓库', values[0]!], ['PR/MR', values[2]!]])]),
     ...(prUrl ? [{
       tag: 'action', actions: [{
         tag: 'button', type: 'default', text: { tag: 'plain_text', content: '打开 PR/MR' },
