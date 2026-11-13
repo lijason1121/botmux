@@ -12,7 +12,8 @@ import { readAndValidateManifest } from '../src/workflows/v3/manifest.js';
 import { createPresetSavedWorkflow } from '../src/workflows/v3/preset-service.js';
 import { instantiatePublishedSavedWorkflow } from '../src/workflows/v3/library-service.js';
 import { runWorkflow } from '../src/workflows/v3/runtime.js';
-import { readJournal } from '../src/workflows/v3/journal.js';
+import { appendEvent, readJournal } from '../src/workflows/v3/journal.js';
+import { resolveWait } from '../src/workflows/v3/gate-wait-store.js';
 import { compileSavedWorkflowFromRun } from '../src/workflows/v3/library-materialize.js';
 import { projectV3Progress } from '../src/workflows/v3/progress-projection.js';
 
@@ -24,7 +25,7 @@ const validateManifest: ValidateManifest = async (path, outputDir) => {
   catch (error) { return { ok: false, problems: [String(error)] }; }
 };
 
-async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direct', sharedReviewer = false) {
+async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direct' | 'publish' | 'publication-failed', sharedReviewer = false) {
   const context = { actor: { larkAppId: 'cli_dev', openId: 'ou_owner' }, chatId: 'oc_fixture' };
   const bots = [
     { larkAppId: 'cli_dev', cliId: 'codex', workingDir: root },
@@ -53,6 +54,11 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direc
         error: { code: 'AUTH_REQUIRED', message: 'Fixture authentication missing', retryable: true }, files: [] }));
       return { status: 'ok', manifestPath };
     }
+    if (mode === 'publication-failed' && req.node.id === 'verify-publication') {
+      writeFileSync(manifestPath, JSON.stringify({ schemaVersion: 1, status: 'fail', summary: 'Publication verification failed',
+        error: { code: 'PUBLICATION_VERIFICATION_FAILED', message: 'Fixture publication does not match the reviewed candidate', retryable: false }, files: [] }));
+      return { status: 'ok', manifestPath };
+    }
     const result = Object.fromEntries(Object.entries(req.node.resultSchema?.properties ?? {}).map(([key, field]) => [key,
       field.enum?.[0] ?? ({ string: 'fixture', number: 1, boolean: true, object: {}, array: [] }[field.type]),
     ]));
@@ -60,7 +66,8 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direc
       result.decision = mode === 'reject' || (mode === 'repair' && req.node.id.includes('.i001.')) ? 'changes_requested' : 'approve';
     }
     if (req.node.id.endsWith(`.${loop.exit.node}`)) {
-      result.passed = mode === 'unchanged' || mode === 'direct' || (mode === 'repair' && req.node.id.includes('.i002.'));
+      result.passed = mode === 'unchanged' || mode === 'direct' || mode === 'publish' || mode === 'publication-failed' ||
+        (mode === 'repair' && req.node.id.includes('.i002.'));
       result.unresolvedFindings = result.passed ? [] : [{ role: 'correctness', blocking: false,
         location: 'fixture.ts:1', impact: 'Redundant line', evidence: 'Duplicate assignment' }];
     }
@@ -82,11 +89,28 @@ async function fixture(mode: 'repair' | 'reject' | 'auth' | 'unchanged' | 'direc
     writeFileSync(manifestPath, JSON.stringify({ schemaVersion: 1, status: 'ok', summary: 'Fixture agent output', files }));
     return { status: 'ok', manifestPath };
   };
-  const outcome = await runWorkflow(run.dag, { runNode, validateManifest,
+  const drive = () => runWorkflow(run.dag, { runNode, validateManifest,
     resolveBotSnapshot: bot => run.botSnapshots.get(bot!)! }, { baseDir, gateMode: 'suspend',
     frozenBotSnapshots: run.botSnapshots, authorizedArtifacts: true,
     executionContext: { params: run.resolvedParams, context: run.resolvedContext as Record<string, string> } });
-  return { run, loop, gatedNode, calls, outcome, events: readJournal(join(run.runDir, 'journal.ndjson')) };
+  const outcome = await drive();
+  return { run, loop, gatedNode, calls, outcome, drive, events: readJournal(join(run.runDir, 'journal.ndjson')) };
+}
+
+async function approvePublication(f: Awaited<ReturnType<typeof fixture>>) {
+  expect(f.outcome.reason).toBe('awaitingGate');
+  expect(f.calls.some(call => ['create-mr', 'publish-direct', 'verify-publication', 'complete'].includes(call.id))).toBe(false);
+  if (f.outcome.reason !== 'awaitingGate') throw new Error('Expected a pending publication approval');
+  expect(f.outcome.pendingWaits).toHaveLength(1);
+  const pending = f.outcome.pendingWaits[0]!;
+  expect(pending.nodeId).toBe('create-mr');
+  // Persist the same wait transition and journal event consumed on daemon redrive.
+  const wait = resolveWait(f.run.runDir, pending.waitId, 'approved', 'ou_owner', 'approve');
+  appendEvent(join(f.run.runDir, 'journal.ndjson'), {
+    type: 'gateResolved', nodeId: pending.nodeId, instanceId: wait.instanceId,
+    waitId: pending.waitId, resolution: 'approved', by: 'ou_owner',
+  });
+  return f.drive();
 }
 
 describe('created development-review preset on the production runtime', () => {
@@ -136,6 +160,56 @@ describe('created development-review preset on the production runtime', () => {
     ]);
     expect(calls.filter(call => call.id.startsWith(`${loop.id}.`)).every(call =>
       call.inputs.inputs.some(input => input.from === 'prepare'))).toBe(true);
+  });
+
+  it('resumes an approved publication through independent verification and completion exactly once', async () => {
+    const f = await fixture('publish');
+    expect(await approvePublication(f)).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+    const events = readJournal(join(f.run.runDir, 'journal.ndjson'));
+    expect(f.calls.filter(call => !call.id.startsWith('development-review-loop.')).map(call => call.id))
+      .toEqual(['preflight', 'prepare', 'prepare-mr', 'check-delivery', 'create-mr', 'verify-publication', 'complete']);
+    const publisher = f.calls.find(call => call.id === 'create-mr')!;
+    const verifier = f.calls.find(call => call.id === 'verify-publication')!;
+    const complete = f.calls.find(call => call.id === 'complete')!;
+    expect(publisher.bot).toBe(f.run.resolvedRoles!.developer.bot);
+    expect(verifier.bot).toBe(f.run.resolvedRoles!.regression.bot);
+    expect(verifier.inputs.inputs.some(input => input.from === 'create-mr' && input.name === 'mr-result' &&
+      input.path.startsWith(publisher.attemptDir))).toBe(true);
+    const verification = complete.inputs.inputs.find(input => input.from === 'verify-publication' && input.name === 'verification')!;
+    expect(verification.path.startsWith(verifier.attemptDir)).toBe(true);
+    expect(JSON.parse(readFileSync(verification.path, 'utf8'))).toEqual({ fixture: 'verify-publication' });
+    const approved = events.findIndex(event => event.type === 'gateResolved' && event.nodeId === 'create-mr');
+    const published = events.findIndex(event => event.type === 'nodeSucceeded' && event.nodeId === 'create-mr');
+    const verifying = events.findIndex(event => event.type === 'nodeDispatched' && event.nodeId === 'verify-publication');
+    const verified = events.findIndex(event => event.type === 'nodeSucceeded' && event.nodeId === 'verify-publication');
+    const completing = events.findIndex(event => event.type === 'nodeDispatched' && event.nodeId === 'complete');
+    expect(approved).toBeGreaterThanOrEqual(0);
+    expect(published).toBeGreaterThan(approved);
+    expect(verifying).toBeGreaterThan(published);
+    expect(verified).toBeGreaterThan(verifying);
+    expect(completing).toBeGreaterThan(verified);
+    const calls = f.calls.map(call => call.id);
+    expect(await f.drive()).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+    expect(f.calls.map(call => call.id)).toEqual(calls);
+  });
+
+  it('keeps completion undispatched after terminal publication verification failure and never republishes on redrive', async () => {
+    const f = await fixture('publication-failed');
+    expect(await approvePublication(f)).toMatchObject({ reason: 'terminal', runStatus: 'failed' });
+    expect(f.calls.filter(call => !call.id.startsWith('development-review-loop.')).map(call => call.id))
+      .toEqual(['preflight', 'prepare', 'prepare-mr', 'check-delivery', 'create-mr', 'verify-publication']);
+    const events = readJournal(join(f.run.runDir, 'journal.ndjson'));
+    expect(events.some(event => event.type === 'nodeSucceeded' && event.nodeId === 'create-mr')).toBe(true);
+    expect(events.some(event => event.type === 'nodeFailed' && event.nodeId === 'verify-publication' &&
+      event.errorCode === 'PUBLICATION_VERIFICATION_FAILED')).toBe(true);
+    expect(events.some(event => event.type === 'nodeDispatched' && event.nodeId === 'complete')).toBe(false);
+    expect(f.calls.some(call => call.id === 'complete')).toBe(false);
+    const calls = f.calls.map(call => call.id);
+    expect(await f.drive()).toMatchObject({ reason: 'terminal', runStatus: 'failed' });
+    expect(f.calls.map(call => call.id)).toEqual(calls);
+    const resumedEvents = readJournal(join(f.run.runDir, 'journal.ndjson'));
+    expect(resumedEvents.filter(event => event.type === 'nodeDispatched' && event.nodeId === 'create-mr')).toHaveLength(1);
+    expect(resumedEvents.some(event => event.type === 'nodeDispatched' && event.nodeId === 'complete')).toBe(false);
   });
 
   it('finishes an unchanged existing PR review without publication or an approval wait', async () => {

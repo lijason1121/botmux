@@ -17,7 +17,7 @@ const write = (file: string, value: unknown) => writeFileSync(file, JSON.stringi
 const sha = (file: string) => 'sha256:' + createHash('sha256').update(readFileSync(file)).digest('hex');
 type Input = { from: string; name: string; path: string; kind?: string };
 
-async function fixture(mode: 'new' | 'review' | 'continue' = 'new', changed = true, failedCheck = false, ownPr = false, checkId = 'behavior', check?: { argv: string[]; timeoutSec: number }) {
+async function fixture(mode: 'new' | 'review' | 'continue' = 'new', changed = true, failedCheck = false, ownPr = false, checkId = 'behavior', check?: { argv: string[]; timeoutSec: number }, forkPr = false) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'dev-rev-mechanical-'))); roots.push(root);
   const repo = join(root, 'repo'), remote = join(root, 'remote.git'), run = join(root, 'fixture-run');
   mkdirSync(repo); mkdirSync(run);
@@ -27,17 +27,21 @@ async function fixture(mode: 'new' | 'review' | 'continue' = 'new', changed = tr
   const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-C', cwd, ...args], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   git(repo, 'init', '-q', '-b', 'main'); writeFileSync(join(repo, 'value.txt'), 'before\n');
   git(repo, 'add', 'value.txt'); git(repo, 'commit', '-qm', 'fixture base');
-  git(root, 'init', '-q', '--bare', remote); git(repo, 'remote', 'add', 'origin', remote); git(repo, 'push', '-q', 'origin', 'main');
+  git(root, 'init', '-q', '--bare', remote); git(repo, 'config', 'url.' + remote + '.insteadOf', 'https://example.invalid/fixture/project.git'); git(repo, 'remote', 'add', 'origin', 'https://example.invalid/fixture/project.git'); git(repo, 'push', '-q', 'origin', 'main');
   if (mode !== 'new') {
     git(repo, 'checkout', '-qb', 'feature'); writeFileSync(join(repo, 'value.txt'), 'after\n');
     git(repo, 'commit', '-qam', 'fixture PR'); git(repo, 'push', '-q', 'origin', 'feature');
+  }
+  if (forkPr) {
+    const fork = join(root, 'fork.git'); git(root, 'clone', '-q', '--bare', remote, fork);
+    git(repo, 'remote', 'rename', 'origin', 'upstream'); git(repo, 'config', 'url.' + fork + '.insteadOf', 'https://example.invalid/fixture/fork.git'); git(repo, 'remote', 'add', 'origin', 'https://example.invalid/fixture/fork.git');
   }
   const out = (node: string) => { const p = join(run, node, 'attempts', '001', 'work'); mkdirSync(p, { recursive: true }); return p; };
   write(join(run, 'run.json'), { runId: 'fixture-run' });
   const prepared = out('prepare#001'), script = join(prepared, 'tools.mjs');
   writeFileSync(script, DEVELOPMENT_REVIEW_RESOURCES[0]!.content);
   const params = join(root, 'params.json'), preflight = join(root, 'preflight.json'), roles = join(root, 'roles.json');
-  const target = { url: 'https://example.invalid/pull/23', author: 'fixture-author', remote: 'origin', sourceBranch: 'feature', targetBranch: 'main', headSha: git(repo, 'rev-parse', 'HEAD') };
+  const target = { url: 'https://example.invalid/fixture/project/pull/23', author: 'fixture-author', remote: 'origin', ...(forkPr ? { baseRemote: 'upstream' } : {}), sourceBranch: 'feature', targetBranch: 'main', headSha: git(repo, 'rev-parse', 'HEAD') };
   write(params, { params: { mode, repo_path: repo, requirement: 'Fixture task', target_branch: 'main',
     validation_commands: [{ id: checkId, ...(check ?? { argv: [process.execPath, '-e', `process.exit(${failedCheck ? 3 : 0})`], timeoutSec: 10 }) }] } });
   write(preflight, { schemaVersion: 1, state: 'READY', runId: 'fixture-run', repoPath: repo, targetBranch: 'main',
@@ -97,7 +101,7 @@ async function fixture(mode: 'new' | 'review' | 'continue' = 'new', changed = tr
       ...(mode === 'review' ? ['--comment', join(output, 'review-comment.md')] : ['--title', join(output, 'mr-title.txt'), '--body', join(output, 'mr-body.md')])], output)).toMatchObject({ code: 0 });
     return { output, plan: join(output, 'result.json') };
   }
-  return { root, repo, run, out, tool, git, prepared, preflight, params, roles, context, resources, ctx, candidate, validation, reviews,
+  return { root, repo, run, out, tool, git, env, prepared, preflight, params, roles, context, resources, ctx, candidate, validation, reviews,
     gated, release, preparedInputs, gateInputs, releaseInput, complete, legacyGate, delivery };
 }
 
@@ -269,6 +273,148 @@ describe('fixed development-review mechanical stages', () => {
     expect(await f.tool('authored-stage', [], verified, [...inputs, { from: 'check-delivery', name: 'route', path: join(routed, 'result.json') }])).toMatchObject({ code: 0 });
     expect(await f.tool('authored-stage', [], f.complete, [...inputs, { from: 'verify-publication', name: 'verification', path: join(verified, 'verification.json') }])).toMatchObject({ code: 0 });
     expect(json(join(f.complete, 'completion.json'))).toMatchObject({ action: plan.action, approvalRequired: true, pushed: true, commented: false });
+  });
+
+  async function publicationFixture(mode: 'new' | 'continue', changed = true, forkPr = false) {
+    const f = await fixture(mode, changed, false, false, 'behavior', undefined, forkPr), d = await f.delivery(), plan = json(d.plan);
+    const inputs = [...f.preparedInputs, f.releaseInput, { from: 'prepare-mr', name: 'delivery-plan', path: d.plan }];
+    const routed = f.out('check-delivery#001'), verified = f.out('verify-publication#001');
+    expect(await f.tool('authored-stage', [], routed, inputs)).toMatchObject({ code: 0 });
+    if (plan.publicationRequired) {
+      expect(await f.tool('push', ['--context', f.context, '--release', f.release, '--plan', d.plan], f.out('create-mr#001'))).toMatchObject({ code: 0 });
+    }
+    const observation = { url: plan.existingPr?.url ?? 'https://example.invalid/fixture/project/pull/24',
+      state: 'OPEN', headSha: plan.headSha, sourceBranch: plan.sourceBranch, targetBranch: plan.targetBranch };
+    const verify = () => f.tool('authored-stage', [], verified, [...inputs, { from: 'check-delivery', name: 'route', path: join(routed, 'result.json') }]);
+    return { ...f, d, plan, inputs, routed, verified, observation, verify };
+  }
+
+  function integratePublication(f: Awaited<ReturnType<typeof publicationFixture>>, strategy: 'merge' | 'squash' | 'rebase', deleteSource = true) {
+    // A separate clone acts as the hosting platform. Diverging the target first
+    // makes squash/rebase integration SHAs distinct from the reviewed candidate.
+    const integration = join(f.root, 'integration');
+    f.git(f.root, 'clone', '-q', '--no-checkout', f.git(f.repo, 'remote', 'get-url', f.plan.pushRemote), integration);
+    f.git(integration, 'checkout', '-qb', 'target', 'origin/main');
+    writeFileSync(join(integration, 'target.txt'), 'target moved before merge\n');
+    f.git(integration, 'add', '.'); f.git(integration, 'commit', '-qm', 'target advances');
+    if (strategy === 'merge') f.git(integration, 'merge', '--no-ff', '-m', 'merge reviewed PR', 'origin/' + f.plan.sourceBranch);
+    else if (strategy === 'squash') {
+      f.git(integration, 'merge', '--squash', 'origin/' + f.plan.sourceBranch);
+      f.git(integration, 'commit', '-qm', 'squash reviewed PR');
+    } else {
+      for (const commit of f.git(integration, 'rev-list', '--reverse', f.plan.baseSha + '..' + f.plan.headSha).split('\n')) {
+        f.git(integration, 'cherry-pick', commit);
+      }
+    }
+    const mergeCommitSha = f.git(integration, 'rev-parse', 'HEAD');
+    writeFileSync(join(integration, 'later.txt'), 'target moved after merge\n');
+    f.git(integration, 'add', '.'); f.git(integration, 'commit', '-qm', 'later target change');
+    const targetHeadSha = f.git(integration, 'rev-parse', 'HEAD');
+    f.git(integration, 'push', '-q', join(f.root, 'remote.git'), 'HEAD:refs/heads/main');
+    if (deleteSource) f.git(integration, 'push', '-q', 'origin', '--delete', f.plan.sourceBranch);
+    return { mergeCommitSha, targetHeadSha, integration };
+  }
+
+  it.each([
+    ['new', true, 'merge'], ['new', true, 'squash'], ['new', true, 'rebase'],
+    ['continue', true, 'merge'], ['continue', true, 'squash'], ['continue', true, 'rebase'],
+    ['continue', false, 'merge'], ['continue', false, 'squash'], ['continue', false, 'rebase'],
+  ] as const)('completes %s changed=%s after a %s merge deletes the source branch', async (mode, changed, strategy) => {
+    const f = await publicationFixture(mode, changed), merged = integratePublication(f, strategy);
+    const observation = { ...f.observation, state: 'MERGED', mergeCommitSha: merged.mergeCommitSha };
+    const before = { refs: f.git(f.repo, 'show-ref'), head: f.git(f.repo, 'rev-parse', 'HEAD'), status: f.git(f.repo, 'status', '--porcelain') };
+    let completeInputs = f.inputs;
+    if (f.plan.publicationRequired) {
+      write(join(f.verified, 'observed-pr.json'), observation);
+      expect(await f.verify()).toMatchObject({ code: 0, stderr: '' });
+      const verification = join(f.verified, 'verification.json');
+      expect(json(verification)).toMatchObject({ headSha: f.plan.headSha, publication: {
+        state: 'MERGED', mergeCommitSha: merged.mergeCommitSha, targetHeadSha: merged.targetHeadSha,
+        observedPrSha256: sha(join(f.verified, 'observed-pr.json')),
+      } });
+      completeInputs = [...f.inputs, { from: 'verify-publication', name: 'verification', path: verification }];
+      // Completion consumes the independent receipt, rather than racing a second
+      // remote lookup after publication has already been proved.
+      f.git(f.repo, 'remote', 'set-url', 'origin', join(f.root, 'unavailable.git'));
+    } else write(join(f.complete, 'observed-pr.json'), observation);
+    expect(await f.tool('authored-stage', [], f.complete, completeInputs)).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(f.complete, 'completion.json'))).toMatchObject({ action: f.plan.action, headSha: f.plan.headSha,
+      publication: { state: 'MERGED', mergeCommitSha: merged.mergeCommitSha, targetHeadSha: merged.targetHeadSha } });
+    expect(readFileSync(join(f.complete, 'task-report.md'), 'utf8')).toContain(merged.mergeCommitSha);
+    expect((await readAndValidateManifest(join(dirname(f.complete), 'manifest.json'), f.complete)).status).toBe('ok');
+    expect({ refs: f.git(f.repo, 'show-ref'), head: f.git(f.repo, 'rev-parse', 'HEAD'), status: f.git(f.repo, 'status', '--porcelain') }).toEqual(before);
+  });
+
+  it('rejects closed unmerged PRs even while their reviewed source ref still exists', async () => {
+    const f = await publicationFixture('continue');
+    write(join(f.verified, 'observed-pr.json'), { ...f.observation, state: 'CLOSED' });
+    expect((await f.verify()).code).toBe(2);
+    expect(existsSync(join(f.verified, 'verification.json'))).toBe(false);
+    expect(existsSync(join(dirname(f.verified), 'manifest.json'))).toBe(false);
+  });
+
+  it('requires exact PR identity and real target history for a merged publication', async () => {
+    const f = await publicationFixture('continue'), merged = integratePublication(f, 'squash', false);
+    const valid = { ...f.observation, state: 'MERGED', mergeCommitSha: merged.mergeCommitSha };
+    // This source still exists, so the old implementation incorrectly accepted
+    // missing or unrelated integration evidence, and ignored the PR state.
+    for (const observation of [
+      { ...valid, state: 'CLOSED' }, { ...valid, state: 'UNKNOWN' },
+      { ...valid, mergeCommitSha: undefined }, { ...valid, mergeCommitSha: '--help' },
+      { ...valid, mergeCommitSha: f.plan.headSha },
+      { ...valid, headSha: f.plan.baseSha }, { ...valid, sourceBranch: 'another' },
+      { ...valid, targetBranch: 'another' }, { ...valid, url: valid.url + '0' },
+    ]) {
+      write(join(f.verified, 'observed-pr.json'), observation);
+      expect((await f.verify()).code, JSON.stringify(observation)).toBe(2);
+      expect(existsSync(join(f.verified, 'verification.json'))).toBe(false);
+    }
+    write(join(f.verified, 'observed-pr.json'), valid);
+    expect(await f.verify()).toMatchObject({ code: 0, stderr: '' });
+  });
+
+  it('matches explicit web ports without accepting a different target service', async () => {
+    const f = await publicationFixture('new'), merged = integratePublication(f, 'merge');
+    const remote = join(f.root, 'remote.git');
+    for (const port of [8443, 9443]) f.git(f.repo, 'config', '--add', 'url.' + remote + '.insteadOf', 'https://example.invalid:' + port + '/fixture/project.git');
+    write(join(f.verified, 'observed-pr.json'), { ...f.observation, url: 'https://example.invalid:8443/fixture/project/pull/24',
+      state: 'MERGED', mergeCommitSha: merged.mergeCommitSha });
+    f.git(f.repo, 'remote', 'set-url', 'origin', 'https://example.invalid:9443/fixture/project.git');
+    expect((await f.verify()).code).toBe(2);
+    expect(existsSync(join(f.verified, 'verification.json'))).toBe(false);
+    f.git(f.repo, 'remote', 'set-url', 'origin', 'https://example.invalid:8443/fixture/project.git');
+    expect(await f.verify()).toMatchObject({ code: 0, stderr: '' });
+  });
+
+  it('isolates target proof collection from inherited Git repository locations', async () => {
+    const f = await publicationFixture('new'), merged = integratePublication(f, 'merge');
+    const before = { refs: f.git(f.repo, 'show-ref'), config: readFileSync(join(f.repo, '.git', 'config'), 'utf8') };
+    Object.assign(f.env, { GIT_DIR: join(f.repo, '.git'), GIT_COMMON_DIR: join(f.repo, '.git'), GIT_WORK_TREE: f.repo,
+      GIT_OBJECT_DIRECTORY: join(f.repo, '.git', 'objects') });
+    write(join(f.verified, 'observed-pr.json'), { ...f.observation, state: 'MERGED', mergeCommitSha: merged.mergeCommitSha });
+    expect(await f.verify()).toMatchObject({ code: 0, stderr: '' });
+    expect({ refs: f.git(f.repo, 'show-ref'), config: readFileSync(join(f.repo, '.git', 'config'), 'utf8') }).toEqual(before);
+    expect(f.git(f.repo, 'rev-parse', '--is-bare-repository')).toBe('false');
+  });
+
+  it('uses the base repository for a fork PR and rejects a rewritten target history', async () => {
+    const f = await publicationFixture('continue', true, true), merged = integratePublication(f, 'merge');
+    // The frozen base remote is upstream. A head/fork remote must not stand in for
+    // it merely because a same-named main branch contains the candidate.
+    f.git(merged.integration, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+    f.git(merged.integration, 'push', '-q', '--force', join(f.root, 'remote.git'), f.plan.baseSha + ':refs/heads/main');
+    write(join(f.verified, 'observed-pr.json'), { ...f.observation, state: 'MERGED', mergeCommitSha: merged.mergeCommitSha });
+    expect((await f.verify()).code).toBe(2);
+    expect(existsSync(join(f.verified, 'verification.json'))).toBe(false);
+    f.git(merged.integration, 'push', '-q', join(f.root, 'remote.git'), 'HEAD:refs/heads/main');
+    const originalUrl = f.git(f.repo, 'config', '--get', 'remote.upstream.url');
+    f.git(f.repo, 'remote', 'set-url', 'upstream', join(f.root, 'fork.git'));
+    expect((await f.verify()).code).toBe(2);
+    expect(existsSync(join(f.verified, 'verification.json'))).toBe(false);
+    f.git(f.repo, 'remote', 'set-url', 'upstream', originalUrl);
+    // With the real target restored, a deleted fork source is no obstacle.
+    expect(await f.verify()).toMatchObject({ code: 0, stderr: '' });
+    expect(json(join(f.verified, 'verification.json')).publication.targetRemote).toBe('upstream');
   });
 
   it('requires a fresh matching observation before reporting reuse and rejects a changed PR', async () => {

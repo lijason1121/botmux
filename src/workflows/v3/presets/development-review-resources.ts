@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { PUBLICATION_RECOVERY_TOOLS_SOURCE } from './development-review-publication-recovery-tools.js';
 
 /** Embedded bytes are the executable resource: no checkout-relative file reads.
  * Keep it ASCII (\u escapes for text): Bun's transpiler rewrites non-ASCII inside
@@ -39,8 +40,8 @@ function regular(root, relative) {
   return current;
 }
 const gitEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-function git(cwd, args) {
-  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env: gitEnv, maxBuffer: 256 * 1024 * 1024 });
+function git(cwd, args, timeout, env = gitEnv) {
+  const result = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env, timeout, maxBuffer: 256 * 1024 * 1024 });
   requireThat(!result.error && result.status === 0, 'git command failed: ' + args[0]);
   return result.stdout.trim();
 }
@@ -80,12 +81,12 @@ function ownOutput(out, name) {
 }
 // A delivery plan is valid only for the passed gate, context and fixed tools it was derived from,
 // and only with the routing the context implies: the developer cannot skip an approval.
-function checkPlan(args) {
+function checkPlan(args, binding) {
   const deliveryPlan = read(args.plan), context = read(args.context), release = read(args.release);
   version(deliveryPlan, 'delivery plan'); version(context, 'context'); version(release, 'release');
-  requireThat(context.runId === runtimeRunId() && deliveryPlan.runId === context.runId, 'delivery plan wrong run');
+  requireThat(context.runId === (binding ? binding.sourceRunId : runtimeRunId()) && deliveryPlan.runId === context.runId, 'delivery plan wrong run');
   commonRepository(context);
-  requireThat(release.passed === true && release.gate.passed === true && release.toolsSha256 === digest(self) &&
+  requireThat(release.passed === true && release.gate.passed === true && release.toolsSha256 === (binding ? binding.sourceToolsSha256 : digest(self)) &&
     deliveryPlan.releaseSha256 === digest(args.release) && deliveryPlan.contextSha256 === digest(args.context), 'delivery plan is not bound to the passed gate');
   requireThat(deliveryPlan.headSha === release.gate.headSha && deliveryPlan.baseSha === context.baseSha && deliveryPlan.mode === context.mode,
     'delivery plan publishes a commit the reviewers did not approve');
@@ -107,8 +108,8 @@ function checkPlan(args) {
   }
   return { deliveryPlan, context, release };
 }
-function boundPlan(args) {
-  const bound = checkPlan(args);
+function boundPlan(args, binding) {
+  const bound = checkPlan(args, binding);
   requireThat(bound.deliveryPlan.publicationRequired === true, 'delivery plan has no publication');
   return bound;
 }
@@ -625,7 +626,7 @@ function prepare(args) {
     // durable fork record can authorize using another run's candidate.
     const records = fs.existsSync(journalPath) ? fs.readFileSync(journalPath, 'utf8').split('\n').slice(0, -1).filter(line => line.trim()).map(line => JSON.parse(line)) : [];
     const authorization = records.find(event => event.type === 'runRecovered');
-    requireThat(authorization && authorization.sourceRunId === recovery.sourceRunId &&
+    requireThat(authorization && authorization.purpose === undefined && authorization.sourceRunId === recovery.sourceRunId &&
       authorization.sourceAttemptId === recovery.sourceAttemptId && authorization.sourceJournalSha256 === recovery.journalSha256 &&
       ['developer', 'correctness', 'regression'].every(role => authorization.roles[role] === selected[role].bot),
       'authorized recovery record missing or mismatched');
@@ -975,9 +976,80 @@ function push(args) {
     sourceBranch: deliveryPlan.sourceBranch, headSha: deliveryPlan.headSha, remoteBefore: before, remoteAfter: after, planSha256: digest(args.plan) });
 }
 // Run by an independent reviewer bot: the published state must equal what the gate passed and the plan showed.
-function verifyPublication(args) {
+// A merged PR may have no source ref. Its original head still identifies the
+// reviewed candidate, while the platform's integration commit proves delivery
+// on the target branch (including squash/rebase, which rewrite commit IDs).
+function publicationTarget(context, planned, observed) {
+  const expected = pullRequestRepository(observed.url);
+  requireThat(expected, 'merged PR must identify its target repository');
+  const expectedUrl = new URL(observed.url);
+  const matches = url => {
+    const identity = repositoryIdentity(url);
+    // SSH and HTTPS use different ports. HTTP remotes, however, must name the
+    // same web authority as the PR, including any non-default service port.
+    const web = /^https?:\/\//i.test(url) ? new URL(url) : null;
+    return identity && identity.host === expectedUrl.hostname.toLowerCase() && identity.path === expected.path &&
+      (!web || web.host.toLowerCase() === expectedUrl.host.toLowerCase());
+  };
+  const rawUrl = remote => git(context.repo, ['config', '--get-all', 'remote.' + remote + '.url']).split('\n')[0];
+  let remote = context.reviewTarget && (context.reviewTarget.baseRemote || context.reviewTarget.remote);
+  if (!remote) {
+    const candidates = git(context.repo, ['remote']).split('\n').filter(name => name && matches(rawUrl(name)));
+    requireThat(candidates.length, 'merged PR target repository has no configured remote');
+    remote = candidates.includes(planned.pushRemote) ? planned.pushRemote : candidates[0];
+  }
+  requireThat(typeof remote === 'string' && REMOTE.test(remote), 'merged PR target remote required');
+  let url = git(context.repo, ['remote', 'get-url', remote]);
+  requireThat(matches(rawUrl(remote)), 'merged PR target remote belongs to another repository');
+  // Check the configured identity before resolving insteadOf transport aliases.
+  // Resolve local transport paths against the checkout that owns the config.
+  if (!url.includes(':')) url = path.resolve(context.repo, url);
+  return { remote, url };
+}
+function observedPublication(context, planned, observed, observationPath) {
+  requireThat(object(observed) && ['OPEN', 'MERGED'].includes(observed.state), 'PR must be open or verifiably merged');
+  requireThat(typeof observed.url === 'string' && /^https:\/\//.test(observed.url) &&
+    (!planned.existingPr || observed.url === planned.existingPr.url), 'published to a different PR');
+  requireThat(observed.headSha === planned.headSha && observed.sourceBranch === planned.sourceBranch &&
+    observed.targetBranch === planned.targetBranch, 'PR does not point at the reviewed commit and branches');
+  const proof = { state: observed.state, observedPrSha256: digest(observationPath) };
+  if (observed.state === 'OPEN') {
+    requireThat(remoteHead(context.repo, planned.pushRemote, planned.sourceBranch) === planned.headSha, 'remote branch does not hold the reviewed commit');
+    return proof;
+  }
+  requireThat(typeof observed.mergeCommitSha === 'string' && COMMIT.test(observed.mergeCommitSha), 'merged PR integration commit required');
+  const target = publicationTarget(context, planned, observed);
+  const output = process.env.BOTMUX_GOAL_OUTPUT_DIR;
+  requireThat(output, 'publication verification output required');
+  const temporary = fs.mkdtempSync(path.join(output, 'publication-target-'));
+  const isolatedEnv = { ...gitEnv };
+  for (const key of ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH']) delete isolatedEnv[key];
+  const isolatedGit = (args, timeout) => git(temporary, args, timeout, isolatedEnv);
+  try {
+    const format = git(context.repo, ['rev-parse', '--show-object-format']);
+    isolatedGit(['init', '--bare', '--object-format=' + format, '.']);
+    // Keep refs, FETCH_HEAD, configuration and objects of the task checkout
+    // unchanged. No shallow boundary may hide the integration's ancestry.
+    isolatedGit(['fetch', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--', target.url,
+      'refs/heads/' + planned.targetBranch + ':refs/heads/verified-target'], 120000);
+    const targetHeadSha = isolatedGit(['rev-parse', '--verify', 'refs/heads/verified-target^{commit}']);
+    isolatedGit(['merge-base', '--is-ancestor', observed.mergeCommitSha, targetHeadSha]);
+    // Fetch advertised this exact target snapshot. Normal target advancement
+    // after the fetch does not invalidate this historical delivery proof.
+    return { ...proof, mergeCommitSha: observed.mergeCommitSha, targetHeadSha, targetRemote: target.remote };
+  } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+}
+function validPublicationProof(proof) {
+  return object(proof) && ['OPEN', 'MERGED'].includes(proof.state) && /^sha256:[a-f0-9]{64}$/.test(proof.observedPrSha256) &&
+    (proof.state !== 'MERGED' || (COMMIT.test(proof.mergeCommitSha) && COMMIT.test(proof.targetHeadSha)));
+}
+function recoveryReceipt(binding) {
+  return binding ? { sourceRunId: binding.sourceRunId, sourceBundleSha256: binding.sourceBundleSha256, verificationToolsSha256: digest(self) } : {};
+}
+function verifyPublication(args, binding) {
   ownOutput(args.out, 'verification.json');
-  const { deliveryPlan, context } = boundPlan(args);
+  const { deliveryPlan, context } = boundPlan(args, binding);
   // The approval decision is check-delivery's, which may be stricter than the developer's plan.
   const routed = read(args.route);
   requireThat(object(routed) && routed.schemaVersion === 1 && routed.runId === context.runId && routed.planSha256 === digest(args.plan) &&
@@ -987,19 +1059,18 @@ function verifyPublication(args) {
   const observed = read(args.observed);
   requireThat(object(observed) && typeof observed.url === 'string' && /^https:\/\//.test(observed.url), 'observed PR URL required');
   if (deliveryPlan.existingPr) requireThat(observed.url === deliveryPlan.existingPr.url, 'published to a different PR');
+  let publication;
   if (deliveryPlan.action === 'create' || deliveryPlan.action === 'update') {
-    requireThat(remoteHead(context.repo, deliveryPlan.pushRemote, deliveryPlan.sourceBranch) === deliveryPlan.headSha, 'remote branch does not hold the reviewed commit');
-    requireThat(observed.headSha === deliveryPlan.headSha && observed.sourceBranch === deliveryPlan.sourceBranch &&
-      observed.targetBranch === deliveryPlan.targetBranch, 'PR does not point at the reviewed commit and branches');
+    publication = observedPublication(context, deliveryPlan, observed, args.observed);
   } else {
     requireThat(deliveryPlan.action === 'comment', 'unsupported publication action');
     const posted = commentText(fs.readFileSync(args['observed-comment'], 'utf8'));
     requireThat(sha(Buffer.from(posted)) === deliveryPlan.commentSha256, 'posted comment differs from the planned text');
   }
-  atomic(args.out, { schemaVersion: 1, verified: true, runId: context.runId, mode: deliveryPlan.mode, action: deliveryPlan.action,
+  atomic(args.out, { schemaVersion: 1, verified: true, runId: binding ? binding.executionRunId : context.runId, ...recoveryReceipt(binding), mode: deliveryPlan.mode, action: deliveryPlan.action,
     url: observed.url, sourceBranch: deliveryPlan.sourceBranch, targetBranch: deliveryPlan.targetBranch, headSha: deliveryPlan.headSha,
     approvalRequired: routed.approvalRequired, directPublish: routed.directPublish, identityConfirmed: routed.identityConfirmed === true,
-    planSha256: digest(args.plan), routeSha256: digest(args.route) });
+    planSha256: digest(args.plan), routeSha256: digest(args.route), ...(publication ? { publication } : {}) });
 }
 // The stage entry point resolves the runtime's frozen refs, then calls the same
 // guards as the public low-level commands. No model assembles provenance paths.
@@ -1030,8 +1101,8 @@ function reportBlock(value, language = 'text') {
   const fence = String.fromCharCode(96).repeat(longest + 1);
   return fence + language + '\n' + text + (text.endsWith('\n') ? '' : '\n') + fence;
 }
-function completeStage(args, input, output) {
-  const { deliveryPlan: planned, context, release } = checkPlan(args);
+function completeStage(args, input, output, binding) {
+  const { deliveryPlan: planned, context, release } = checkPlan(args, binding);
   cleanHead(context, planned.headSha, 'completion candidate');
   requireThat(release.artifacts.context.sha256 === digest(args.context), 'completion context changed');
   const evidence = {};
@@ -1043,13 +1114,18 @@ function completeStage(args, input, output) {
   }
   const gateFile = input('development-review-loop', 'gate-result', true);
   if (gateFile) requireThat(JSON.stringify(read(gateFile)) === JSON.stringify(release.gate), 'completion gate differs from the release');
-  let verified, observed, url = null;
+  let verified, observed, publication, url = null;
   if (planned.publicationRequired) {
     verified = read(input('verify-publication', 'verification'));
     version(verified, 'verification');
     requireThat(verified.verified === true && verified.planSha256 === digest(args.plan) &&
       /^sha256:[a-f0-9]{64}$/.test(verified.routeSha256), 'verification is not bound to this plan');
-    same(verified, planned, ['runId', 'mode', 'action', 'headSha', 'sourceBranch', 'targetBranch'], 'verification');
+    same(verified, { ...planned, runId: binding ? binding.executionRunId : planned.runId }, ['runId', 'mode', 'action', 'headSha', 'sourceBranch', 'targetBranch'], 'verification');
+    if (binding) same(verified, recoveryReceipt(binding), ['sourceRunId', 'sourceBundleSha256', 'verificationToolsSha256'], 'recovery verification');
+    if (planned.action === 'create' || planned.action === 'update') {
+      requireThat(validPublicationProof(verified.publication), 'verification lacks a publication state proof');
+      publication = verified.publication;
+    }
     requireThat(typeof verified.url === 'string' && /^https:\/\//.test(verified.url) &&
       (!planned.existingPr || verified.url === planned.existingPr.url), 'verification targets another PR');
     requireThat(typeof verified.approvalRequired === 'boolean' && verified.directPublish === !verified.approvalRequired &&
@@ -1057,12 +1133,11 @@ function completeStage(args, input, output) {
     url = verified.url;
   } else if (planned.action === 'reuse') {
     observed = read(regular(output, 'observed-pr.json'));
-    requireThat(observed.state === 'OPEN' && observed.url === planned.existingPr.url, 'reused PR is no longer open or has another URL');
-    same(observed, planned, ['headSha', 'sourceBranch', 'targetBranch'], 'reused PR');
-    requireThat(remoteHead(context.repo, planned.pushRemote, planned.sourceBranch) === planned.headSha, 'reused PR head changed');
+    publication = observedPublication(context, planned, observed, path.join(output, 'observed-pr.json'));
     url = observed.url;
   }
-  const completion = { schemaVersion: 1, runId: context.runId, mode: context.mode, action: planned.action, url,
+  const completion = { schemaVersion: 1, runId: binding ? binding.executionRunId : context.runId, ...recoveryReceipt(binding), mode: context.mode, action: planned.action, url,
+    ...(publication ? { publication } : {}),
     sourceBranch: planned.sourceBranch, targetBranch: planned.targetBranch, headSha: planned.headSha, baseSha: planned.baseSha,
     publicationRequired: planned.publicationRequired, approvalRequired: verified ? verified.approvalRequired : false,
     pushed: planned.action === 'create' || planned.action === 'update', commented: planned.action === 'comment',
@@ -1071,6 +1146,10 @@ function completeStage(args, input, output) {
   const lines = ['# Task report', '', 'Mode: ' + completion.mode, 'Action: ' + completion.action,
     'PR:', reportBlock(url || '(none)'), 'Source branch:', reportBlock(completion.sourceBranch),
     'Target branch:', reportBlock(completion.targetBranch), 'Head: ' + completion.headSha, 'Base: ' + completion.baseSha,
+    ...(binding ? ['Recovered from run: ' + binding.sourceRunId, 'Recovery run: ' + binding.executionRunId,
+      'Original review tools: ' + binding.sourceToolsSha256, 'Publication verification tools: ' + digest(self)] : []),
+    ...(publication ? ['Publication state: ' + publication.state, ...(publication.state === 'MERGED' ?
+      ['Integration commit: ' + publication.mergeCommitSha, 'Verified target snapshot: ' + publication.targetHeadSha] : [])] : []),
     'Pushed: ' + completion.pushed, 'Commented: ' + completion.commented,
     'Human approval required: ' + completion.approvalRequired, '', '## Delivery summary', '', reportBlock(planned.summary),
     '', '## Changes, validation and limitations', '', reportBlock(evidence['change-summary']),
@@ -1183,6 +1262,7 @@ function publish(args, checkpoint = false) {
 }
 const args = { entries: [] }, mode = process.argv[2];
 const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment', 'observed-identity', 'route', 'dependency-source']);
+${PUBLICATION_RECOVERY_TOOLS_SOURCE}
 try {
   for (let index = 3; index < process.argv.length; index++) {
     const flag = process.argv[index];
@@ -1201,6 +1281,7 @@ try {
   else if (mode === 'route') route(args);
   else if (mode === 'verify-publication') verifyPublication(args);
   else if (mode === 'stage') stage(args);
+  else if (mode === 'publication-recovery-stage') publicationRecoveryStage(args);
   else if (mode === 'publish') publish(args);
   else if (mode === 'checkpoint') publish(args, true);
   else throw new Error('unsupported development-review tool mode');

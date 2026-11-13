@@ -147,6 +147,8 @@ export type V3Event =
       nodeExecutor?: 'bot';
     }
   | { type: 'runRecovered'; sourceRunId: string; sourceAttemptId: string; sourceJournalSha256: string;
+      /** Read-only publication successors cannot authorize development recovery. */
+      purpose?: 'publication-only'; sourceBundleSha256?: string;
       previousRoles: Record<string, string>; roles: Record<string, string> }
   | { type: 'nodeInputsBound'; nodeId: string; attemptId: string; inputHash: string }
   | { type: 'nodeCheckpointRestored'; nodeId: string; attemptId: string; previousAttemptId: string; inputHash: string; fileCount: number }

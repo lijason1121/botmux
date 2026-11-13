@@ -180,8 +180,8 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
   // Quorum 5 is reached only after that publisher succeeds (check-delivery, prepare-mr, loop and prepare make four).
   const verifyPublication = goal('verify-publication', bots.regression, [
     '由独立回归评审机器人只读核验发布结果，不推送、不评论、不修改PR或代码。delivery-plan来自开发机器人，必须经固定脚本与本角色gate产出的release-candidate绑定后才可信。',
-    REPOSITORY_CLI, '用官方CLI只读查询delivery-plan对应的PR，写observed-pr.json：{url,state,sourceBranch,targetBranch,headSha}；action=comment时再取回实际发布的那条评论正文原文写入observed-comment.md。开发机器人的mr-result.json只用于找到PR和评论链接，不能代替本角色的查询。',
-    '阶段命令仍核对发布提交、远端分支、PR和评论原文与计划一致；审批结论来自独立check-delivery，不取开发者计划中的字段。真实查询文件写到本输出目录上述固定名称。', STAGE_COMMAND,
+    REPOSITORY_CLI, '用官方CLI只读查询delivery-plan对应的PR，写observed-pr.json：{url,state,sourceBranch,targetBranch,headSha,mergeCommitSha?}，state规范为OPEN/MERGED/CLOSED；REST的closed不能直接等同未合入，要依据平台真实merged字段区分。MERGED必须取平台实际合入提交（GitHub mergeCommit.oid/merge_commit_sha；GitLab merge_commit_sha或squash_commit_sha），不可用当前目标分支tip猜填；headSha仍为PR的原候选提交。action=comment时再取回实际发布的那条评论正文原文写入observed-comment.md。开发机器人的mr-result.json只用于找到PR和评论链接，不能代替本角色的查询。',
+    '阶段命令核对发布提交、PR和评论原文与计划一致；OPEN要求源分支持有候选，MERGED独立核对平台合入提交属于正确目标仓库在核验时取得的目标历史，允许源分支已删除。关闭未合入或缺少合入证据必须失败。核验目标历史只用隔离临时仓库，不修改任务仓库的refs或Git配置；审批结论来自独立check-delivery，不取开发者计划中的字段。真实查询文件写到本输出目录上述固定名称。', STAGE_COMMAND,
     '阶段命令交付verification及本角色的真实查询结果。校验失败如实停止并说明差异，不重试改写或自行宣称通过。',
   ].join('\n'), { verification: output('verification.json') }, ['create-mr', 'publish-direct', 'prepare-mr', 'development-review-loop', 'prepare'],
   [ref('create-mr', 'mr-result'), ref('publish-direct', 'mr-result'), ref('prepare-mr', 'delivery-plan'), ref('check-delivery', 'route'), ref('development-review-loop', 'release-candidate'),
@@ -192,7 +192,7 @@ export function createDevelopmentReviewPreset(bots: DevelopmentReviewDefaultBots
 
   // Runs once after verification, or straight after planning when nothing is published.
   const complete = goal('complete', bots.developer, [
-    '交付最终task-report.md。有发布时直接消费独立verify-publication已核验结果，不重复查询已核验的PR或重新审计发布工具；无发布的new/action=none无需找PR。continue/action=reuse时用官方CLI实时只读查询原PR并写本输出目录observed-pr.json：{url,state,sourceBranch,targetBranch,headSha}。',
+    '交付最终task-report.md。有发布时直接消费独立verify-publication已核验结果，不重复查询已核验的PR或重新审计发布工具；无发布的new/action=none无需找PR。continue/action=reuse时用官方CLI实时只读查询原PR并写本输出目录observed-pr.json：{url,state,sourceBranch,targetBranch,headSha,mergeCommitSha?}，state规范为OPEN/MERGED/CLOSED；MERGED时从官方API读取实际合入提交，不能用目标tip代替，允许源分支已删除；关闭未合入仍失败。',
     REPOSITORY_CLI,
     '固定阶段从绑定的验证、双审、change-summary及独立核验确定性生成报告，保留每项失败检查、全部意见含nit、两份审查结论及覆盖与未验证项，按实际路由记录审批状态。不得由模型重写报告或序列化额外审计大对象；不推送、不创建、不修改PR、不发评论。发布节点在无发布路径上跳过属于正常结果。',
     STAGE_COMMAND,

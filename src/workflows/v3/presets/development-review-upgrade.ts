@@ -7,6 +7,7 @@ import { createDevelopmentReviewPreset, type DevelopmentReviewDefaultBots } from
 // Earlier embedded tools contained non-ASCII text, so Bun and Node produced different
 // bytes for the same build; both variants of those builds are listed.
 const PREVIOUS_DRAFT_SHA256 = new Set([
+  '02f4f642d64489ac4811d699a10baa75f9e3b0c3e26bca69d68623a6abc170f2',
   '3a4df53d299057eb0296315d8dbb98597d80b73def14624a77ccf34e670128b1',
   '39dcea56c89de7f3912216512e39ac4fcb873d81820c3b3314bd0c5dbccee178',
   '302296bb7d391f25315b71f21e20c7e93ead65155f97d92f8df78b633726eacd',
