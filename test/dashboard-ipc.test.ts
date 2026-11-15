@@ -7086,11 +7086,9 @@ describe('GET /api/schedules', () => {
     setLarkAppId('cli_ipc_test_bot002');
     const previousScope = scheduleStore.getScheduleScope();
     scheduleStore.setScheduleScope('cli_ipc_test_bot002');
+    // This projection fixture needs a live deadline regardless of the calendar date.
+    const deadline = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
     try {
-    // Deadline stays relative to the wall clock: `addTask` validates it against
-    // Date.now() (`until_done_deadline_past`), so an absolute literal would make
-    // this case start failing the moment real time passes it.
-    const deadline = new Date(Date.now() + 6 * 60 * 60_000).toISOString();
     const add = scheduler.addTask({
       name: '等待上游实例完成',
       schedule: '1m',
