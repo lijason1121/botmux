@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const h = vi.hoisted(() => ({ instantiate: vi.fn(), save: vi.fn(), start: vi.fn(), source: vi.fn() }));
+const h = vi.hoisted(() => ({ instantiate: vi.fn(), save: vi.fn(), start: vi.fn(), source: vi.fn(), recover: vi.fn() }));
+vi.mock('../src/workflows/v3/development-review-recovery.js', () => ({ recoverDevelopmentReviewRun: h.recover }));
 vi.mock('../src/workflows/v3/library-service.js', () => ({
   instantiatePublishedSavedWorkflow: h.instantiate, saveTerminalRunAsWorkflow: h.save,
   resolveOwnedTerminalRunDir: h.source, listVisibleSavedWorkflows: vi.fn(),
@@ -29,6 +30,17 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 describe('Saved Workflow CLI role execution entry', () => {
+  it('passes explicit validation rediscovery to recovery and rejects it for publication-only recovery', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    h.recover.mockResolvedValue({ runId: 'recovered', resolvedRoles: {} });
+    await cmdSavedWorkflow('recover', ['old-run', '--rediscover-validation']);
+    expect(h.recover).toHaveBeenCalledWith(expect.objectContaining({ sourceRunId: 'old-run', rediscoverValidation: true }));
+    expect(h.start).toHaveBeenCalledTimes(1);
+    h.recover.mockClear(); h.start.mockClear();
+    await expect(cmdSavedWorkflow('recover', ['old-run', '--publication-only', '--rediscover-validation'])).rejects.toThrow('--publication-only');
+    expect(h.recover).not.toHaveBeenCalled(); expect(h.start).not.toHaveBeenCalled();
+  });
+
   it('passes role choices to instantiation and reports the actual frozen result', async () => {
     const output = vi.spyOn(console, 'log').mockImplementation(() => {});
     await cmdSavedWorkflow('run', ['Reusable', '--role', 'developer=Codex', '--json']);

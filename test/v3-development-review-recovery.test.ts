@@ -73,6 +73,41 @@ function prepareRecovered(f: Awaited<ReturnType<typeof fixture>>, run: Awaited<R
 }
 
 describe('authorized development role recovery', () => {
+  it('rediscovers a broken frozen plan only when explicitly requested, without inheriting old evidence', async () => {
+    const f = await fixture(), before = readFileSync(f.journal, 'utf8');
+    const ordinary = await recoverDevelopmentReviewRun({ ...f.input, runId: undefined });
+    const corrected = await recoverDevelopmentReviewRun({ ...f.input, runId: undefined, rediscoverValidation: true });
+    expect(ordinary.resolvedParams.validation_commands).toEqual([{ id: 'test', argv: ['node', '--version'] }]);
+    expect(corrected.resolvedParams.validation_commands).toEqual([]);
+    expect(corrected.runId).not.toBe(ordinary.runId);
+    expect((await recoverDevelopmentReviewRun({ ...f.input, runId: undefined, rediscoverValidation: true })).runId).toBe(corrected.runId);
+    expect(readFileSync(f.journal, 'utf8')).toBe(before);
+    const result = prepareRecovered(f, corrected);
+    expect(result.result.status).not.toBe(0); // New preflight must supply the corrected plan; old evidence is insufficient.
+    expect(readJournal(join(corrected.runDir, 'journal.ndjson')).map(event => event.type)).toEqual(['runRecovered']);
+  });
+
+  it.each(['blocked', 'cancelled'] as const)('recovers the verified candidate retained by an environment failure settled as %s', async settlement => {
+    const f = await fixture();
+    const attemptId = 'development-review-loop.i001.implement/attempts/001';
+    const manifestPath = join(f.run.runDir, attemptId, 'manifest.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    manifest.status = 'fail'; manifest.error = { code: 'VALIDATION_ENVIRONMENT_BLOCKED', message: 'Browser missing', retryable: true };
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    if (settlement === 'blocked') appendEvent(f.journal, { type: 'nodeBlocked', nodeId: 'development-review-loop.i001.implement', attemptId,
+      errorClass: 'workerError', errorCode: 'VALIDATION_ENVIRONMENT_BLOCKED' });
+    else appendEvent(f.journal, { type: 'nodeCancelled', nodeId: 'development-review-loop.i001.implement', attemptId,
+      reason: 'runCancelled', cancelRequestId: 'fixture-cancel' });
+    appendEvent(f.journal, { type: 'runCancelled', cancelRequestId: 'fixture-cancel', by: 'ou_owner' });
+    const recovered = await recoverDevelopmentReviewRun(f.input);
+    const prepared = prepareRecovered(f, recovered);
+    expect(prepared.result.status, String(prepared.result.stderr)).toBe(0);
+    expect(f.git(prepared.worktree, 'rev-parse', 'HEAD')).toBe(f.headSha);
+    expect(readJournal(join(recovered.runDir, 'journal.ndjson')).some(event => event.type === 'nodeSucceeded')).toBe(false);
+    manifest.error.code = 'UNTRUSTED_FAILURE'; writeFileSync(manifestPath, JSON.stringify(manifest));
+    await expect(recoverDevelopmentReviewRun({ ...f.input, runId: 'unsafe' })).rejects.toThrow('source artifact is incomplete');
+  });
+
   it.each([false, true])('recovers with one bot in both review roles without changing the source history; already shared: %s', async shared => {
     const f = await fixture(shared), before = readFileSync(f.journal, 'utf8');
     const recovered = await recoverDevelopmentReviewRun({ ...f.input,

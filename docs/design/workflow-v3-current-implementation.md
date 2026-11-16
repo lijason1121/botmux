@@ -1084,6 +1084,7 @@ botmux workflow start <runId>
 botmux workflow cancel <runId> --reason "目标已变化"
 botmux workflow retry <runId> --node <nodeId>
 botmux workflow recover <failed-or-cancelled-development-runId> --role developer=<bot>
+botmux workflow recover <failed-or-cancelled-development-runId> --rediscover-validation
 botmux workflow grant <runId> --loop <loopId>
 botmux workflow revise-spec <runId>
 botmux workflow revise-dag <runId>
@@ -1095,6 +1096,8 @@ botmux workflow revise-dag <runId>
 - 需求不变但流程需重编：`revise-dag`。
 - 普通 blocked 节点：`retry`。
 - 内置开发流程更换角色或从终止 run 接续候选：`recover`。来源须由同应用、同群的原 owner 操作，旧 run 必须 failed/cancelled 且 Worker/effect 已退出；blocked run 可先 retry，换角色前先取消。恢复创建新的冻结身份、独立 worktree 和审查/发布 Gate，不继承旧批准。候选、上下文、来源 journal、仓库和干净 HEAD 都会复核；已经开始发布的 run 拒绝恢复，须先核对外部结果。相同恢复请求复用同一新 run，`--run-id` 可指定不同的新 run。
+- 冻结的验证入口有误时，显式加 `--rediscover-validation`，由新 run 重新读取仓库规则、选择全部必需检查并执行启动探针。默认恢复保留原命令；该选项不能与 `--publication-only` 混用。因环境、权限或验证超时停止的实现节点，其失败 Manifest 中经过摘要核验的干净候选也可恢复，失败记录不代表验证通过。
+- 开发检查支持任务相对 `cwd`，自动发现的命令必须提供 `readinessArgv`（同 cwd 的只读启动探针，默认 60 秒、最多 120 秒）。环境准备完成后执行探针，未通过不开发；浏览器检查需要实际启动对应浏览器。门禁保留全部失败检查，只有完整代码 finding 才允许返工；环境、权限、证据损坏、无可执行代码反馈或连续两轮同提交同问题均停止。评审节点最多 30 分钟，未完成必须交付检查点，不能把证据不足当批准。
 - Loop 轮数耗尽：`grant`。
 - Revisit 预算耗尽：使用飞书授权卡。
 

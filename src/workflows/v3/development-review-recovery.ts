@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import type { BotConfig } from '../../bot-registry.js';
 import type { RawParamInput } from '../shared/params.js';
 import { resolveBotConfig } from './bot-resolve.js';
@@ -28,6 +28,7 @@ const requireThat = (condition: unknown, message: string): void => { if (!condit
 export async function recoverDevelopmentReviewRun(input: {
   dataDir: string; baseDir: string; sourceRunId: string; runId?: string;
   context: SavedWorkflowActorContext; bots: BotConfig[]; roleSelections?: Record<string, string>;
+  rediscoverValidation?: boolean;
 }) {
   const context = requireActorContext(input.context, { requireChat: true });
   requireThat(isValidRunId(input.sourceRunId), 'invalid recovery source runId');
@@ -62,19 +63,26 @@ export async function recoverDevelopmentReviewRun(input: {
 
   const success = (node: string | RegExp) => [...events].reverse().find(e => e.type === 'nodeSucceeded'
     && (typeof node === 'string' ? e.nodeId === node : node.test(e.nodeId)));
-  const prepared = success('prepare'), implemented = success(/^development-review-loop\.i\d{3}\.implement$/);
-  requireThat(prepared?.type === 'nodeSucceeded' && implemented?.type === 'nodeSucceeded', 'source has no complete candidate checkpoint');
-  if (prepared?.type !== 'nodeSucceeded' || implemented?.type !== 'nodeSucceeded') throw new Error('candidate unavailable');
-  const artifact = async (manifestPath: string, name: string) => {
+  const prepared = success('prepare'), implemented = [...events].reverse().find(e =>
+    (e.type === 'nodeSucceeded' || e.type === 'nodeFailed' || e.type === 'nodeBlocked' ||
+      (e.type === 'nodeCancelled' && e.reason === 'runCancelled' && !!e.attemptId)) && /^development-review-loop\.i\d{3}\.implement$/.test(e.nodeId));
+  if (prepared?.type !== 'nodeSucceeded' || !implemented ||
+    (implemented.type !== 'nodeSucceeded' && implemented.type !== 'nodeFailed' && implemented.type !== 'nodeBlocked' && implemented.type !== 'nodeCancelled') ||
+    !implemented.attemptId) throw new Error('source has no complete candidate checkpoint');
+  const sourceAttemptId = implemented.attemptId;
+  const artifact = async (manifestPath: string, name: string, failedCheckpoint = false) => {
+    requireThat(resolve(manifestPath).startsWith(resolve(runDir) + sep), 'source manifest escaped its run');
     const output = join(dirname(manifestPath), 'work');
     const manifest = await readAndValidateManifest(manifestPath, output);
-    requireThat(manifest.status === 'ok', 'source artifact is incomplete');
+    requireThat(manifest.status === 'ok' || (failedCheckpoint && manifest.status === 'fail' &&
+      ['DEPENDENCY_ENVIRONMENT_NOT_READY', 'VALIDATION_ENVIRONMENT_BLOCKED', 'VALIDATION_PERMISSION_REQUIRED', 'VALIDATION_TIMEOUT'].includes(manifest.error?.code ?? '')), 'source artifact is incomplete');
     const file = manifest.files.find(f => f.path === name);
     requireThat(file?.kind === 'json', 'source artifact missing: ' + name);
     return join(output, file!.path);
   };
   const contextPath = await artifact(prepared.manifestPath, 'context.json');
-  const candidatePath = await artifact(implemented.manifestPath, 'candidate.json');
+  const candidatePath = await artifact(implemented.type === 'nodeSucceeded' ? implemented.manifestPath :
+    join(runDir, sourceAttemptId, 'manifest.json'), 'candidate.json', implemented.type !== 'nodeSucceeded');
   const prior = JSON.parse(readFileSync(contextPath, 'utf8')), candidate = JSON.parse(readFileSync(candidatePath, 'utf8'));
   requireThat(candidate.runId === input.sourceRunId && prior.runId === input.sourceRunId
     && candidate.contextSha256 === digest(contextPath) && candidate.repo === prior.repo && candidate.baseSha === prior.baseSha,
@@ -85,13 +93,18 @@ export async function recoverDevelopmentReviewRun(input: {
   requireThat(git('rev-parse', 'HEAD') === candidate.headSha && !git('status', '--porcelain'), 'candidate worktree changed; preserve or commit remaining work first');
   requireThat(realpathSync(git('rev-parse', '--path-format=absolute', '--git-common-dir')) === realpathSync(execFileSync('git',
     ['-C', prior.repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8', timeout: 5000 }).trim()), 'candidate repository changed');
-  const recovery = { sourceRunId: input.sourceRunId, sourceAttemptId: implemented.attemptId, contextPath, candidatePath,
+  const recovery = { sourceRunId: input.sourceRunId, sourceAttemptId, contextPath, candidatePath,
     contextSha256: digest(contextPath), candidateSha256: digest(candidatePath), journalPath: join(runDir, 'journal.ndjson'),
     journalSha256: digest(join(runDir, 'journal.ndjson')) };
   const params = (loaded.resolvedParams as { params: Record<string, unknown> }).params;
-  const rawParams: Record<string, RawParamInput> = Object.fromEntries(Object.entries({ ...params, recovery_source: recovery })
+  // Changing the frozen plan requires an explicit owner request and a new run.
+  // Its preflight must rediscover every repository-mandated check and probe it;
+  // none of the old validation/review/approval evidence is reusable.
+  const recoveredParams = { ...params, ...(input.rediscoverValidation ? { validation_commands: [] } : {}), recovery_source: recovery };
+  const rawParams: Record<string, RawParamInput> = Object.fromEntries(Object.entries(recoveredParams)
     .map(([key, value]) => [key, { kind: 'json' as const, value }]));
-  const recoveryKey = createHash('sha256').update(canonicalJsonStringify({ recovery, selected, actor: context.actor })).digest('hex');
+  const recoveryKey = createHash('sha256').update(canonicalJsonStringify({ recovery, selected, actor: context.actor,
+    ...(input.rediscoverValidation ? { rediscoverValidation: true } : {}) })).digest('hex');
   const runId = input.runId ?? `recover-${input.sourceRunId.slice(0, 60)}-${recoveryKey.slice(0, 16)}`;
   requireThat(isValidRunId(runId) && runId !== input.sourceRunId, 'invalid recovery runId');
   return withFileLock(join(input.baseDir, `.recover-${runId}`), async () => {
@@ -103,7 +116,7 @@ export async function recoverDevelopmentReviewRun(input: {
       const existingParams = (existing.resolvedParams as { params: Record<string, unknown> }).params;
       requireThat(existing.envelope.chatBinding?.larkAppId === context.actor.larkAppId
         && existing.envelope.chatBinding?.ownerOpenId === context.actor.openId && existing.envelope.chatBinding?.chatId === context.chatId
-        && canonicalJsonStringify(existingParams) === canonicalJsonStringify({ ...params, recovery_source: recovery })
+        && canonicalJsonStringify(existingParams) === canonicalJsonStringify(recoveredParams)
         && DEV_REV_ROLES.every(role => existingRoles[role]?.bot === selected[role]), 'recovery runId is already bound to another request');
       run = { runId, runDir: nextDir, resolvedRoles: existingRoles, resolvedParams: existingParams };
     } else {
@@ -113,7 +126,7 @@ export async function recoverDevelopmentReviewRun(input: {
     }
     if (!readJournal(join(run.runDir, 'journal.ndjson')).some(e => e.type === 'runRecovered')) {
       appendEventDurable(join(run.runDir, 'journal.ndjson'), { type: 'runRecovered', sourceRunId: input.sourceRunId,
-        sourceAttemptId: implemented.attemptId, sourceJournalSha256: recovery.journalSha256,
+        sourceAttemptId, sourceJournalSha256: recovery.journalSha256,
         previousRoles: Object.fromEntries(DEV_REV_ROLES.map(role => [role, roles[role]!.bot])), roles: selected });
     }
     return run;

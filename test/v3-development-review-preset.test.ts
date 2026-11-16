@@ -77,6 +77,122 @@ async function evidenceFixture(objectFormat = 'sha1', round = 1, selected = BOTS
 }
 
 describe('authored development-review preset', () => {
+  it('does not mistake an application authorization regression for tool permission failure', async () => {
+    const f = fixture();
+    writeFileSync(join(f.repo, 'authorize.cjs'), 'module.exports = () => 200;');
+    writeFileSync(join(f.repo, 'check.cjs'), 'require("node:assert/strict").equal(require("./authorize.cjs")(), 200, "HTTP 403: permission denied for valid request");');
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'authorization behavior');
+    write(f.params, { params: { ...json(f.params).params, validation_commands: [{ id: 'authorization',
+      argv: [process.execPath, 'check.cjs'], readinessArgv: [process.execPath, '--check', 'check.cjs'], timeoutSec: 10 }] } });
+    const e = await evidenceFixture('sha1', 1, BOTS, f);
+    writeFileSync(join(f.worktree, 'authorize.cjs'), 'module.exports = () => 403;'); f.git(f.worktree, 'commit', '-qam', 'candidate denies valid requests');
+    expect(await f.tool('candidate', ['--context', e.context, '--round', '1'], dirname(e.candidate))).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', e.context, '--candidate', e.candidate, '--round', '1'], dirname(e.candidate))).toMatchObject({ code: 0 });
+    expect(json(e.validation).checks[0].exitCode).not.toBe(0);
+    expect(existsSync(join(dirname(dirname(e.candidate)), 'manifest.json'))).toBe(false);
+  });
+
+  it('keeps missing source modules as code failures for reviewers to diagnose', async () => {
+    const f = fixture();
+    writeFileSync(join(f.repo, 'value.mjs'), 'export default 1');
+    writeFileSync(join(f.repo, 'check.mjs'), 'import value from "./value.mjs"; if(value !== 1) process.exit(1);');
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'module behavior');
+    write(f.params, { params: { ...json(f.params).params, validation_commands: [{ id: 'module',
+      argv: [process.execPath, 'check.mjs'], readinessArgv: [process.execPath, '--check', 'check.mjs'], timeoutSec: 10 }] } });
+    const e = await evidenceFixture('sha1', 1, BOTS, f);
+    f.git(f.worktree, 'rm', 'value.mjs'); f.git(f.worktree, 'commit', '-qm', 'candidate removed source');
+    expect(await f.tool('candidate', ['--context', e.context, '--round', '1'], dirname(e.candidate))).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', e.context, '--candidate', e.candidate, '--round', '1'], dirname(e.candidate))).toMatchObject({ code: 0 });
+    for (const [role, file] of [['correctness', e.correctness], ['regression', e.regression]]) {
+      write(file!, { ...json(file!), ...json(e.candidate), candidateSha256: sha(e.candidate), validationSha256: sha(e.validation),
+        decision: role === 'correctness' ? 'changes_requested' : 'approve', findings: role === 'correctness'
+          ? [{ blocking: true, location: 'check.mjs:1', impact: 'Required source was deleted', evidence: 'Import of value.mjs fails after candidate deletion' }] : [] });
+    }
+    expect(await e.gate()).toMatchObject({ code: 0 });
+    expect(json(e.result)).toMatchObject({ disposition: 'rework', validationFailures: ['module'] });
+  });
+
+  it('preserves the candidate and completed checks when a later cwd disappears during validation', async () => {
+    const f = fixture();
+    mkdirSync(join(f.repo, 'later')); writeFileSync(join(f.repo, 'later', 'entry'), 'present');
+    f.git(f.repo, 'add', '.'); f.git(f.repo, 'commit', '-qm', 'later cwd');
+    write(f.params, { params: { ...json(f.params).params, validation_commands: [
+      { id: 'first', argv: [process.execPath, '-e', 'require("node:fs").renameSync("later", "moved"); console.log("completed")'] },
+      { id: 'second', cwd: 'later', argv: [process.execPath, '--version'] },
+    ] } });
+    expect(await f.prepare()).toMatchObject({ code: 0 });
+    const output = f.out('development-review-loop.i001.implement'), context = join(f.prepared, 'context.json');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], output)).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', context, '--candidate', join(output, 'candidate.json'), '--round', '1'], output)).toMatchObject({ code: 2 });
+    expect(json(join(output, 'validation.json')).checks).toMatchObject([
+      { id: 'first', exitCode: 0 }, { id: 'second', exitCode: null, spawnError: 'VALIDATION_ENVIRONMENT_BLOCKED' },
+    ]);
+    const manifest = await readAndValidateManifest(join(dirname(output), 'manifest.json'), output);
+    expect(manifest.files.map(file => file.name)).toEqual(['candidate', 'validation', 'log-first', 'log-second']);
+    expect(readFileSync(join(output, 'first.log'), 'utf8')).toContain('completed');
+  });
+
+  it('runs readiness probes and validation in the declared task-relative cwd', async () => {
+    const f = fixture();
+    mkdirSync(join(f.repo, 'checks')); writeFileSync(join(f.repo, 'checks', 'entry.txt'), 'ready');
+    f.git(f.repo, 'add', 'checks'); f.git(f.repo, 'commit', '-qm', 'check entry');
+    const argv = [process.execPath, '-e', 'require("node:fs").readFileSync("entry.txt")'];
+    write(f.params, { params: { ...json(f.params).params,
+      validation_commands: [{ id: 'nested', argv, cwd: 'checks', readinessArgv: argv, timeoutSec: 10 }] } });
+    const e = await evidenceFixture('sha1', 1, BOTS, f);
+    expect(json(join(f.prepared, 'readiness.json')).checks[0]).toMatchObject({ exitCode: 0, cwd: join(f.worktree, 'checks') });
+    expect(json(e.validation).checks[0].cwd).toBe(join(f.worktree, 'checks'));
+    expect(await e.gate()).toMatchObject({ code: 0 });
+    expect(json(e.result)).toMatchObject({ passed: true, disposition: 'pass' });
+  });
+
+  it('stops before development when the actual readiness command cannot start a browser', async () => {
+    const f = fixture();
+    write(f.params, { params: { ...json(f.params).params, validation_commands: [{ id: 'browser',
+      argv: [process.execPath, '-e', 'process.exit(0)'],
+      readinessArgv: [process.execPath, '-e', 'console.error("browserType.launch: Executable doesn\'t exist"); process.exit(1)'] }] } });
+    expect(await f.prepare()).toMatchObject({ code: 2 });
+    expect(existsSync(join(f.prepared, 'context.json'))).toBe(false);
+    expect(json(join(f.prepared, 'readiness.json')).checks[0]).toMatchObject({ id: 'browser', exitCode: 1 });
+    expect(await readAndValidateManifest(join(dirname(f.prepared), 'manifest.json'), f.prepared))
+      .toMatchObject({ status: 'fail', error: { code: 'VALIDATION_ENVIRONMENT_BLOCKED' } });
+  });
+
+  it('delivers all environment failures immediately and refuses a subsequent success manifest', async () => {
+    const f = fixture();
+    write(f.params, { params: { ...json(f.params).params, validation_commands: ['package', 'browser'].map((id, i) => ({ id,
+      argv: [process.execPath, '-e', 'console.error(' + JSON.stringify(i ? "browserType.launch: Executable doesn't exist" : 'ERR_PNPM_RECURSIVE_EXEC_NO_PACKAGE') + '); process.exit(1)'] })) } });
+    expect(await f.prepare()).toMatchObject({ code: 0 });
+    const output = f.out('development-review-loop.i001.implement'), context = join(f.prepared, 'context.json');
+    expect(await f.tool('candidate', ['--context', context, '--round', '1'], output)).toMatchObject({ code: 0 });
+    expect(await f.tool('record', ['--context', context, '--candidate', join(output, 'candidate.json'), '--round', '1'], output)).toMatchObject({ code: 2 });
+    expect(json(join(output, 'validation.json')).checks.map((check: any) => check.exitCode)).toEqual([1, 1]);
+    const manifest = await readAndValidateManifest(join(dirname(output), 'manifest.json'), output);
+    expect(manifest).toMatchObject({ status: 'fail', error: { code: 'VALIDATION_ENVIRONMENT_BLOCKED' } });
+    expect(manifest.files.some(file => file.name === 'candidate')).toBe(true);
+    expect((await f.tool('publish', ['--entry', 'validation', 'json', 'validation.json'], output)).code).toBe(2);
+  });
+
+  it('keeps all failing checks and actionable findings, and routes only code feedback to rework', async () => {
+    const f = fixture();
+    write(f.params, { params: { ...json(f.params).params, validation_commands: [1, 2].map(n => ({ id: 'test-' + n,
+      argv: [process.execPath, '-e', 'process.exit(' + n + ')'], timeoutSec: 10 })) } });
+    const e = await evidenceFixture('sha1', 1, BOTS, f);
+    const finding = { blocking: true, location: 'value.txt:1', impact: 'Wrong output', evidence: 'test-1.log and test-2.log reproduce the wrong output' };
+    write(e.correctness, { ...json(e.correctness), decision: 'changes_requested', findings: [finding] });
+    expect(await e.gate()).toMatchObject({ code: 0 });
+    expect(json(e.result)).toMatchObject({ passed: false, disposition: 'rework', validationFailures: ['test-1', 'test-2'],
+      unresolvedFindings: [{ role: 'correctness', ...finding }] });
+    write(e.regression, { ...json(e.regression), decision: 'blocked' });
+    expect(await e.gate()).toMatchObject({ code: 0 });
+    expect(json(e.result)).toMatchObject({ passed: false, disposition: 'blocked', failureCode: 'REVIEW_EVIDENCE_INCOMPLETE',
+      validationFailures: ['test-1', 'test-2'], unresolvedFindings: [{ role: 'correctness', ...finding }] });
+    write(e.correctness, { ...json(e.correctness), decision: 'approve', findings: [] });
+    write(e.regression, { ...json(e.regression), decision: 'approve' });
+    expect(await e.gate()).toMatchObject({ code: 0 });
+    expect(json(e.result)).toMatchObject({ disposition: 'blocked', failureCode: 'VALIDATION_FAILED_UNCLASSIFIED' });
+  });
+
   function pinnedNodeProject(f: ReturnType<typeof fixture>, pinFile = '.nvmrc', workspace = true) {
     // Executable runtime doubles expose which interpreter reaches lifecycle scripts
     // and validation subprocesses; they never use a real version-manager home.
@@ -184,7 +300,7 @@ if (process.argv.includes('--force') || !fs.existsSync('node_modules/fixture/com
     const result = await f.tool('record', ['--context', context, '--candidate', join(output, 'candidate.json'), '--round', '1'], output);
     expect(result.code).toBe(2);
     expect(result.stderr).toContain('Explicit Node validation command does not match');
-    expect(existsSync(join(output, 'validation.json'))).toBe(false);
+    expect(json(join(output, 'validation.json')).checks[0]).toMatchObject({ exitCode: null, spawnError: 'DEPENDENCY_ENVIRONMENT_NOT_READY' });
   });
 
   it.each(['changed', 'legacy'] as const)('rebuilds workspace lifecycle output when its Node runtime is %s', async mode => {
@@ -435,7 +551,7 @@ if (process.argv.includes('--force') || !fs.existsSync('node_modules/fixture/com
     expect(json(join(implemented, 'validation.json')).checks[0].exitCode).toBe(0);
     expect(f.git(f.worktree, 'status', '--porcelain')).toBe('');
   });
-  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
+  it.each(['v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18', 'v19'])('upgrades the complete previous %s preset while preserving configured role defaults', version => {
     const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_custom_check', regression: 'cli_custom_regression' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
@@ -445,8 +561,8 @@ if (process.argv.includes('--force') || !fs.existsSync('node_modules/fixture/com
     expect(upgradeDevelopmentReviewPreset(bound)).toBeUndefined();
     expect(upgradeDevelopmentReviewPreset(createDevelopmentReviewPreset(selected))).toBeUndefined();
   });
-  it('upgrades only an exact previous built-in when the two review roles share a bot', () => {
-    const previous = JSON.parse(readFileSync(new URL('./fixtures/development-review/v11.json', import.meta.url), 'utf8'));
+  it.each(['v11', 'v19'])('upgrades only an exact previous %s built-in when the two review roles share a bot', version => {
+    const previous = JSON.parse(readFileSync(new URL(`./fixtures/development-review/${version}.json`, import.meta.url), 'utf8'));
     const selected = { developer: 'cli_custom_dev', correctness: 'cli_shared', regression: 'cli_shared' };
     const bound = JSON.parse(JSON.stringify(previous), (_key, value) =>
       typeof value === 'string' ? Object.entries(BOTS).reduce((v, [role, bot]) => v === bot ? selected[role as keyof typeof selected] : v, value) : value);
@@ -493,7 +609,7 @@ if (process.argv.includes('--force') || !fs.existsSync('node_modules/fixture/com
       exit: { node: 'verify-review-gate', when: { path: 'result.passed', equals: true } }, feedback: ['verify-review-gate.result'] });
     for (const id of ['review-correctness', 'review-regression']) {
       const reviewer = loop.body!.nodes.find(node => node.id === id)!;
-      expect(reviewer.timeoutSec).toBe(loop.body!.nodes.find(node => node.id === 'implement')!.timeoutSec);
+      expect(reviewer.timeoutSec).toBeLessThan(loop.body!.nodes.find(node => node.id === 'implement')!.timeoutSec!);
       expect(reviewer.depends).toEqual([{ from: 'implement' }]);
       expect(reviewer.inputs.every(input => input.from === 'implement')).toBe(true);
     }
@@ -998,7 +1114,7 @@ describe('fixed development-review executable resources', () => {
   });
   it('discovers required checks from preflight only when the launch plan is empty', async () => {
     const f = fixture(), input = json(f.params), checked = json(f.preflight);
-    const expected = input.params.validation_commands;
+    const expected = input.params.validation_commands.map((command: any) => ({ ...command, readinessArgv: [process.execPath, "--version"], readinessTimeoutSec: 60 }));
     input.params.validation_commands = []; checked.validationCommands = expected;
     write(f.params, input); write(f.preflight, checked);
     expect(await f.prepare()).toMatchObject({ code: 0, stderr: '' });

@@ -8210,7 +8210,7 @@ ${SEND_HELP_BODY}
                                        把成功 run 固化为 chat scope Saved Workflow；
                                        发布当前 Bot 全局版本 / 确认 unsafe lint 请由用户在飞书显式发送 /workflow save ...
   workflow run <名称|workflowId> [--param key=value ...] [--role developer=BotName ...]
-  workflow recover <失败或取消的开发runId> [--role developer=BotName ...]
+  workflow recover <失败或取消的开发runId> [--role developer=BotName ...] [--rediscover-validation]
   workflow list [--json] | show <名称|workflowId>
                                        运行 / 查看 Saved Workflow
   workflow new|spec-finalize|approve-spec|revise-spec|architect|revise-dag [...]

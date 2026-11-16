@@ -193,8 +193,76 @@ function plan(commands) {
     requireThat(Array.isArray(item.argv) && item.argv.length > 0 && item.argv.every(arg => typeof arg === 'string' && arg.length && !arg.includes('\0')), 'validation argv required; shell strings rejected');
     const timeoutSec = item.timeoutSec === undefined ? 1800 : item.timeoutSec;
     requireThat(Number.isInteger(timeoutSec) && timeoutSec >= 1 && timeoutSec <= 14400, 'invalid validation timeout');
-    return { id: item.id, argv: item.argv, timeoutSec };
+    if (item.cwd !== undefined) requireThat(typeof item.cwd === 'string' && item.cwd && !path.isAbsolute(item.cwd) &&
+      !item.cwd.split(/[\\/]/).includes('..'), 'validation cwd must be task-relative');
+    if (item.readinessArgv !== undefined) requireThat(Array.isArray(item.readinessArgv) && item.readinessArgv.length &&
+      item.readinessArgv.every(arg => typeof arg === 'string' && arg.length && !arg.includes('\0')), 'readiness argv required');
+    const readinessTimeoutSec = item.readinessTimeoutSec === undefined ? 60 : item.readinessTimeoutSec;
+    requireThat(Number.isInteger(readinessTimeoutSec) && readinessTimeoutSec >= 1 && readinessTimeoutSec <= 120, 'invalid readiness timeout');
+    return { id: item.id, argv: item.argv, timeoutSec, ...(item.cwd === undefined ? {} : { cwd: item.cwd }),
+      ...(item.readinessArgv === undefined ? {} : { readinessArgv: item.readinessArgv, readinessTimeoutSec }) };
   });
+}
+function validationError(code, message) { const error = new Error(message); error.code = code; return error; }
+function validationCwd(context, command) {
+  try {
+    const root = fs.realpathSync(context.worktree), cwd = fs.realpathSync(path.resolve(root, command.cwd || '.'));
+    requireThat((cwd === root || cwd.startsWith(root + path.sep)) && fs.statSync(cwd).isDirectory(), 'cwd escapes the task worktree');
+    return cwd;
+  } catch (error) { throw validationError('VALIDATION_ENVIRONMENT_BLOCKED', command.id + ': invalid cwd ' + (command.cwd || '.') + ': ' + error.message); }
+}
+function commandEntry(context, command, env) {
+  const cwd = validationCwd(context, command), executable = command.argv[0];
+  const names = process.platform === 'win32' && !path.extname(executable)
+    ? (env.PATHEXT || '.EXE;.CMD;.BAT').split(';').map(ext => executable + ext) : [executable];
+  const directories = path.isAbsolute(executable) || /[\\/]/.test(executable) ? [cwd] : (env.PATH || '').split(path.delimiter);
+  requireThat(directories.some(directory => names.some(name => {
+    try { const file = path.resolve(directory || cwd, name); fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); }
+    catch { return false; }
+  })), command.id + ': executable unavailable: ' + executable);
+  // pnpm exec requires a package in its selected directory. A card/source folder
+  // is not necessarily a package; detect this before spending a development round.
+  if (/^pnpm(?:\.cmd|\.exe)?$/i.test(path.basename(executable)) && command.argv.includes('exec')) {
+    const at = command.argv.findIndex(arg => arg === '--dir' || arg === '-C');
+    const option = command.argv.find(arg => arg.startsWith('--dir='));
+    const directory = at >= 0 ? command.argv[at + 1] : option?.slice(6);
+    if (directory) requireThat(fs.existsSync(path.resolve(cwd, directory, 'package.json')),
+      command.id + ': pnpm exec directory has no package.json: ' + directory);
+  }
+}
+function validationBlock(check, log) {
+  if (check.timedOut) return 'VALIDATION_TIMEOUT';
+  if (check.exitCode === 0 && !check.signal) return null;
+  // Application tests can legitimately report HTTP 403 or missing source
+  // modules. Only the process launcher's permission errors are unambiguous.
+  if (['EACCES', 'EPERM'].includes(check.spawnError))
+    return 'VALIDATION_PERMISSION_REQUIRED';
+  if (check.spawnError || check.signal || /ERR_PNPM_(?:RECURSIVE_EXEC_NO_PACKAGE|NO_IMPORTER_MANIFEST_FOUND|NO_SCRIPT)|command not found|browserType\.launch:.*(?:Executable doesn't exist|executable.*not found)|Host system is missing dependencies/i.test(log))
+    return 'VALIDATION_ENVIRONMENT_BLOCKED';
+  return null;
+}
+function checkBlocks(checks, directory) {
+  return checks.map(check => ({ check, code: validationBlock(check, fs.readFileSync(regular(directory, check.log.path), 'utf8')) }))
+    .filter(item => item.code);
+}
+function prepareValidation(context, output) {
+  const runtime = checkDependencies(context, context.dependencies), commands = plan(context.validationCommands);
+  try { for (const command of commands) commandEntry(context, command, runtime.env); }
+  catch (error) { throw validationError('VALIDATION_ENVIRONMENT_BLOCKED', error.message); }
+  const probes = commands.filter(command => command.readinessArgv).map(command => ({ ...command, argv: command.readinessArgv,
+    timeoutSec: command.readinessTimeoutSec }));
+  const checks = probes.length ? runChecks({ ...context, validationCommands: probes }, output, 'readiness-') : [];
+  atomic(path.join(output, 'readiness.json'), { schemaVersion: 1, runId: context.runId, headSha: context.startSha, checks });
+  const failed = checks.filter(check => check.exitCode !== 0 || check.signal || check.timedOut);
+  requireThat(git(context.worktree, ['rev-parse', 'HEAD']) === context.startSha && !git(context.worktree, ['status', '--porcelain']), 'readiness probe changed the task checkout');
+  if (failed.length) {
+    const error = validationError('VALIDATION_ENVIRONMENT_BLOCKED', 'Readiness failed before development: ' + failed.map(check =>
+      check.id + ' (exit ' + check.exitCode + ', log ' + check.log.path + ')').join('; ') + '. Repair preparation, then retry; do not enter code rework.');
+    publish({ entries: [['readiness', 'json', 'readiness.json'], ...checks.map(check => ['readiness-' + check.id, 'log', check.log.path])],
+      error: { code: error.code, message: error.message, retryable: true } });
+    error.manifestPublished = true;
+    throw error;
+  }
 }
 function roles(value) {
   const names = ['developer', 'correctness', 'regression'];
@@ -652,6 +720,8 @@ function prepare(args) {
   // Explicit caller-supplied checks remain authoritative and cannot be replaced.
   const commands = plan(Array.isArray(params.validation_commands) && params.validation_commands.length === 0
     ? checked.validationCommands : params.validation_commands);
+  if (Array.isArray(params.validation_commands) && params.validation_commands.length === 0)
+    requireThat(commands.every(command => command.readinessArgv), 'discovered validation commands require readinessArgv probes before development');
   const requirement = checked.resolvedRequirement === undefined ? params.requirement : checked.resolvedRequirement;
   requireThat(typeof requirement === 'string' && requirement.trim(), 'resolved requirement required');
   if (/^https?:\/\/\S+$/i.test(params.requirement.trim()) && mode === 'new') {
@@ -683,6 +753,7 @@ function prepare(args) {
       candidateSha256: recovery.candidateSha256, journalSha256: recovery.journalSha256 } } : {}),
     baseSha, startSha, ...(reviewTarget ? { reviewTarget } : {}), ...(repositoryCliPath ? { repositoryCliPath } : {}), login, requirement, requirementSha256: sha(Buffer.from(requirement)), roles: selected,
     dependencies, validationCommands: commands, preflightSha256: digest(args.preflight), resourcesSha256: digest(path.join(output, 'resources.json')) };
+  prepareValidation(context, output);
   atomic(path.join(output, 'context.json'), context);
   atomic(path.join(output, 'result.json'), { ready: true, runId: checked.runId, mode, baseSha, startSha });
 }
@@ -716,26 +787,32 @@ function failForTimeout(error, entries) {
 function runChecks(context, output, prefix, dependencies = context.dependencies) {
   const runtime = checkDependencies(context, dependencies);
   return plan(context.validationCommands).map(command => {
-    // An explicit interpreter bypasses PATH. Preserve caller argv, but never
-    // certify checks run against a different Node than the installed addons.
-    if (runtime.node && path.isAbsolute(command.argv[0])) {
-      let executable = command.argv[0];
-      try { executable = fs.realpathSync(executable); } catch { /* Normal spawn failure is recorded below. */ }
-      if (/^node(?:\.exe)?$/i.test(path.basename(executable)) || /^node(?:\.exe)?$/i.test(path.basename(command.argv[0]))) {
-        const actual = spawnSync(command.argv[0], ['--version'], { env: runtime.env, encoding: 'utf8', timeout: 10000, shell: false });
-        if (actual.error || actual.status !== 0 || actual.stdout.trim() !== runtime.node.version)
-          dependencyFailure('Explicit Node validation command does not match prepared ' + runtime.node.version + ': ' + command.argv[0]);
-      }
-    }
     const startedAtMs = Date.now(), before = git(context.worktree, ['rev-parse', 'HEAD']);
-    const result = spawnSync(command.argv[0], command.argv.slice(1), { cwd: context.worktree, env: runtime.env, encoding: 'utf8', timeout: command.timeoutSec * 1000, maxBuffer: 16 * 1024 * 1024, shell: false });
-    const logfile = prefix + command.id + '.log';
-    // A command stopped by its own budget has not failed a check; record that explicitly so
-    // the gate reports an undersized budget instead of a failure there is nothing to fix for.
-    const timedOut = !!result.error && result.error.code === 'ETIMEDOUT';
+    let cwd = path.resolve(context.worktree, command.cwd || '.'), result;
+    try {
+      cwd = validationCwd(context, command);
+      // An absolute interpreter bypasses PATH and must match the prepared ABI.
+      if (runtime.node && path.isAbsolute(command.argv[0])) {
+        let executable = command.argv[0];
+        try { executable = fs.realpathSync(executable); } catch { /* Record spawn failure below. */ }
+        if (/^node(?:\.exe)?$/i.test(path.basename(executable)) || /^node(?:\.exe)?$/i.test(path.basename(command.argv[0]))) {
+          const actual = spawnSync(command.argv[0], ['--version'], { env: runtime.env, encoding: 'utf8', timeout: 10000, shell: false });
+          if (actual.error || actual.status !== 0 || actual.stdout.trim() !== runtime.node.version)
+            dependencyFailure('Explicit Node validation command does not match prepared ' + runtime.node.version + ': ' + command.argv[0]);
+        }
+      }
+      result = spawnSync(command.argv[0], command.argv.slice(1), { cwd, env: runtime.env, encoding: 'utf8', timeout: command.timeoutSec * 1000,
+        maxBuffer: 16 * 1024 * 1024, shell: false });
+    } catch (error) {
+      // Preserve every completed check and this failure if the environment
+      // changes mid-run. Throwing here used to lose the entire validation file.
+      result = { status: null, signal: null, error };
+    }
+    const logfile = prefix + command.id + '.log', timedOut = !!result.error && result.error.code === 'ETIMEDOUT';
     fs.writeFileSync(path.join(output, logfile), (result.stdout || '') + (result.stderr || '') + (result.error ? '\n' + result.error.message : '') +
       (timedOut ? '\n[development-review] stopped after its ' + command.timeoutSec + 's validation budget' : ''), { mode: 0o600 });
-    return { id: command.id, argv: command.argv, cwd: context.worktree, startedAtMs, completedAtMs: Date.now(), exitCode: result.status,
+    return { id: command.id, argv: command.argv, cwd, startedAtMs, completedAtMs: Date.now(), exitCode: result.status,
+      ...(result.error ? { spawnError: result.error.code || 'SPAWN_FAILED', spawnMessage: result.error.message } : {}),
       signal: result.signal, ...(timedOut ? { timedOut: true, timeoutSec: command.timeoutSec } : {}), headBefore: before, headAfter: git(context.worktree, ['rev-parse', 'HEAD']),
       log: { path: logfile, sha256: digest(path.join(output, logfile)) } };
   });
@@ -771,11 +848,22 @@ function record(args) {
       ['validation', 'json', 'validation.json'], ...validation.checks.map(check => ['log-' + check.id, 'log', check.log.path])].filter(entry => entry[2]));
     throw error;
   }
+  const blocked = checkBlocks(validation.checks, output);
+  if (blocked.length) {
+    const error = validationError(blocked[0].code, blocked.map(({ check, code }) => code + ': ' + check.id + ' (log ' + check.log.path + ')' +
+      (check.spawnMessage ? ': ' + check.spawnMessage : '')).join('; ') +
+      '. Repair the environment or recover with a corrected validation plan; no code rework was requested.');
+    publish({ entries: [['candidate', 'json', 'candidate.json'], ['validation', 'json', 'validation.json'],
+      ...validation.checks.map(check => ['log-' + check.id, 'log', check.log.path])],
+      error: { code: error.code, message: error.message, retryable: true } });
+    error.manifestPublished = true;
+    throw error;
+  }
 }
 function gate(args) {
   ownOutput(args.out, 'result.json');
   const problems = [], unresolvedFindings = [], validationFailures = [], budgetStops = [];
-  let candidate = {}, mode;
+  let candidate = {}, mode, failureCode;
   try {
     const context = read(args.context); candidate = read(args.candidate);
     version(context, 'context'); version(candidate, 'candidate'); commonRepository(context);
@@ -802,7 +890,7 @@ function gate(args) {
     requireThat(Array.isArray(validation.checks) && validation.checks.length === commands.length, 'missing/extra validation commands');
     for (let index = 0; index < commands.length; index++) {
       const expected = commands[index], actual = validation.checks[index];
-      requireThat(actual.id === expected.id && JSON.stringify(actual.argv) === JSON.stringify(expected.argv) && actual.cwd === context.worktree, 'validation command provenance mismatch');
+      requireThat(actual.id === expected.id && JSON.stringify(actual.argv) === JSON.stringify(expected.argv) && actual.cwd === validationCwd(context, expected), 'validation command provenance mismatch');
       requireThat(actual.headBefore === candidate.headSha && actual.headAfter === candidate.headSha, 'validation failed or changed HEAD');
       requireThat(Number.isFinite(actual.startedAtMs) && Number.isFinite(actual.completedAtMs) && actual.completedAtMs >= actual.startedAtMs, 'invalid validation timing');
       requireThat(digest(regular(path.dirname(args.validation), actual.log.path)) === actual.log.sha256, 'validation log hash mismatch');
@@ -813,9 +901,12 @@ function gate(args) {
       requireThat(actual.timedOut !== true, budgetStops[budgetStops.length - 1]);
       // Reviewing someone else's PR reports failed checks; it cannot repair them.
       if (actual.exitCode !== 0 || actual.signal) {
-        requireThat(mode === 'review', 'validation failed or changed HEAD');
         validationFailures.push(expected.id);
       }
+    }
+    for (const { check, code } of checkBlocks(validation.checks, path.dirname(args.validation))) {
+      failureCode = failureCode || code;
+      problems.push(code + ': ' + check.id + ' (log ' + check.log.path + ')');
     }
     // validation.json is developer-authored: re-run every check here and require the same outcome.
     requireThat(mode !== 'review' || JSON.stringify(validation.dependencies) === JSON.stringify(context.dependencies), 'review dependency environment changed');
@@ -830,6 +921,10 @@ function gate(args) {
     }
     rerun.forEach((check, index) => requireThat(check.exitCode === validation.checks[index].exitCode &&
       (check.signal || null) === (validation.checks[index].signal || null), 'validation record contradicts the independent re-run: ' + check.id));
+    for (const { check, code } of checkBlocks(rerun, path.dirname(args.out))) {
+      failureCode = failureCode || code;
+      problems.push(code + ': independent ' + check.id + ' (log ' + check.log.path + ')');
+    }
     const reviews = [read(args.correctness), read(args.regression)];
     for (let index = 0; index < reviews.length; index++) {
       const review = reviews[index], role = index === 0 ? 'correctness' : 'regression';
@@ -841,6 +936,7 @@ function gate(args) {
         requireThat([review.coverage, review.evidence].every(items => Array.isArray(items) && items.length && items.every(item => typeof item === 'string' && item.trim())), 'review lacks nonempty string evidence/coverage');
         requireThat(Array.isArray(review.findings) && review.findings.every(finding => object(finding) && typeof finding.blocking === 'boolean' &&
           ['location', 'impact', 'evidence'].every(key => typeof finding[key] === 'string' && finding[key].trim())), 'unclassified/incomplete finding');
+        requireThat(['approve', 'changes_requested', 'blocked'].includes(review.decision), 'invalid review decision');
         // Only forward authenticated, candidate-bound findings, never the full
         // independent report. Developers need both reviewers' actionable issues.
         for (const finding of review.findings) unresolvedFindings.push({ role, blocking: finding.blocking,
@@ -853,10 +949,33 @@ function gate(args) {
           if (review.findings.length) problems.push(role + ': unresolved findings (including nits)');
           if (review.decision !== 'approve') problems.push(role + ': review not approved');
         }
-      } catch (error) { problems.push(role + ': ' + error.message); }
+        if (review.decision === 'blocked' || (review.findings.length ? review.decision !== 'changes_requested' : review.decision !== 'approve'))
+          failureCode = failureCode || 'REVIEW_EVIDENCE_INCOMPLETE';
+      } catch (error) { failureCode = 'VALIDATION_EVIDENCE_INVALID'; problems.push(role + ': ' + error.message); }
     }
-  } catch (error) { problems.push(error.message); }
-  const result = { passed: problems.length === 0, mode, reasons: problems, runId: candidate.runId, repo: candidate.repo,
+    if (mode !== 'review' && validationFailures.length) {
+      problems.push('validation failed: ' + validationFailures.join(', '));
+      if (!unresolvedFindings.length) failureCode = failureCode || 'VALIDATION_FAILED_UNCLASSIFIED';
+    }
+  } catch (error) { failureCode = error.code || 'VALIDATION_EVIDENCE_INVALID'; problems.push(error.message); }
+  if (args['previous-gate'] && !failureCode && problems.length) {
+    try {
+      const previous = read(args['previous-gate']);
+      same(previous, candidate, ['runId', 'repo', 'baseSha'], 'previous gate');
+      requireThat(previous.round === candidate.round - 1 && previous.passed === false, 'previous gate is not the preceding failed round');
+      const issues = items => JSON.stringify(items.map(({ role, location, impact, blocking }) => ({ role, location, impact, blocking }))
+        .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+      if (previous.headSha === candidate.headSha && issues(previous.unresolvedFindings) === issues(unresolvedFindings) &&
+        JSON.stringify(previous.validationFailures) === JSON.stringify(validationFailures)) {
+        failureCode = 'DEVELOPMENT_NO_PROGRESS';
+        problems.push('The same candidate, findings and failed checks recurred; stop instead of repeating another development round.');
+      }
+    } catch (error) { failureCode = 'VALIDATION_EVIDENCE_INVALID'; problems.push(error.message); }
+  }
+  const passed = problems.length === 0;
+  if (!passed && !failureCode && (mode === 'review' || !unresolvedFindings.length)) failureCode = 'REVIEW_EVIDENCE_INCOMPLETE';
+  const disposition = passed ? 'pass' : failureCode ? 'blocked' : 'rework';
+  const result = { passed, disposition, ...(failureCode ? { failureCode } : {}), mode, reasons: problems, runId: candidate.runId, repo: candidate.repo,
     baseSha: candidate.baseSha, headSha: candidate.headSha, round: candidate.round, unresolvedFindings, validationFailures };
   atomic(args.out, result);
   const artifacts = {};
@@ -1189,7 +1308,8 @@ function stage(args) {
       gate({ context, resources: input('prepare', 'resources'), 'expected-resources-sha': args['expected-resources-sha'],
         candidate: input(prefix + 'implement', 'candidate'), validation: input(prefix + 'implement', 'validation'),
         'change-summary': input(prefix + 'implement', 'change-summary'), correctness: input(prefix + 'review-correctness', 'review'),
-        regression: input(prefix + 'review-regression', 'review'), round: String(runtimeRound()), out: path.join(output, 'result.json') });
+        regression: input(prefix + 'review-regression', 'review'), 'previous-gate': input('previous.verify-review-gate', 'gate-result', true),
+        round: String(runtimeRound()), out: path.join(output, 'result.json') });
     } catch (error) {
       // The gate already wrote its not-passed evidence; deliver it as a failed attempt.
       if (error.code === 'VALIDATION_TIMEOUT') { gateProducts(); failForTimeout(error, entries); }
@@ -1197,8 +1317,10 @@ function stage(args) {
     }
     gateProducts();
     const decision = read(local('result.json'));
-    if (decision.mode === 'review' && !decision.passed) {
-      publish({ entries, error: { code: 'REVIEW_EVIDENCE_INCOMPLETE', message: decision.reasons.join('; '), retryable: true } });
+    if (decision.disposition === 'blocked' || (decision.mode === 'review' && !decision.passed)) {
+      publish({ entries, error: { code: decision.failureCode || 'REVIEW_EVIDENCE_INCOMPLETE',
+        message: decision.reasons.join('; ') + '. Repair evidence/environment before retrying, or use workflow recover to prepare a new run. No code rework was scheduled.',
+        retryable: decision.failureCode !== 'VALIDATION_EVIDENCE_INVALID' } });
       return;
     }
   } else {
@@ -1247,6 +1369,19 @@ function publish(args, checkpoint = false) {
     const stopped = [...timedOutChecks(path.join(output, 'validation.json')), ...timedOutChecks(path.join(output, 'independent-validation.json'))];
     requireThat(!stopped.length, 'VALIDATION_TIMEOUT: ' + stopped.map(check => check.id).join(', ') + ' stopped by its validation budget; only a VALIDATION_TIMEOUT failure can be delivered');
   }
+  if (!checkpoint && !args.error) {
+    const readiness = path.join(output, 'readiness.json');
+    requireThat(!fs.existsSync(readiness) || read(readiness).checks.every(check => check.exitCode === 0 && !check.signal && !check.timedOut),
+      'Readiness failure requires a failed manifest');
+    for (const name of ['validation.json', 'independent-validation.json']) {
+      const file = path.join(output, name);
+      if (!fs.existsSync(file)) continue;
+      const blocked = checkBlocks(read(file).checks || [], output);
+      requireThat(!blocked.length, 'Validation environment failure requires a failed manifest: ' + blocked.map(item => item.code).join(', '));
+    }
+    const result = path.join(output, 'result.json');
+    requireThat(!fs.existsSync(result) || read(result).disposition !== 'blocked', 'Blocked gate requires a failed manifest');
+  }
   if (checkpoint) {
     const attempt = process.env.BOTMUX_GOAL_ATTEMPT_DIR;
     requireThat(attempt && path.resolve(output) === path.join(path.resolve(attempt), 'work'), 'checkpoint must use this attempt output');
@@ -1261,7 +1396,7 @@ function publish(args, checkpoint = false) {
   atomic(manifest, { schemaVersion: 1, status: args.error ? 'fail' : 'ok', ...(args.error ? { error: args.error } : {}), summary: args.summary || 'Products delivered; decisions are in the artifacts.', files });
 }
 const args = { entries: [] }, mode = process.argv[2];
-const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment', 'observed-identity', 'route', 'dependency-source']);
+const allowed = new Set(['preflight', 'params', 'roles', 'context', 'candidate', 'validation', 'change-summary', 'correctness', 'regression', 'resources', 'expected-resources-sha', 'expected-tools-sha', 'round', 'out', 'summary', 'release', 'draft', 'title', 'body', 'comment', 'plan', 'observed', 'observed-comment', 'observed-identity', 'route', 'dependency-source', 'previous-gate']);
 ${PUBLICATION_RECOVERY_TOOLS_SOURCE}
 try {
   for (let index = 3; index < process.argv.length; index++) {
@@ -1286,9 +1421,16 @@ try {
   else if (mode === 'checkpoint') publish(args, true);
   else throw new Error('unsupported development-review tool mode');
 } catch (error) {
-  if (error.code === 'DEPENDENCY_ENVIRONMENT_NOT_READY' && process.env.BOTMUX_GOAL_MANIFEST_PATH) {
-    atomic(process.env.BOTMUX_GOAL_MANIFEST_PATH, { schemaVersion: 1, status: 'fail', summary: 'Dependency environment requires preparation before review.',
-      error: { code: error.code, message: error.message, retryable: true }, files: [] });
+  if (['DEPENDENCY_ENVIRONMENT_NOT_READY', 'VALIDATION_ENVIRONMENT_BLOCKED', 'VALIDATION_PERMISSION_REQUIRED'].includes(error.code) &&
+    !error.manifestPublished && process.env.BOTMUX_GOAL_MANIFEST_PATH) {
+    const failure = { code: error.code, message: error.message, retryable: true };
+    const output = process.env.BOTMUX_GOAL_OUTPUT_DIR;
+    // The candidate was already created from real Git before dependency checks.
+    // Keep it recoverable when environment preparation itself fails.
+    if (mode === 'record' && output && args.candidate && path.resolve(args.candidate) === path.join(path.resolve(output), 'candidate.json')) {
+      publish({ entries: [['candidate', 'json', 'candidate.json']], error: failure });
+    } else atomic(process.env.BOTMUX_GOAL_MANIFEST_PATH, { schemaVersion: 1, status: 'fail', summary: 'Environment requires preparation before review.',
+      error: failure, files: [] });
   }
   process.stderr.write(error.message + '\n'); process.exitCode = 2;
 }
