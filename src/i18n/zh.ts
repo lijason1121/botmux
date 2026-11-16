@@ -331,7 +331,9 @@ export const messages: Record<string, string> = {
   // /invite（把群外 bot 拉进本群，owner 专用）
   'cmd.invite.owner_only': '⚠️ 仅 Bot 管理员可以使用 /invite。',
   'cmd.invite.p2p': '⚠️ 私聊里不能拉机器人，请在群里使用 /invite。',
-  'cmd.invite.usage': '用法：@我 /invite @要拉进群的机器人（可多个），或 @我 /invite --app cli_xxx',
+  'cmd.invite.usage': '用法：@我 /invite 补齐 groupCreation.agents 配置中的机器人；也可 @我 /invite @目标（可多个），或 @我 /invite --app cli_xxx。',
+  'cmd.invite.invalid_defaults': '⚠️ groupCreation.agents 配置无效，未拉入任何机器人：{reason}',
+  'cmd.invite.roster_unavailable': '⚠️ 暂时无法查询群成员，未执行默认名单邀请。请稍后重试。',
   'cmd.invite.header': '🤝 /invite 结果：',
   'cmd.invite.ok': '✅ 已拉进群：{names}',
   'cmd.invite.already': '⏭️ 已在群内（跳过）：{names}',

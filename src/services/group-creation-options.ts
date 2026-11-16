@@ -1,6 +1,6 @@
 export type GroupAvatarMode = 'name' | 'logo' | 'off';
 
-/** Opt-in team defaults for /g; mentions retain creator election and invitations. */
+/** Opt-in team defaults for /g; agents also supply bare /invite targets. */
 export interface GroupCreationDefaults {
   agents?: string[];
   tag?: string;

@@ -129,6 +129,12 @@ You can also send `/botconfig set groupCreation <JSON>` in Lark, and `/botconfig
 - `--no-agents`, `--no-tag` and `--avatar off` only drop defaults; they never remove bots you explicitly @-mentioned.
 - Without `groupCreation` and without options, only the current bot and the bots you @-mentioned join.
 
+### Add missing bots to an existing group
+
+A bot admin can send `@bot /invite` in a group to add missing members from that bot's `groupCreation.agents` defaults. Names and app IDs resolve the same way as `/g`. Each app ID is invited once; the current bot and bots already in the group are skipped. An unknown or ambiguous entry, or an unavailable membership check, prevents invitations for the entire default list and prompts a configuration correction or a later retry.
+
+Explicit targets in `@bot /invite @target` or `/invite --app cli_xxx` replace the default list. `tag` and `avatar` do not affect `/invite`; it does not change the existing group's name, tag or avatar. Without a default list, the command displays usage help.
+
 ## Create a group in the Dashboard
 
 Prefer not to type commands? Open the **Group Management** page in `botmux dashboard` and click "New Chat":
